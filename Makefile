@@ -49,20 +49,21 @@ fmt: $(GOLANGCI_LINT) ## Format all Go code (gofmt and goimports)
 test: ## Unit tests, with the race detector
 	go test -race -count=1 ./...
 
-# Packages with tests tagged `integration`. They need Linux with KVM, so they
-# are compiled here and run on the dev server.
-INTEGRATION_PKGS := ./internal/firecracker
+# Packages with tests tagged `integration`. They need Linux with KVM, and the
+# jailer needs root, so they're compiled here and run on the dev server with sudo.
+INTEGRATION_PKGS := ./internal/firecracker ./internal/storage ./internal/jailer
 
 .PHONY: test-integration
-test-integration: ## Integration tests on the dev server, against real Firecracker (server must be up)
-	@mkdir -p $(OUT)/tests
+test-integration: ## Integration tests on the dev server, as root, against real Firecracker (server must be up)
+	@rm -rf $(OUT)/tests && mkdir -p $(OUT)/tests
 	@for p in $(INTEGRATION_PKGS); do \
 		name=$$(echo $$p | sed 's|^\./||; s|/|-|g'); \
 		echo "build $(OUT)/tests/$$name.test"; \
 		CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test -c -tags integration -o $(OUT)/tests/$$name.test $$p || exit 1; \
 	done
 	./scripts/dev-server.sh sync
-	./scripts/dev-server.sh ssh 'cd ~/tine && for t in $(OUT)/tests/*.test; do echo "=== $$t"; ./$$t -test.v -test.count=1 || exit 1; done'
+	./scripts/dev-server.sh ssh 'cd ~/tine && for t in $(OUT)/tests/*.test; do echo "=== $$t"; \
+		sudo TINE_ARTIFACTS=$$HOME/tine/artifacts ./$$t -test.v -test.count=1 || exit 1; done'
 
 .PHONY: deploy
 deploy: build ## Build, copy to the dev server, install the binaries, restart tined if it's installed

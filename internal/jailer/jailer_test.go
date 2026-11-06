@@ -23,12 +23,17 @@ func testConfig(t *testing.T) Config {
 }
 
 // testSpec uses this test process's own uid and gid, so Prepare can chown
-// files without being root.
+// files without being root. Run as root (as the integration tests are on the
+// dev server), it uses nobody's instead, since jails refuse uid 0.
 func testSpec() Spec {
+	uid, gid := os.Getuid(), os.Getgid()
+	if uid == 0 {
+		uid, gid = 65534, 65534
+	}
 	return Spec{
 		ID:     "vm-test1",
-		UID:    os.Getuid(),
-		GID:    os.Getgid(),
+		UID:    uid,
+		GID:    gid,
 		Limits: Limits{VCPUs: 2, MemoryBytes: 1 << 30, MaxPIDs: 64},
 	}
 }
