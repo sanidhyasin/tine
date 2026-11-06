@@ -1,0 +1,15 @@
+# Downloaded on the dev server by scripts/host-setup.sh
+/artifacts/
+
+# Build output
+/bin/
+
+# Firecracker and VM files, wherever they end up
+*.log
+*.ext4
+*.squashfs
+vmlinux-*
+guest_key
+guest_key.pub
+
+.DS_Store
