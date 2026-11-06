@@ -155,7 +155,8 @@ CI (GitHub Actions) runs `make check` and `make build` on every push. The end-to
 ### Cost rules
 
 - Stop the dev server whenever work pauses: `./scripts/dev-server.sh stop`.
-- Anything new that costs money (the data volume in step 1, the bare-metal run in step 4) gets its price stated first.
+- The paid items in this plan are the data volume in step 1 and the bare-metal run in step 4. Each one gets its cost stated when it's added, and nothing else is spent on.
+- No waste: right-size things, delete what's no longer needed, and check `./scripts/dev-server.sh status` at the end of every session.
 
 ---
 
@@ -547,7 +548,7 @@ vm-7f3k2q9d1a  running
 
 Every cliff gets a chart and an explanation.
 
-**Bare-metal run:** rent a `.metal` instance for a few hours. Re-warm the templates there, run the full suite, and compare the results with the nested numbers.
+**Bare-metal run:** rent a `.metal` instance for a few hours (state the hourly price before launching, and terminate it as soon as the run is done). Re-warm the templates there, run the full suite, and compare the results with the nested numbers.
 
 ### Tasks
 
@@ -665,7 +666,7 @@ with Sandbox.create(image="python") as sb:            # destroyed automatically 
 | Snapshots only restore on the same Firecracker version and CPU | Check metadata, and re-warm templates after upgrades or on new hosts |
 | Under memory pressure, the shared memory file can be evicted from the page cache | Measure it in step 4 and explain it. Huge pages or pinning are possible fixes. |
 | Guests are untrusted code | Jailer, one namespace per VM, a blocked metadata service, no VM-to-VM traffic, and Firecracker kept up to date |
-| Cloud costs creep up | Stop the dev server when pausing work. Paid additions get their price stated first. |
+| Cloud costs creep up | Stop the dev server when pausing work, check `status` at the end of every session, and spend nothing outside this plan |
 
 ## Glossary
 
