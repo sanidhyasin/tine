@@ -51,7 +51,7 @@ test: ## Unit tests, with the race detector
 
 # Packages with tests tagged `integration`. They need Linux with KVM, and the
 # jailer needs root, so they're compiled here and run on the dev server with sudo.
-INTEGRATION_PKGS := ./internal/firecracker ./internal/storage ./internal/jailer
+INTEGRATION_PKGS := ./internal/firecracker ./internal/storage ./internal/jailer ./internal/netns
 
 .PHONY: test-integration
 test-integration: ## Integration tests on the dev server, as root, against real Firecracker (server must be up)

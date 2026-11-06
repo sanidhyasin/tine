@@ -22,6 +22,8 @@ type Artifacts struct {
 	Jailer      string
 	Kernel      string
 	Rootfs      string
+	// GuestKey is the SSH key that can log in to Rootfs's guest as root.
+	GuestKey string
 }
 
 // RequireArtifacts finds the artifacts in $TINE_ARTIFACTS (by default
@@ -43,8 +45,9 @@ func RequireArtifacts(t testing.TB) Artifacts {
 		Jailer:      filepath.Join(dir, "bin", "jailer"),
 		Kernel:      kernels[len(kernels)-1],
 		Rootfs:      filepath.Join(dir, "rootfs.ext4"),
+		GuestKey:    filepath.Join(dir, "guest_key"),
 	}
-	for _, p := range []string{a.Firecracker, a.Jailer, a.Rootfs} {
+	for _, p := range []string{a.Firecracker, a.Jailer, a.Rootfs, a.GuestKey} {
 		if _, err := os.Stat(p); err != nil {
 			t.Skipf("%v: run scripts/host-setup.sh, or set TINE_ARTIFACTS", err)
 		}

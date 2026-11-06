@@ -39,7 +39,7 @@ command -v apt-get >/dev/null || die "This script expects Ubuntu or Debian (apt-
 say "Installing packages"
 sudo apt-get -o DPkg::Lock::Timeout=300 update -qq
 sudo DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 install -y -qq \
-  curl jq squashfs-tools e2fsprogs xfsprogs acl iproute2 iptables openssh-client >/dev/null
+  curl jq squashfs-tools e2fsprogs xfsprogs acl iproute2 iptables nftables openssh-client >/dev/null
 echo "OK"
 
 # --- 2. KVM -----------------------------------------------------------------
