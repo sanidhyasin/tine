@@ -37,14 +37,29 @@ aws_() { aws --profile "$PROFILE" --region "$REGION" "$@"; }
 say()  { printf '==> %s\n' "$*" >&2; }
 die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
+# macOS ships bash 3.2, which switches off `set -e` inside $(...). Functions
+# whose output gets captured therefore turn it back on themselves, and every
+# captured value is checked with `expect`.
+# Usage: expect <glob> <value> <error message>   (one glob only: "a|b" doesn't work here)
+expect() {
+  # shellcheck disable=SC2254
+  case "$2" in $1) ;; *) die "$3" ;; esac
+}
+
 instance_id() {
-  aws_ ec2 describe-instances \
+  set -e
+  local id
+  id="$(aws_ ec2 describe-instances \
     --filters "Name=tag:Name,Values=$NAME" "Name=tag:Project,Values=tine" \
               "Name=instance-state-name,Values=pending,running,stopping,stopped" \
-    --query 'Reservations[].Instances[].InstanceId | [0]' --output text
+    --query 'Reservations[].Instances[].InstanceId | [0]' --output text)"
+  # "None" means there's no server yet; anything else must be an instance ID.
+  [ "$id" = "None" ] || expect 'i-*' "$id" "Couldn't query EC2 with the $PROFILE profile"
+  echo "$id"
 }
 
 require_instance() {
+  set -e
   local id
   id="$(instance_id)"
   [ "$id" != "None" ] || die "There's no $NAME server. Run: $0 up"
@@ -52,40 +67,56 @@ require_instance() {
 }
 
 instance_field() {
+  set -e
   aws_ ec2 describe-instances --instance-ids "$1" --query "Reservations[0].Instances[0].$2" --output text
 }
 
 running_ip() {
+  set -e
   local id ip
   id="$(require_instance)"
   ip="$(instance_field "$id" PublicIpAddress)"
   [ "$ip" != "None" ] || die "$NAME isn't running. Run: $0 up"
+  expect '[0-9]*.[0-9]*.[0-9]*.[0-9]*' "$ip" "Couldn't read the public IP of $id"
   echo "$ip"
 }
 
-my_ip() { curl -fsS https://checkip.amazonaws.com | tr -d '[:space:]'; }
+my_ip() {
+  set -e
+  local ip
+  ip="$(curl -fsS https://checkip.amazonaws.com)"
+  ip="$(printf '%s' "$ip" | tr -d '[:space:]')"
+  expect '[0-9]*.[0-9]*.[0-9]*.[0-9]*' "$ip" "Couldn't find your public IPv4 address"
+  echo "$ip"
+}
 
 security_group() {
+  set -e
   local vpc sg
   vpc="$(aws_ ec2 describe-vpcs --filters Name=isDefault,Values=true --query 'Vpcs[0].VpcId' --output text)"
-  [ "$vpc" != "None" ] || die "No default VPC in $REGION"
+  expect 'vpc-*' "$vpc" "No default VPC in $REGION"
   sg="$(aws_ ec2 describe-security-groups \
         --filters "Name=group-name,Values=$NAME" "Name=vpc-id,Values=$vpc" \
         --query 'SecurityGroups[0].GroupId' --output text)"
   if [ "$sg" = "None" ]; then
+    # AWS only allows a-zA-Z0-9 and . _-:/()#,@[]+=&;{}!$* in descriptions (no apostrophes).
     sg="$(aws_ ec2 create-security-group --group-name "$NAME" --vpc-id "$vpc" \
-          --description "tine dev server: SSH from the owner's IP only" \
+          --description "tine dev server - SSH from the owner IP only" \
           --tag-specifications "ResourceType=security-group,Tags=[{Key=Project,Value=tine}]" \
           --query GroupId --output text)"
+    expect 'sg-*' "$sg" "Couldn't create the $NAME security group"
     say "Created security group $sg"
   fi
+  expect 'sg-*' "$sg" "Couldn't find the $NAME security group"
   echo "$sg"
 }
 
 allow_my_ip() {
   local sg ip perms
   sg="$(security_group)"
+  expect 'sg-*' "$sg" "No security group to update"
   ip="$(my_ip)"
+  expect '[0-9]*.[0-9]*.[0-9]*.[0-9]*' "$ip" "Couldn't find your public IPv4 address"
   perms="$(aws_ ec2 describe-security-groups --group-ids "$sg" \
            --query 'SecurityGroups[0].IpPermissions' --output json)"
   if [ "$(printf '%s' "$perms" | tr -d '[:space:]')" != "[]" ]; then
@@ -107,15 +138,17 @@ key_pair() {
 
 default_subnet() {
   # Pick an availability zone that offers the instance type, then its default subnet.
-  local az subnet
-  az="$(aws_ ec2 describe-instance-type-offerings --location-type availability-zone \
-        --filters "Name=instance-type,Values=$TYPE" \
-        --query 'InstanceTypeOfferings[].Location' --output text | tr '\t' '\n' | sort | head -1)"
-  [ -n "$az" ] || die "$TYPE isn't offered in $REGION"
+  set -e
+  local zones az subnet
+  zones="$(aws_ ec2 describe-instance-type-offerings --location-type availability-zone \
+           --filters "Name=instance-type,Values=$TYPE" \
+           --query 'InstanceTypeOfferings[].Location' --output text)"
+  az="$(printf '%s' "$zones" | tr '\t' '\n' | sort | head -1)"
+  expect "$REGION*" "$az" "$TYPE isn't offered in $REGION"
   subnet="$(aws_ ec2 describe-subnets \
             --filters Name=default-for-az,Values=true "Name=availability-zone,Values=$az" \
             --query 'Subnets[0].SubnetId' --output text)"
-  [ "$subnet" != "None" ] || die "No default subnet in $az"
+  expect 'subnet-*' "$subnet" "No default subnet in $az"
   echo "$subnet"
 }
 
@@ -192,8 +225,10 @@ cmd_up() {
   else
     key_pair
     sg="$(security_group)"
+    expect 'sg-*' "$sg" "No security group to launch with"
     allow_my_ip
     subnet="$(default_subnet)"
+    expect 'subnet-*' "$subnet" "No subnet to launch in"
     ud="$(mktemp)"
     user_data > "$ud"
     say "Launching $TYPE with nested virtualization in $REGION (AWS profile: $PROFILE)"
@@ -213,10 +248,12 @@ cmd_up() {
             "ResourceType=volume,Tags=[{Key=Name,Value=$NAME},{Key=Project,Value=tine}]" \
           --query 'Instances[0].InstanceId' --output text)"
     rm -f "$ud"
+    expect 'i-*' "$id" "The launch didn't return an instance ID"
     say "Launched $id"
   fi
   aws_ ec2 wait instance-running --instance-ids "$id"
   ip="$(instance_field "$id" PublicIpAddress)"
+  expect '[0-9]*.[0-9]*.[0-9]*.[0-9]*' "$ip" "$id has no public IP address"
   wait_for_ssh "$ip"
   say "Ready. Connect with: $0 ssh   (ubuntu@$ip)"
 }
