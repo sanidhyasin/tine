@@ -15,20 +15,14 @@ On your Mac, from the tine folder:
 ```
 
 ```bash
-./scripts/dev-server.sh sync
+./scripts/dev-server.sh setup
 ```
 
 ```bash
 ./scripts/dev-server.sh ssh
 ```
 
-Then on the server:
-
-```bash
-cd ~/tine && ./scripts/host-setup.sh
-```
-
-This installs a few packages, checks that you can use KVM, and puts everything in `~/tine/artifacts/`:
+`setup` copies the repo to the server and runs `scripts/host-setup.sh` there. It installs a few packages, checks that you can use KVM, mounts tine's data volume at `/srv/tine`, and puts everything for this walkthrough in `~/tine/artifacts/`:
 
 | File | What it is |
 |---|---|
