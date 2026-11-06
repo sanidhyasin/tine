@@ -276,7 +276,7 @@ Errors come back as `{"error": {"code": "...", "message": "..."}}` with proper H
 
 - [x] **1.1 Project skeleton:** Go module, the layout above, `Makefile` (`build`, `check`, `deploy`; `e2e` arrives with task 1.14), `golangci-lint` config, and GitHub Actions CI.
 - [x] **1.2 Data volume:** add a 50 GB gp3 EBS volume to the dev server (about $4.60/month), formatted XFS and mounted at `/srv/tine`. Teach `dev-server.sh` and `host-setup.sh` about it. *Measured: copying a 2 GB disk image takes 2,725 ms normally and 5 ms as a reflink, using 0 MB of extra disk.*
-- [ ] **1.3 Firecracker client** (`internal/firecracker`): typed calls for configure, start, pause and resume over a Unix socket, with every call timed. Unit tests against a fake socket server.
+- [x] **1.3 Firecracker client** (`internal/firecracker`): typed calls for configure, start, pause and resume over a Unix socket, with every call timed. Unit tests against a fake socket server. *Also tested against real Firecracker 1.17.0 with `make test-integration`: configuration calls take 0.1–2 ms and pause or resume about 0.25 ms (nested virtualization).*
 - [ ] **1.4 Jails** (`internal/jailer`): build the jailer command, prepare the chroot (hard links and reflinks), allocate a uid per VM, and clean up.
 - [ ] **1.5 Networking** (`internal/netns`): namespaces, tap, veth, routes, NAT and firewall rules in `inet tine`, and a slot allocator. E2e test: create 20, delete 20, nothing left behind.
 - [ ] **1.6 Guest agent** (`cmd/tine-agent`): vsock HTTP server with `/health` and streaming `/exec`. Unit tests over a local socket.
