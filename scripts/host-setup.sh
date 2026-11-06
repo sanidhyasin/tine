@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
 # Prepares a Linux host to run Firecracker microVMs for tine.
 #
-# Run this ON THE LINUX SERVER, not on your Mac:
-#   cd ~/tine && ./scripts/host-setup.sh
+# Run this ON THE LINUX SERVER, not on your Mac. On the AWS dev server, the
+# easiest way is from your Mac:   ./scripts/dev-server.sh setup
+# Or on the server itself:        cd ~/tine && ./scripts/host-setup.sh
 #
 # What it does:
 #   1. Installs the packages it needs (Ubuntu/Debian).
 #   2. Checks that KVM exists and that you can use it.
-#   3. Downloads Firecracker into artifacts/bin/.
-#   4. Downloads a guest kernel and an Ubuntu disk image from Firecracker's CI,
+#   3. Sets up tine's data volume at /srv/tine: XFS with reflinks, mounted at
+#      boot. Set TINE_DATA_DEVICE to the disk to use; it must be empty or
+#      already XFS, and is never reformatted. dev-server.sh setup sets it.
+#   4. Downloads Firecracker into artifacts/bin/.
+#   5. Downloads a guest kernel and an Ubuntu disk image from Firecracker's CI,
 #      adds an SSH key to the image, and writes artifacts/rootfs.ext4.
 #
 # It's safe to re-run: anything already done is skipped.
@@ -35,7 +39,7 @@ command -v apt-get >/dev/null || die "This script expects Ubuntu or Debian (apt-
 say "Installing packages"
 sudo apt-get -o DPkg::Lock::Timeout=300 update -qq
 sudo DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 install -y -qq \
-  curl jq squashfs-tools e2fsprogs acl iproute2 iptables openssh-client >/dev/null
+  curl jq squashfs-tools e2fsprogs xfsprogs acl iproute2 iptables openssh-client >/dev/null
 echo "OK"
 
 # --- 2. KVM -----------------------------------------------------------------
@@ -52,10 +56,58 @@ fi
 { [ -r /dev/kvm ] && [ -w /dev/kvm ]; } || die "No read/write access to /dev/kvm"
 echo "KVM OK ($(lsmod | awk '/^kvm_(intel|amd)/ {print $1; exit}'))"
 
+# --- 3. Data volume (/srv/tine) ---------------------------------------------
+# VM disks, images and snapshots live here. XFS reflinks make copying a disk
+# image instant: the copy shares the original's data until one of them changes.
+DATA_DIR=/srv/tine
+say "Data volume ($DATA_DIR)"
+if mountpoint -q "$DATA_DIR"; then
+  echo "Already mounted"
+elif [ -n "${TINE_DATA_DEVICE:-}" ]; then
+  dev="$(readlink -f "$TINE_DATA_DEVICE")"
+  [ -b "$dev" ] || die "TINE_DATA_DEVICE=$TINE_DATA_DEVICE isn't a block device"
+  root_disk="$(lsblk -no PKNAME "$(findmnt -no SOURCE /)" 2>/dev/null || true)"
+  [ "$(basename "$dev")" != "$root_disk" ] || die "$dev is the root disk; refusing to touch it"
+  [ -z "$(lsblk -no MOUNTPOINTS "$dev" | tr -d '[:space:]')" ] || die "$dev is already mounted somewhere"
+
+  fstype="$(sudo blkid -o value -s TYPE "$dev" || true)"
+  case "$fstype" in
+    "")  echo "Formatting $dev as XFS with reflinks"
+         sudo mkfs.xfs -q -m reflink=1 -L tine-data "$dev" ;;
+    xfs) echo "$dev already has an XFS filesystem; keeping it" ;;
+    *)   die "$dev already has a $fstype filesystem; refusing to format it" ;;
+  esac
+
+  uuid="$(sudo blkid -o value -s UUID "$dev")"
+  [ -n "$uuid" ] || die "Couldn't read the filesystem UUID of $dev"
+  sudo mkdir -p "$DATA_DIR"
+  if ! grep -q "^UUID=$uuid " /etc/fstab; then
+    # nofail: if the volume is ever missing, the server still boots.
+    echo "UUID=$uuid $DATA_DIR xfs defaults,noatime,nofail 0 2" | sudo tee -a /etc/fstab >/dev/null
+    sudo systemctl daemon-reload
+  fi
+  sudo mount "$DATA_DIR"
+else
+  echo "Skipped: no data volume given."
+  echo "  On the AWS dev server, run this from your Mac instead: ./scripts/dev-server.sh setup"
+  echo "  Elsewhere, set TINE_DATA_DEVICE=/dev/<disk> (an empty disk, or one that's already XFS)."
+fi
+
+if mountpoint -q "$DATA_DIR"; then
+  [ "$(findmnt -no FSTYPE "$DATA_DIR")" = "xfs" ] || die "$DATA_DIR is mounted but isn't XFS"
+  # Prove reflinks work: cloning a file must share its data, not copy it.
+  probe="$DATA_DIR/.reflink-probe"
+  sudo dd if=/dev/urandom of="$probe" bs=1M count=4 status=none
+  sudo cp --reflink=always "$probe" "$probe.clone" 2>/dev/null \
+    || { sudo rm -f "$probe"; die "Reflink copies don't work on $DATA_DIR"; }
+  sudo rm -f "$probe" "$probe.clone"
+  echo "OK: $(findmnt -no SOURCE "$DATA_DIR") on $DATA_DIR, XFS with reflinks, $(df -h --output=avail "$DATA_DIR" | tail -1 | tr -d ' ') free"
+fi
+
 mkdir -p "$ART/bin"
 cd "$ART"
 
-# --- 3. Firecracker ---------------------------------------------------------
+# --- 4. Firecracker ---------------------------------------------------------
 say "Firecracker $FC_VERSION"
 if [ -x bin/firecracker ] && bin/firecracker --version | grep -q "${FC_VERSION#v}"; then
   echo "Already installed"
@@ -70,7 +122,7 @@ else
 fi
 bin/firecracker --version | head -1
 
-# --- 4. Guest kernel and rootfs ---------------------------------------------
+# --- 5. Guest kernel and rootfs ---------------------------------------------
 say "Guest kernel and rootfs (from Firecracker's CI artifacts)"
 
 ci_prefix() {
