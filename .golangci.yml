@@ -1,6 +1,11 @@
 # golangci-lint v2 configuration. The version is pinned in the Makefile and CI.
 version: "2"
 
+run:
+  # Lint the integration tests too (they run on the dev server).
+  build-tags:
+    - integration
+
 linters:
   # errcheck, govet, ineffassign, staticcheck, unused
   default: standard
