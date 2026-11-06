@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
 # Manage tine's AWS dev server. Run this on your Mac, from the tine folder.
 #
-#   ./scripts/dev-server.sh up           create the server, or start it if it's stopped
-#   ./scripts/dev-server.sh status       show its state, IP and settings
+#   ./scripts/dev-server.sh up           create the server (or start it), with its data volume
+#   ./scripts/dev-server.sh setup        sync this repo, then run host-setup.sh on the server
+#   ./scripts/dev-server.sh status       show its state, IP, settings and data volume
 #   ./scripts/dev-server.sh ssh [cmd]    SSH in (or run one command)
 #   ./scripts/dev-server.sh sync         copy this repo to ~/tine on the server
 #   ./scripts/dev-server.sh stop         stop it (no compute charges while stopped)
 #   ./scripts/dev-server.sh allow-my-ip  let your current IP in over SSH (after it changes)
-#   ./scripts/dev-server.sh down         terminate it for good (deletes its disk)
+#   ./scripts/dev-server.sh down         terminate it for good (deletes both of its disks)
 #
 # Cost in ap-south-1 (on-demand, checked 2026-11-07): m8i.xlarge is $0.2227/hour
-# while running, plus about $5.50/month for the 60 GB gp3 disk even while stopped,
-# plus $0.005/hour for the public IPv4 address while running.
+# while running, plus $0.005/hour for the public IPv4 address while running.
+# The disks cost $0.0912 per GB-month even while stopped: about $5.47/month for
+# the 60 GB root disk and $4.56/month for the 50 GB data volume.
 #
 # The server stops itself after 60 minutes with no SSH connections and no
 # running Firecracker VMs.
@@ -25,6 +27,9 @@ REGION="$(aws configure get region --profile "$PROFILE" 2>/dev/null || true)"
 REGION="${REGION:-ap-south-1}"
 TYPE="${TINE_INSTANCE_TYPE:-m8i.xlarge}"   # 4 vCPU, 16 GiB. c8i/m8i/r8i support nested virtualization.
 DISK_GB="${TINE_DISK_GB:-60}"
+DATA_GB="${TINE_DATA_GB:-50}"              # mounted at /srv/tine as XFS by host-setup.sh
+DATA_DEVICE_NAME="/dev/sdf"                # EC2's name for it; Linux sees an NVMe disk
+GP3_PRICE_GB_MONTH="0.0912"                # ap-south-1, checked 2026-11-07
 NAME="tine-dev"
 SSH_KEY="${TINE_SSH_KEY:-$HOME/.ssh/id_ed25519}"
 KNOWN_HOSTS="$HOME/.ssh/known_hosts_tine"
@@ -152,6 +157,59 @@ default_subnet() {
   echo "$subnet"
 }
 
+data_volume_id() {
+  # The data volume attached to instance $1, or "None".
+  set -e
+  local vol
+  vol="$(aws_ ec2 describe-volumes \
+         --filters "Name=attachment.instance-id,Values=$1" "Name=tag:Project,Values=tine" "Name=tag:Role,Values=data" \
+         --query 'Volumes[0].VolumeId' --output text)"
+  [ "$vol" = "None" ] || expect 'vol-*' "$vol" "Couldn't look up the data volume of $1"
+  echo "$vol"
+}
+
+ensure_data_volume() {
+  # Make sure instance $1 has its data volume attached, creating it if needed.
+  local id="$1" vol az state cost
+  vol="$(data_volume_id "$id")"
+  [ "$vol" = "None" ] || return 0
+
+  az="$(instance_field "$id" Placement.AvailabilityZone)"
+  expect "$REGION*" "$az" "Couldn't read the availability zone of $id"
+
+  # Reuse a detached data volume from an earlier attempt instead of paying for a second one.
+  vol="$(aws_ ec2 describe-volumes \
+         --filters "Name=tag:Project,Values=tine" "Name=tag:Role,Values=data" \
+                   "Name=status,Values=available" "Name=availability-zone,Values=$az" \
+         --query 'Volumes[0].VolumeId' --output text)"
+  if [ "$vol" = "None" ]; then
+    cost="$(awk -v g="$DATA_GB" -v p="$GP3_PRICE_GB_MONTH" 'BEGIN { printf "%.2f", g * p }')"
+    say "Creating a $DATA_GB GB gp3 data volume in $az (about \$$cost/month)"
+    vol="$(aws_ ec2 create-volume --availability-zone "$az" --size "$DATA_GB" --volume-type gp3 \
+           --tag-specifications "ResourceType=volume,Tags=[{Key=Name,Value=$NAME-data},{Key=Project,Value=tine},{Key=Role,Value=data}]" \
+           --query VolumeId --output text)"
+    expect 'vol-*' "$vol" "Couldn't create the data volume"
+    aws_ ec2 wait volume-available --volume-ids "$vol"
+  else
+    expect 'vol-*' "$vol" "Couldn't look up detached data volumes"
+    say "Reusing the detached data volume $vol"
+  fi
+
+  say "Attaching $vol to $id as $DATA_DEVICE_NAME"
+  aws_ ec2 attach-volume --volume-id "$vol" --instance-id "$id" --device "$DATA_DEVICE_NAME" >/dev/null
+  for _ in $(seq 1 30); do
+    state="$(aws_ ec2 describe-volumes --volume-ids "$vol" --query 'Volumes[0].Attachments[0].State' --output text)"
+    [ "$state" = "attached" ] && break
+    sleep 2
+  done
+  [ "$state" = "attached" ] || die "$vol didn't attach (state: $state)"
+
+  # Delete it together with the server, so `down` never leaves a paid volume behind.
+  aws_ ec2 modify-instance-attribute --instance-id "$id" \
+    --block-device-mappings "[{\"DeviceName\":\"$DATA_DEVICE_NAME\",\"Ebs\":{\"DeleteOnTermination\":true}}]"
+  say "Data volume $vol attached. Run '$0 setup' to format and mount it."
+}
+
 user_data() {
   cat <<'USERDATA'
 #!/bin/bash
@@ -252,14 +310,27 @@ cmd_up() {
     say "Launched $id"
   fi
   aws_ ec2 wait instance-running --instance-ids "$id"
+  ensure_data_volume "$id"
   ip="$(instance_field "$id" PublicIpAddress)"
   expect '[0-9]*.[0-9]*.[0-9]*.[0-9]*' "$ip" "$id has no public IP address"
   wait_for_ssh "$ip"
   say "Ready. Connect with: $0 ssh   (ubuntu@$ip)"
 }
 
+cmd_setup() {
+  local id ip vol dev
+  id="$(require_instance)"
+  ip="$(running_ip)"
+  vol="$(data_volume_id "$id")"
+  [ "$vol" != "None" ] || die "$NAME has no data volume yet. Run: $0 up"
+  # On Nitro instances EBS volumes are NVMe disks, and udev names each one after its volume ID.
+  dev="/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_${vol//-/}"
+  cmd_sync
+  ssh "${SSH_OPTS[@]}" "ubuntu@$ip" "cd ~/tine && TINE_DATA_DEVICE='$dev' ./scripts/host-setup.sh"
+}
+
 cmd_status() {
-  local id
+  local id vol
   id="$(instance_id)"
   if [ "$id" = "None" ]; then
     echo "There's no $NAME server. Run: $0 up"
@@ -267,6 +338,13 @@ cmd_status() {
   fi
   aws_ ec2 describe-instances --instance-ids "$id" --output table \
     --query 'Reservations[0].Instances[0].{Id:InstanceId,State:State.Name,Type:InstanceType,IP:PublicIpAddress,Zone:Placement.AvailabilityZone,NestedVirt:CpuOptions.NestedVirtualization,Launched:LaunchTime}'
+  vol="$(data_volume_id "$id")"
+  if [ "$vol" = "None" ]; then
+    echo "Data volume: none attached (run: $0 up)"
+  else
+    aws_ ec2 describe-volumes --volume-ids "$vol" --output table \
+      --query 'Volumes[0].{DataVolume:VolumeId,SizeGB:Size,Type:VolumeType,State:State,DeleteWithServer:Attachments[0].DeleteOnTermination}'
+  fi
 }
 
 cmd_ssh() {
@@ -287,13 +365,13 @@ cmd_stop() {
   local id
   id="$(require_instance)"
   aws_ ec2 stop-instances --instance-ids "$id" >/dev/null
-  say "Stopping $id. The disk is kept; run '$0 up' to start it again."
+  say "Stopping $id. Both disks are kept; run '$0 up' to start it again."
 }
 
 cmd_down() {
   local id answer
   id="$(require_instance)"
-  read -r -p "This terminates $id and deletes its disk. Type $NAME to confirm: " answer
+  read -r -p "This terminates $id and deletes its root disk and data volume. Type $NAME to confirm: " answer
   [ "$answer" = "$NAME" ] || die "Cancelled"
   aws_ ec2 terminate-instances --instance-ids "$id" >/dev/null
   rm -f "$KNOWN_HOSTS"
@@ -306,11 +384,12 @@ cmd="${1:-}"
 shift || true
 case "$cmd" in
   up)          cmd_up ;;
+  setup)       cmd_setup ;;
   status)      cmd_status ;;
   ssh)         cmd_ssh "$@" ;;
   sync)        cmd_sync ;;
   stop)        cmd_stop ;;
   allow-my-ip) allow_my_ip ;;
   down)        cmd_down ;;
-  *)           sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  *)           sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac
