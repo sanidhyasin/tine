@@ -3,9 +3,8 @@
 // Integration tests run against a real Firecracker binary, so they need Linux
 // with KVM. Run them on the dev server with `make test-integration`.
 //
-// Paths default to what scripts/host-setup.sh downloads into ~/tine/artifacts.
-// Override them with TINE_FIRECRACKER, TINE_TEST_KERNEL and TINE_TEST_ROOTFS.
-// Tests skip, rather than fail, when something they need isn't there.
+// They use what scripts/host-setup.sh downloads (see internal/testenv), and
+// skip, rather than fail, when something they need isn't there.
 
 package firecracker
 
@@ -18,15 +17,18 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
-	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/sanidhyasin/tine/internal/testenv"
 )
 
 func TestRealFirecrackerBootPauseResume(t *testing.T) {
-	bin, kernel, rootfs := requireArtifacts(t)
-	dir := tempDir(t)
+	testenv.RequireKVM(t)
+	a := testenv.RequireArtifacts(t)
+	bin, kernel, rootfs := a.Firecracker, a.Kernel, a.Rootfs
+	dir := testenv.TempDir(t, "")
 	socket := filepath.Join(dir, "api.sock")
 
 	// Firecracker prints the guest's serial console on stdout. Cancelling
@@ -138,57 +140,4 @@ func TestRealFirecrackerBootPauseResume(t *testing.T) {
 		sort.Slice(ds, func(i, j int) bool { return ds[i] < ds[j] })
 		t.Logf("%-32s calls=%d  median=%v", e, len(ds), ds[len(ds)/2].Round(time.Microsecond))
 	}
-}
-
-// requireArtifacts returns the Firecracker binary, kernel and rootfs to test
-// with, or skips the test if they aren't available.
-func requireArtifacts(t *testing.T) (bin, kernel, rootfs string) {
-	t.Helper()
-	home, _ := os.UserHomeDir()
-	artifacts := filepath.Join(home, "tine", "artifacts")
-
-	bin = envOr("TINE_FIRECRACKER", filepath.Join(artifacts, "bin", "firecracker"))
-	rootfs = envOr("TINE_TEST_ROOTFS", filepath.Join(artifacts, "rootfs.ext4"))
-	kernel = os.Getenv("TINE_TEST_KERNEL")
-	if kernel == "" {
-		matches, _ := filepath.Glob(filepath.Join(artifacts, "vmlinux-*"))
-		sort.Strings(matches)
-		if len(matches) > 0 {
-			kernel = matches[len(matches)-1]
-		}
-	}
-
-	for _, p := range []string{bin, kernel, rootfs} {
-		if p == "" {
-			t.Skip("no guest kernel found; run scripts/host-setup.sh or set TINE_TEST_KERNEL")
-		}
-		if _, err := os.Stat(p); err != nil { //nolint:gosec // paths come from the test's own environment variables
-
-			t.Skipf("%v (run scripts/host-setup.sh, or set TINE_FIRECRACKER / TINE_TEST_KERNEL / TINE_TEST_ROOTFS)", err)
-		}
-	}
-	f, err := os.OpenFile("/dev/kvm", os.O_RDWR, 0)
-	if err != nil {
-		t.Skipf("can't use KVM: %v", err)
-	}
-	_ = f.Close()
-	return bin, kernel, rootfs
-}
-
-func envOr(key, fallback string) string {
-	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
-		return v
-	}
-	return fallback
-}
-
-// tempDir is a short temporary directory, because socket paths are limited to about 100 bytes.
-func tempDir(t *testing.T) string {
-	t.Helper()
-	dir, err := os.MkdirTemp("", "fcit")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(dir) })
-	return dir
 }
