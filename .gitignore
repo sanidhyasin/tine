@@ -1,8 +1,9 @@
 # Downloaded on the dev server by scripts/host-setup.sh
 /artifacts/
 
-# Build output
+# Build output, and pinned tools installed by the Makefile
 /bin/
+/.tools/
 
 # Firecracker and VM files, wherever they end up
 *.log

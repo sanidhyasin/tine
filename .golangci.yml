@@ -1,0 +1,28 @@
+# golangci-lint v2 configuration. The version is pinned in the Makefile and CI.
+version: "2"
+
+linters:
+  # errcheck, govet, ineffassign, staticcheck, unused
+  default: standard
+  enable:
+    - bodyclose      # HTTP response bodies get closed
+    - errorlint      # errors are compared and wrapped correctly (errors.Is / %w)
+    - gosec          # security problems; tine runs untrusted code, so this matters
+    - misspell
+    - noctx          # network calls take a context
+    - nolintlint     # //nolint comments are specific and explained
+    - unconvert
+    - usestdlibvars  # http.MethodGet instead of "GET", and so on
+  settings:
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/sanidhyasin/tine
