@@ -103,7 +103,7 @@ These are settled unless we hit a real reason to change them. If we do, we recor
 9. **New VMs start from templates, not cold boots** (from step 2). Each image is booted once and snapshotted when it's ready. `tine create` restores from that snapshot, so every VM is file-backed from the start, which later lets fork save only the memory that changed.
 10. **Every operation reports where its time went.** API responses include a `timings_ms` breakdown, such as `{"jail": 2.1, "network": 3.4, "restore": 11.8, "agent_ready": 4.0}`. The same numbers feed Prometheus histograms and the benchmarks. Measuring is built in, not added later.
 11. **State lives in SQLite**, using the pure-Go `modernc.org/sqlite` so there's no CGO. When `tined` restarts, it reconciles its state with what actually exists: Firecracker processes, namespaces, jails and files.
-12. **Firewalling uses nftables, in one `inet tine` table.** Ubuntu 24.04 uses nftables. Keeping every tine rule in one table makes cleanup a single command and avoids touching other rules.
+12. **Firewalling uses nftables, in one `inet tine` table, written as plain nftables scripts.** Ubuntu 24.04 uses nftables. Keeping every tine rule in one table makes cleanup a single command and avoids touching other rules. The rules are text applied with `nft -f`, which is atomic (all of a script applies, or none of it) and readable: `nft list table inet tine` shows exactly what tine wrote. Kubernetes' nftables mode works the same way.
 
 ### Libraries
 
@@ -111,7 +111,7 @@ These are settled unless we hit a real reason to change them. If we do, we recor
 |---|---|
 | CLI | `github.com/spf13/cobra` |
 | Network devices and namespaces | `github.com/vishvananda/netlink`, `github.com/vishvananda/netns` |
-| Firewall and NAT | `github.com/google/nftables` |
+| Firewall and NAT | the `nft` command, with scripts generated in Go |
 | vsock in the guest | `github.com/mdlayher/vsock` |
 | SQLite | `modernc.org/sqlite` |
 | Metrics | `github.com/prometheus/client_golang` |
@@ -278,7 +278,7 @@ Errors come back as `{"error": {"code": "...", "message": "..."}}` with proper H
 - [x] **1.2 Data volume:** add a 50 GB gp3 EBS volume to the dev server (about $4.60/month), formatted XFS and mounted at `/srv/tine`. Teach `dev-server.sh` and `host-setup.sh` about it. *Measured: copying a 2 GB disk image takes 2,725 ms normally and 5 ms as a reflink, using 0 MB of extra disk.*
 - [x] **1.3 Firecracker client** (`internal/firecracker`): typed calls for configure, start, pause and resume over a Unix socket, with every call timed. Unit tests against a fake socket server. *Also tested against real Firecracker 1.17.0 with `make test-integration`: configuration calls take 0.1–2 ms and pause or resume about 0.25 ms (nested virtualization).*
 - [x] **1.4 Jails** (`internal/jailer`): build the jailer command, prepare the chroot (hard links and reflinks), allocate a uid per VM, and clean up. *Measured on the dev server: preparing a jail (reflinking a 2 GB disk and hard-linking the kernel) takes under 1 ms. From starting the jailer, Firecracker's API answers in about 7 ms, the VM is started at about 22 ms, and the guest kernel prints its first line at about 82 ms. The guest didn't shut down within 5 s of Ctrl+Alt+Del, so tined should stop VMs by killing them.*
-- [ ] **1.5 Networking** (`internal/netns`): namespaces, tap, veth, routes, NAT and firewall rules in `inet tine`, and a slot allocator. E2e test: create 20, delete 20, nothing left behind.
+- [x] **1.5 Networking** (`internal/netns`): namespaces, tap, veth, routes, NAT and firewall rules in `inet tine`, and a slot allocator. E2e test: create 20, delete 20, nothing left behind. *Slots are allocated with `internal/idalloc`, sized by `netns.MaxSlots`. Measured on the dev server: creating a VM's network takes about 5 ms (median; slowest 17 ms) and destroying it about 16 ms. A real VM reached the internet, and was blocked from the EC2 metadata service, the host (through its gateway and on its main address) and another VM's network, each of which the host could reach.*
 - [ ] **1.6 Guest agent** (`cmd/tine-agent`): vsock HTTP server with `/health` and streaming `/exec`. Unit tests over a local socket.
 - [ ] **1.7 Images:** `tine image import base` produces the base image with the agent baked in.
 - [ ] **1.8 State** (`internal/state`): SQLite schema for images and VMs, with migrations.
