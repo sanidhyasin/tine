@@ -76,6 +76,10 @@ e2e: deploy ## End-to-end tests against the real tined on the dev server (server
 	./scripts/dev-server.sh sync
 	./scripts/dev-server.sh ssh 'cd ~/tine && sudo ./$(OUT)/tests/e2e.test -test.v -test.count=1 -test.timeout 20m'
 
+.PHONY: measure
+measure: deploy ## Measure create, exec and memory per VM on the dev server (server must be up; about 5 minutes)
+	./scripts/dev-server.sh ssh 'cd ~/tine && ./scripts/measure.sh'
+
 .PHONY: deploy
 deploy: build ## Build, copy to the dev server, install the binaries and the tined service, (re)start it
 	./scripts/dev-server.sh sync
