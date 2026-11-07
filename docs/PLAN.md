@@ -408,25 +408,43 @@ The time between steps 1 and 4 is the VM's **pause time**, which we report separ
 - [x] **2.5 Templates:** `tine image warm`. `create` restores from the template, and `--cold` keeps cold boot. *A snapshot fixes a VM's size, so a template is for one image at one size; `tine image warm base --vcpus 4 --memory 4G` makes others. Warming boots the image, waits for `systemctl is-system-running --wait`, and snapshots it. `create` uses the newest template of its image and size if this host can restore it and the image hasn't been imported again since. Otherwise it boots, and notes why on the VM. Each VM records how it started (`cold`, `template` or `snapshot`). tined keeps the images in `--warm-images` (default `base`) warm by itself, warming again after an upgrade or a re-import, and waiting 10 minutes after a failure. `make base-image` warms straight after importing. On the dev server, through tined: from the template in 130 to 168 ms (restore 16 to 22 ms, agent 64 to 79 ms, sync 39 to 58 ms), against 1.83 s for a cold boot. A cold boot started while a template's memory was still being written to disk took 5 s, because its disk reads queued behind the flush.*
 - [x] **2.6 Rollback:** `POST /v1/vms/{id}/rollback` and `tine rollback`. *The snapshot must be one of the VM's own, or the template it started from. The VM claims it first, then its Firecracker is stopped, its jail rebuilt from the snapshot, and the snapshot loaded and synced. Its network namespace, slot, uid and ID never change, and its machine ID is now made from its ID, so it survives rollbacks too. Refused while commands run (409 `busy`), and a command that arrives during one waits. A rollback that fails once the old VM is stopped marks the VM failed. On the dev server, rolling back a VM took 124 to 131 ms: a deleted file came back, a file written after the snapshot was gone, and the VM kept its hostname, machine ID and internet.*
 - [x] **2.7 Snapshot management:** `tine snapshot ls`, `tine snapshot rm`, `GET` and `DELETE /v1/snapshots/{id}`. *Also `GET /v1/snapshots` (filtered by VM, kind or image), `GET /v1/vms/{id}/snapshots`, and `tine snapshot inspect`. Snapshot IDs take unique prefixes, like VM IDs, in `rm`, `inspect` and `rollback --to`. Every listing shows which VMs run from each snapshot, and deleting one they do is 409 `in_use`. The reaper deletes garbage every 15 s: snapshots of destroyed VMs, and templates that a newer one replaced or whose image is gone, once no VM runs from them. Whether an image is gone is checked on disk, because the images table only knows those registered at startup; a test caught the first version deleting a new image's template. On the dev server, a destroyed VM's snapshot was gone within 20 s, and the template stayed.*
-- [ ] **2.8 E2e tests:**
+- [x] **2.8 E2e tests:**
   - Write a file, snapshot, change it, roll back: the file is back.
   - After a restore, the guest's clock is correct.
   - Two restores of one snapshot read different random numbers.
   - Leak check.
+
+  *Also: a template in use can't be deleted, and a destroyed VM's snapshot is collected; a snapshot is refused while a command runs; and tined is SIGKILLed while snapshotting a 4 GiB VM. The leak check now requires that only ready templates are left, and that the store holds exactly the snapshots tined has records of. The kill test found that a restart can meet a Firecracker still writing a big snapshot, whose API won't answer until it's done; reconcile now resumes such a VM in the background, with commands for it waiting, and clears the interrupted snapshot's files from its jail. All 13 e2e tests pass. `make measure` gained sections for templates, rollbacks and snapshots, with numbers under Measure below.*
 - [ ] **2.9 Docs and release:** update `docs/architecture.md`, tag `v0.2.0`.
 
 ### Done when
 
-- [ ] Snapshot → break something → rollback works, and the VM keeps its ID and network.
-- [ ] `tine create` from a template is much faster than a cold boot, with both numbers recorded.
-- [ ] A restored guest has the right time and fresh randomness.
-- [ ] Snapshots in use can't be deleted, and unused ones get cleaned up.
+- [x] Snapshot → break something → rollback works, and the VM keeps its ID and network. *`TestRollbackBringsAFileBack`.*
+- [x] `tine create` from a template is much faster than a cold boot, with both numbers recorded. *p50 111 ms against 1.84 s, below.*
+- [x] A restored guest has the right time and fresh randomness. *`TestRestoredGuestHasTheRightTime`, `TestTwoRestoresAreDifferent`.*
+- [x] Snapshots in use can't be deleted, and unused ones get cleaned up. *`TestSnapshotsInUseStayAndUnusedOnesGo`.*
 
 ### Measure
 
 - Snapshot pause time and total time, for 256 MiB, 1 GiB and 4 GiB VMs.
 - Restore time to "agent ready".
 - `create` from a template vs. cold boot, p50 and p99.
+
+*Measured with `make measure` on the dev server (m8i.xlarge, nested virtualization, a gp3 EBS data volume), one operation at a time:*
+
+| What | p50 | p99 |
+|---|---|---|
+| Create from the template (n=100) | **111 ms** | 145 ms |
+| … restore (load and resume) · agent answers · sync | 13 · 61 · 32 ms | 17 · 72 · 62 ms |
+| Create, cold boot (n=100) | 1.84 s | 1.91 s |
+| Rollback (n=20) | 127 ms | 183 ms |
+| Snapshot pause, 256 MiB VM (n=5) | 47 ms | 65 ms |
+| Snapshot pause, 1 GiB VM (n=5) | 341 ms | 622 ms |
+| Snapshot pause, 4 GiB VM (n=5) | 22.0 s | 22.4 s |
+
+*A snapshot's total time is its pause plus about 1 ms. A VM's next snapshot also waits for the last one to reach the disk, about 8 s per GiB here. A 4 GiB snapshot pauses for 22 s because 4 GiB of new dirty pages is past the kernel's dirty-page limits, so writing the memory file is throttled to the EBS volume's write speed (about 150 MB/s). Smaller ones fit under the limits and run at memory speed. That's the main lead for step 4, along with diff snapshots and local NVMe on bare metal.*
+
+*Memory: an idle VM restored from the template has the same RSS as a booted one (127 MiB), but 108 MiB of it is the template's memory file, mapped from the shared page cache. Only 19 MiB is its own, and its cgroup is charged 24 MiB, against 168 MiB for a booted VM. That's the sharing step 3 builds on.*
 
 ---
 
