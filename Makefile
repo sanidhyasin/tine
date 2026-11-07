@@ -3,7 +3,7 @@
 # Everything is built on your Mac (or in CI) and run on the Linux dev server.
 
 MODULE   := github.com/sanidhyasin/tine
-BINARIES := tine tined tine-agent tine-bench
+BINARIES := tine tined tine-agent tine-bench tine-uffd
 # Benchmark workloads: built for the guest, and baked into the "bench" image.
 WORKLOADS := tine-touch tine-dirty
 OUT      := bin/linux-amd64
@@ -53,7 +53,7 @@ test: ## Unit tests, with the race detector
 
 # Packages with tests tagged `integration`. They need Linux with KVM, and the
 # jailer needs root, so they're compiled here and run on the dev server with sudo.
-INTEGRATION_PKGS := ./internal/firecracker ./internal/storage ./internal/jailer ./internal/netns ./internal/image ./internal/vm
+INTEGRATION_PKGS := ./internal/firecracker ./internal/storage ./internal/jailer ./internal/netns ./internal/image ./internal/uffd ./internal/vm
 
 .PHONY: test-integration
 test-integration: build ## Integration tests on the dev server, as root, against real Firecracker (server must be up)
