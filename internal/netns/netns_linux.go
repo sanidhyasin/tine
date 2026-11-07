@@ -147,26 +147,67 @@ func Destroy(n Network) error {
 // Leftovers lists the VM networks on this host: namespaces named tine-*
 // and veths named tine<N>. Once every VM is destroyed, it should be empty.
 func Leftovers() ([]string, error) {
-	var found []string
-	entries, err := os.ReadDir(NamespaceDir)
-	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+	ids, veths, err := List()
+	if err != nil {
 		return nil, err
 	}
+	var found []string
+	for _, id := range ids {
+		found = append(found, "namespace "+NamespacePrefix+id)
+	}
+	for _, v := range veths {
+		found = append(found, "veth "+v)
+	}
+	return found, nil
+}
+
+// List returns what VM networking exists on this host: the IDs of VMs with
+// a network namespace, and the names of host veths (tine<N>).
+func List() (vmIDs, veths []string, err error) {
+	entries, err := os.ReadDir(NamespaceDir)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return nil, nil, err
+	}
 	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), NamespacePrefix) {
-			found = append(found, "namespace "+e.Name())
+		if id, ok := strings.CutPrefix(e.Name(), NamespacePrefix); ok && validID.MatchString(id) {
+			vmIDs = append(vmIDs, id)
 		}
 	}
 	links, err := netlink.LinkList()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	for _, l := range links {
 		if name := l.Attrs().Name; l.Type() == "veth" && strings.HasPrefix(name, HostVethPrefix) {
-			found = append(found, "veth "+name)
+			veths = append(veths, name)
 		}
 	}
-	return found, nil
+	return vmIDs, veths, nil
+}
+
+// DestroyNamespace removes a VM's network namespace knowing only the VM's
+// ID, for leftovers whose slot is unknown. Removing the namespace also
+// removes the veth pair and tap device inside it, once nothing uses them.
+func DestroyNamespace(vmID string) error {
+	if !validID.MatchString(vmID) {
+		return fmt.Errorf("destroy namespace: bad VM ID %q", vmID)
+	}
+	return removeNamedNamespace(NamespacePrefix + vmID)
+}
+
+// DeleteVeth removes a host veth (and so its peer). A missing one is fine.
+func DeleteVeth(name string) error {
+	if !strings.HasPrefix(name, HostVethPrefix) {
+		return fmt.Errorf("delete veth %q: not one of tine's", name)
+	}
+	link, err := netlink.LinkByName(name)
+	if isLinkNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return netlink.LinkDel(link)
 }
 
 // configureLink adds addr to the named link (unless addr is the zero

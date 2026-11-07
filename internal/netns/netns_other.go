@@ -25,3 +25,12 @@ func Destroy(Network) error { return errUnsupported }
 
 // Leftovers needs Linux.
 func Leftovers() ([]string, error) { return nil, errUnsupported }
+
+// List needs Linux.
+func List() ([]string, []string, error) { return nil, nil, errUnsupported }
+
+// DestroyNamespace needs Linux.
+func DestroyNamespace(string) error { return errUnsupported }
+
+// DeleteVeth needs Linux.
+func DeleteVeth(string) error { return errUnsupported }

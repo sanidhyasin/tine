@@ -129,6 +129,19 @@ func addToIPv4(a [4]byte, n uint32) netip.Addr {
 	return netip.AddrFrom4(b)
 }
 
+// SlotOfVeth returns the slot a host veth name (tine<N>) belongs to.
+func SlotOfVeth(name string) (int, bool) {
+	n, ok := strings.CutPrefix(name, HostVethPrefix)
+	if !ok || n == "" {
+		return 0, false
+	}
+	slot, err := strconv.Atoi(n)
+	if err != nil || slot < 0 || slot >= MaxSlots || strconv.Itoa(slot) != n {
+		return 0, false
+	}
+	return slot, true
+}
+
 // NamespacePath is the namespace's handle, which the jailer joins with --netns.
 func (n Network) NamespacePath() string { return NamespaceDir + "/" + n.Namespace }
 

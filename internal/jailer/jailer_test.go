@@ -384,3 +384,45 @@ func TestCleanupKeepsTheJailWhileItsCgroupRemains(t *testing.T) {
 		t.Errorf("the jail's files were removed although its cgroup remains: %v", err)
 	}
 }
+
+func TestExistingAndListing(t *testing.T) {
+	cfg := testConfig(t)
+	j, _ := New(cfg, testSpec())
+	if err := j.Prepare(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(j.CgroupDir(), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if ids, err := cfg.ListIDs(); err != nil || len(ids) != 1 || ids[0] != "vm-test1" {
+		t.Errorf("ListIDs = %v, %v", ids, err)
+	}
+	if ids, err := cfg.CgroupIDs(); err != nil || len(ids) != 1 || ids[0] != "vm-test1" {
+		t.Errorf("CgroupIDs = %v, %v", ids, err)
+	}
+
+	// Found by ID alone, it points at the same places and can be cleaned up.
+	e, err := Existing(cfg, "vm-test1")
+	if err != nil || e.Dir != j.Dir || e.CgroupDir() != j.CgroupDir() {
+		t.Fatalf("Existing = %+v, %v", e, err)
+	}
+	if busy, err := e.HasProcesses(); err != nil || busy {
+		t.Errorf("HasProcesses = %v, %v; want false (no cgroup.procs here)", busy, err)
+	}
+	if err := os.WriteFile(filepath.Join(e.CgroupDir(), "cgroup.procs"), []byte("4242\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if busy, _ := e.HasProcesses(); !busy {
+		t.Error("HasProcesses = false with a pid in cgroup.procs")
+	}
+	_ = os.Remove(filepath.Join(e.CgroupDir(), "cgroup.procs"))
+	if err := e.Cleanup(); err != nil {
+		t.Fatal(err)
+	}
+	if ids, _ := cfg.ListIDs(); len(ids) != 0 {
+		t.Errorf("after Cleanup, ListIDs = %v", ids)
+	}
+	if _, err := Existing(cfg, "../x"); err == nil {
+		t.Error("Existing with a bad ID: want an error")
+	}
+}

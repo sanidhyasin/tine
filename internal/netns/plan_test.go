@@ -149,3 +149,16 @@ func TestNamespaceRuleset(t *testing.T) {
 		}
 	}
 }
+
+func TestSlotOfVeth(t *testing.T) {
+	for name, want := range map[string]int{"tine0": 0, "tine42": 42, "tine16383": 16383} {
+		if got, ok := SlotOfVeth(name); !ok || got != want {
+			t.Errorf("SlotOfVeth(%q) = %d, %v; want %d", name, got, ok, want)
+		}
+	}
+	for _, bad := range []string{"tine", "tine-1", "tine16384", "tine007", "eth0", "tinex"} {
+		if _, ok := SlotOfVeth(bad); ok {
+			t.Errorf("SlotOfVeth(%q): want not ok", bad)
+		}
+	}
+}

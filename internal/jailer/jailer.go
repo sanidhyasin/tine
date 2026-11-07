@@ -163,6 +163,76 @@ func New(cfg Config, spec Spec) (*Jail, error) {
 	return &Jail{ID: spec.ID, Dir: dir, Root: filepath.Join(dir, "root"), cfg: cfg, spec: spec}, nil
 }
 
+// Existing describes the jail of a VM that may exist on the host, knowing
+// only its ID: enough to find its files, PID and cgroup, and to Cleanup. It's
+// for removing what's left of VMs whose configuration is unknown. Don't
+// Prepare it or start its Command.
+func Existing(cfg Config, id string) (*Jail, error) {
+	if cfg.CgroupRoot == "" {
+		cfg.CgroupRoot = DefaultCgroupRoot
+	}
+	if err := cfg.validate(); err != nil {
+		return nil, err
+	}
+	if !validID.MatchString(id) {
+		return nil, fmt.Errorf("jail ID %q: must be 1-64 letters, digits and hyphens", id)
+	}
+	dir := filepath.Join(cfg.ChrootBaseDir, filepath.Base(cfg.FirecrackerBin), id)
+	return &Jail{ID: id, Dir: dir, Root: filepath.Join(dir, "root"), cfg: cfg, spec: Spec{ID: id}}, nil
+}
+
+// ListIDs returns the IDs of the jails that exist on disk.
+func (c Config) ListIDs() ([]string, error) {
+	entries, err := os.ReadDir(filepath.Join(c.ChrootBaseDir, filepath.Base(c.FirecrackerBin)))
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
+	for _, e := range entries {
+		if e.IsDir() && validID.MatchString(e.Name()) {
+			ids = append(ids, e.Name())
+		}
+	}
+	return ids, nil
+}
+
+// CgroupIDs returns the IDs of the VM cgroups that exist under CgroupParent.
+func (c Config) CgroupIDs() ([]string, error) {
+	root := c.CgroupRoot
+	if root == "" {
+		root = DefaultCgroupRoot
+	}
+	entries, err := os.ReadDir(filepath.Join(root, filepath.FromSlash(c.CgroupParent)))
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
+	for _, e := range entries {
+		if e.IsDir() && validID.MatchString(e.Name()) {
+			ids = append(ids, e.Name())
+		}
+	}
+	return ids, nil
+}
+
+// HasProcesses reports whether anything runs in the jail's cgroup.
+func (j *Jail) HasProcesses() (bool, error) {
+	data, err := os.ReadFile(filepath.Join(j.CgroupDir(), "cgroup.procs"))
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return len(strings.TrimSpace(string(data))) > 0, nil
+}
+
 func (c Config) validate() error {
 	for name, p := range map[string]string{"JailerBin": c.JailerBin, "FirecrackerBin": c.FirecrackerBin, "ChrootBaseDir": c.ChrootBaseDir, "CgroupRoot": c.CgroupRoot} {
 		if !filepath.IsAbs(p) {
