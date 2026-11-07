@@ -80,7 +80,8 @@ put_back() {
 }
 trap put_back EXIT
 
-: >"$out"
+# tine-bench runs as root and creates the file; an old one may be root's.
+sudo rm -f "$out"
 tined_with
 for part in $parts; do
 	case $part in
