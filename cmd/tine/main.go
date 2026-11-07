@@ -95,7 +95,7 @@ VM IDs can be shortened to any unique prefix, like docker's.`,
 		return fmt.Errorf("%w (see 'tine %s --help')", err, cmd.Name())
 	})
 	root.AddCommand(
-		newCreateCmd(g), newListCmd(g), newInspectCmd(g), newExecCmd(g), newCpCmd(g), newDestroyCmd(g), newDialStdioCmd(g),
+		newCreateCmd(g), newListCmd(g), newInspectCmd(g), newExecCmd(g), newCpCmd(g), newTopCmd(g), newDestroyCmd(g), newDialStdioCmd(g),
 		newSnapshotCmd(g), newRollbackCmd(g), newForkCmd(g), newImagesCmd(g), newImageCmd(g), newVersionCmd(g),
 	)
 	return root
