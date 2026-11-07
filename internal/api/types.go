@@ -190,6 +190,9 @@ type Health struct {
 	Version       string  `json:"version"`
 	VMs           int     `json:"vms"`
 	UptimeSeconds float64 `json:"uptime_seconds"`
+	// Features are optional behaviours tined runs with, such as
+	// "diff-snapshots".
+	Features []string `json:"features,omitempty"`
 }
 
 // Exec uses the agent's types, so tined passes requests and frames through

@@ -56,6 +56,8 @@ type Server struct {
 	metrics *metrics.Metrics
 	started time.Time
 	mux     *http.ServeMux
+	// features are reported by GET /v1/health.
+	features []string
 }
 
 // Option configures a Server.
@@ -63,6 +65,9 @@ type Option func(*Server)
 
 // WithMetrics serves GET /metrics and records every request in m.
 func WithMetrics(m *metrics.Metrics) Option { return func(s *Server) { s.metrics = m } }
+
+// WithFeatures lists optional behaviours tined runs with in GET /v1/health.
+func WithFeatures(f ...string) Option { return func(s *Server) { s.features = f } }
 
 // RequestIDHeader carries a request's ID: tined answers with it, and uses
 // the caller's if one is sent.
@@ -163,7 +168,8 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, Health{Status: "ok", Version: s.version, VMs: len(vms), UptimeSeconds: time.Since(s.started).Seconds()})
+	writeJSON(w, http.StatusOK, Health{Status: "ok", Version: s.version, VMs: len(vms), UptimeSeconds: time.Since(s.started).Seconds(),
+		Features: s.features})
 }
 
 func (s *Server) images(w http.ResponseWriter, r *http.Request) {

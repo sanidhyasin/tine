@@ -109,6 +109,16 @@ type Config struct {
 	// either way; this also moves the guest's monotonic clock, which
 	// Firecracker warns can surprise programs in the guest.
 	ClockRealtime bool
+	// DiffSnapshots has Firecracker track the pages each VM changes, so that
+	// its snapshots, once it has a base, hold only the pages changed since
+	// (see diff.go). It shortens the pause; tracking costs the guest some
+	// speed. Diff snapshots are a developer preview in Firecracker v1.17.
+	DiffSnapshots bool
+	// DiffMerge is how a diff is merged onto its base's memory: "reflink"
+	// shares the unchanged pages with the base on disk, "copy" copies them
+	// through the page cache. Empty means copy for a fork's snapshot, which
+	// its children restore from straight away, and reflink for the others.
+	DiffMerge string
 	// ReaperInterval is how often expired VMs are looked for.
 	ReaperInterval time.Duration
 	// DestroyedRetention is how long destroyed VMs' records are kept.
@@ -281,6 +291,8 @@ type Manager struct {
 	warmFailed map[string]time.Time
 	// pins are snapshots that mustn't be collected or deleted yet (see pin).
 	pins map[string]int
+	// diffBases are the bases of VMs tracking dirty pages (see diff.go).
+	diffBases map[string]string
 	// admitMu guards admission control's reservations: what's held for VMs
 	// being made.
 	admitMu                                          sync.Mutex
@@ -305,6 +317,9 @@ func New(cfg Config, store *state.Store) (*Manager, error) {
 
 func newManager(cfg Config, store *state.Store, h host) (*Manager, error) {
 	cfg = cfg.withDefaults()
+	if err := validMerge(cfg.DiffMerge); err != nil {
+		return nil, err
+	}
 	slots, err := idalloc.NewRange(0, netns.MaxSlots)
 	if err != nil {
 		return nil, err
@@ -317,6 +332,7 @@ func newManager(cfg Config, store *state.Store, h host) (*Manager, error) {
 		cfg: cfg, store: store, host: h, log: cfg.Log, slots: slots, snaps: snaps, gate: newGate(),
 		procs: map[string]*tracked{}, ops: map[string]*createOp{}, flushes: map[string]chan struct{}{},
 		warming: map[string]bool{}, warmFailed: map[string]time.Time{}, pins: map[string]int{},
+		diffBases: map[string]string{},
 	}
 	// Slots held by VMs from before a restart stay theirs.
 	live, err := store.ListVMs(context.Background(), state.ListOptions{})
@@ -601,6 +617,7 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (state.VM, erro
 	if err != nil {
 		return fail("record", err)
 	}
+	m.tracking(vm.ID, vm.SnapshotID)
 	log.InfoContext(ctx, "created", "from", vm.Source, "snapshot", vm.SnapshotID, "timings_ms", vm.Timings)
 	m.cfg.Metrics.CreateSucceeded(string(vm.Source), vm.Timings)
 	return vm, nil
@@ -668,6 +685,7 @@ func (m *Manager) destroy(ctx context.Context, id, reason string) (state.VM, err
 
 // teardown stops the VM's Firecracker and removes its jail and network.
 func (m *Manager) teardown(ctx context.Context, vm state.VM) error {
+	m.untrack(vm.ID)
 	n, j, err := m.resources(vm)
 	if err != nil {
 		return err

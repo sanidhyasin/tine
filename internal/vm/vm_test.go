@@ -58,6 +58,8 @@ type fakeHost struct {
 	loading, maxLoading int
 	// mem is what hostMemory reports; zero means 16 GiB, 15 available.
 	mem hostMemory
+	// merges are what collectSnapshot was asked to do, in order.
+	merges []diffMerge
 	// memoryModes is how each jail got a snapshot's memory file, by VM ID.
 	memoryModes map[string]jailer.FileMode
 }
@@ -123,7 +125,10 @@ func (f *fakeHost) paused(ctx context.Context, j *jailer.Jail) (bool, error) {
 	defer f.mu.Unlock()
 	return f.isPaused[j.ID], nil
 }
-func (f *fakeHost) writeSnapshot(context.Context, *jailer.Jail) error {
+func (f *fakeHost) writeSnapshot(_ context.Context, _ *jailer.Jail, diff bool) error {
+	if diff {
+		return f.record("writeSnapshot diff")
+	}
 	return f.record("writeSnapshot")
 }
 func (f *fakeHost) cloneDisk(_ *jailer.Jail, dst string) error {
@@ -132,16 +137,26 @@ func (f *fakeHost) cloneDisk(_ *jailer.Jail, dst string) error {
 	}
 	return os.WriteFile(dst, []byte("disk"), 0o600)
 }
-func (f *fakeHost) collectSnapshot(_ *jailer.Jail, b *snapshot.Building) error {
+func (f *fakeHost) collectSnapshot(_ *jailer.Jail, b *snapshot.Building, merge diffMerge) (int64, error) {
 	if err := f.record("collectSnapshot"); err != nil {
-		return err
+		return 0, err
 	}
+	f.mu.Lock()
+	f.merges = append(f.merges, merge)
+	f.mu.Unlock()
 	for _, file := range []string{snapshot.StateFile, snapshot.MemoryFile} {
 		if err := os.WriteFile(b.Path(file), []byte(file), 0o600); err != nil {
-			return err
+			return 0, err
 		}
 	}
-	return nil
+	if merge.Base == "" {
+		return 0, nil
+	}
+	// The base must be there to merge onto; then the link goes.
+	if _, err := os.Stat(merge.Base); err != nil {
+		return 0, err
+	}
+	return 4096, os.Remove(merge.Base)
 }
 func (f *fakeHost) flushSnapshot(string) error { return f.record("flushSnapshot") }
 func (f *fakeHost) hostMemory() (hostMemory, error) {

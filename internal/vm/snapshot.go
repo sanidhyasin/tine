@@ -125,9 +125,16 @@ func (m *Manager) takeSnapshot(ctx context.Context, vm state.VM, kind state.Snap
 		}
 		return state.Snapshot{}, err
 	}
+	merge := m.planDiff(vm, kind, b)
+	wrote := false
 	fail := func(stage string, cause error) (state.Snapshot, error) {
 		if kind == state.SnapshotKindFork {
 			defer m.unpin(rec.ID)
+		}
+		if wrote {
+			// Firecracker may have reset its dirty-page tracking: the next
+			// snapshot must be a full one.
+			m.rebase(vm.ID, "")
 		}
 		log.WarnContext(ctx, "snapshot failed", "stage", stage, "err", cause)
 		m.cfg.Metrics.SnapshotFailed(string(kind), stage)
@@ -157,7 +164,8 @@ func (m *Manager) takeSnapshot(ctx context.Context, vm state.VM, kind state.Snap
 	}
 	t.mark("pause")
 	// The VM is frozen: its memory and its disk are consistent with each other.
-	writeErr := m.host.writeSnapshot(ctx, j)
+	wrote = true
+	writeErr := m.host.writeSnapshot(ctx, j, merge.Base != "")
 	t.mark("memory")
 	var diskErr error
 	if writeErr == nil {
@@ -178,10 +186,16 @@ func (m *Manager) takeSnapshot(ctx context.Context, vm state.VM, kind state.Snap
 	case diskErr != nil:
 		return fail("disk", diskErr)
 	}
-	if err := m.host.collectSnapshot(j, b); err != nil {
+	// With a diff, this makes the whole memory from the base's, while the VM runs.
+	diffBytes, err := m.host.collectSnapshot(j, b, merge)
+	if err != nil {
 		return fail("collect", err)
 	}
-	t.mark("collect")
+	if merge.Base != "" {
+		t.mark("merge")
+	} else {
+		t.mark("collect")
+	}
 	// Taking the snapshot reset the guest's vsock connections. Its agent
 	// keeps listening, so it should answer straight away.
 	agentCtx, agentCancel := context.WithTimeout(ctx, 10*time.Second)
@@ -197,6 +211,9 @@ func (m *Manager) takeSnapshot(ctx context.Context, vm state.VM, kind state.Snap
 		Kind: string(kind), VMID: vm.ID, Image: vm.Image, ImageCreatedAt: built,
 		VCPUs: vm.VCPUs, MemoryMiB: vm.MemoryMiB, Host: host, CreatedAt: rec.CreatedAt, TimingsMs: timings,
 	}
+	if merge.Base != "" {
+		meta.Base, meta.DiffBytes = merge.BaseID, diffBytes
+	}
 	size, err := b.Commit(&meta)
 	if err != nil {
 		return fail("store", err)
@@ -211,6 +228,7 @@ func (m *Manager) takeSnapshot(ctx context.Context, vm state.VM, kind state.Snap
 		return fail("record", err)
 	}
 	m.cfg.Metrics.SnapshotTaken(string(kind), timings, size)
+	m.rebase(vm.ID, ready.ID)
 	m.flushInBackground(vm.ID, ready.ID)
 	_ = m.store.Note(ctx, vm.ID, fmt.Sprintf("%s snapshot %s taken (paused %.0fms)", kind, ready.ID, timings["paused"]))
 	log.InfoContext(ctx, "snapshot taken", "kind", kind, "bytes", size, "timings_ms", timings)

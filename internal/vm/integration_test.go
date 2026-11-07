@@ -694,3 +694,80 @@ func formatTimings(t map[string]float64) string {
 	}
 	return strings.Join(parts, " · ")
 }
+
+// sha writes size MiB of random data to a file in the guest's RAM (tmpfs)
+// and returns its checksum.
+func shaOfRandom(t *testing.T, m *Manager, id, name string, mib int) string {
+	t.Helper()
+	return execOut(t, m, id, "sh", "-c", fmt.Sprintf("head -c %dM /dev/urandom > /dev/shm/%s && sha256sum < /dev/shm/%s", mib, name, name))
+}
+
+func shaOf(t *testing.T, m *Manager, id, name string) string {
+	t.Helper()
+	return execOut(t, m, id, "sh", "-c", "sha256sum < /dev/shm/"+name)
+}
+
+// A diff snapshot, merged onto its base, restores the VM's memory exactly.
+func TestRealDiffSnapshot(t *testing.T) {
+	m := realManager(t, func(c *Config) { c.DiffSnapshots = true })
+	ctx := context.Background()
+	vm, err := m.Create(ctx, CreateRequest{MemoryMiB: 512, Cold: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = m.Destroy(context.Background(), vm.ID) })
+	a := shaOfRandom(t, m, vm.ID, "a", 96)
+	first, err := m.Snapshot(ctx, vm.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := shaOfRandom(t, m, vm.ID, "b", 64)
+	second, err := m.Snapshot(ctx, vm.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m1, _ := m.snaps.Load(first.ID)
+	m2, err := m.snaps.Load(second.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("full snapshot paused %.0fms; diff paused %.0fms, %d MiB, merged in %.0fms",
+		m1.TimingsMs["paused"], m2.TimingsMs["paused"], m2.DiffBytes>>20, m2.TimingsMs["merge"])
+	if m1.Base != "" || m2.Base != first.ID {
+		t.Fatalf("bases: %q, %q; want a full snapshot, then a diff of it", m1.Base, m2.Base)
+	}
+	if m2.DiffBytes < 64<<20 || m2.DiffBytes > 256<<20 {
+		t.Errorf("the diff holds %d MiB; want the 64 MiB changed, and not much more", m2.DiffBytes>>20)
+	}
+
+	// Restored from the merged snapshot, both files are as they were.
+	restored, err := m.Create(ctx, CreateRequest{SnapshotID: second.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = m.Destroy(context.Background(), restored.ID) })
+	if got := shaOf(t, m, restored.ID, "a"); got != a {
+		t.Errorf("/dev/shm/a after the restore: %s, want %s", got, a)
+	}
+	if got := shaOf(t, m, restored.ID, "b"); got != b {
+		t.Errorf("/dev/shm/b after the restore: %s, want %s", got, b)
+	}
+	// A fork of the restored VM is a diff of the snapshot it came from,
+	// copied through the page cache, and its children see the same.
+	c := shaOfRandom(t, m, restored.ID, "c", 16)
+	res, err := m.Fork(ctx, restored.ID, ForkRequest{Count: 2})
+	if err != nil || res.Failed() > 0 {
+		t.Fatalf("Fork: %v %+v", err, res.Children)
+	}
+	if meta, _ := m.snaps.Load(res.Snapshot.ID); meta.Base != second.ID {
+		t.Errorf("the fork's snapshot's base = %q, want %s", meta.Base, second.ID)
+	}
+	for _, ch := range res.Children {
+		t.Cleanup(func() { _, _ = m.Destroy(context.Background(), ch.VM.ID) })
+		for name, want := range map[string]string{"a": a, "b": b, "c": c} {
+			if got := shaOf(t, m, ch.VM.ID, name); got != want {
+				t.Errorf("child %s: /dev/shm/%s = %s, want %s", ch.VM.ID, name, got, want)
+			}
+		}
+	}
+}

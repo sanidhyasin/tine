@@ -50,12 +50,15 @@ type host interface {
 	// paused reports whether the VM's Firecracker has it paused.
 	paused(ctx context.Context, j *jailer.Jail) (bool, error)
 	// writeSnapshot has Firecracker write the paused VM's state and memory
-	// into that directory.
-	writeSnapshot(ctx context.Context, j *jailer.Jail) error
+	// into that directory: all of its memory, or with diff, only the pages
+	// it changed since its last snapshot or restore.
+	writeSnapshot(ctx context.Context, j *jailer.Jail, diff bool) error
 	// cloneDisk makes dst a reflink copy of the VM's disk.
 	cloneDisk(j *jailer.Jail, dst string) error
 	// collectSnapshot moves the state and memory Firecracker wrote into b.
-	collectSnapshot(j *jailer.Jail, b *snapshot.Building) error
+	// For a diff, it makes b's memory from merge.Base with the diff written
+	// over it, and returns how many bytes the diff held.
+	collectSnapshot(j *jailer.Jail, b *snapshot.Building, merge diffMerge) (int64, error)
 	// flushSnapshot writes a snapshot file that's still in the page cache
 	// out to disk.
 	flushSnapshot(path string) error
@@ -130,6 +133,11 @@ func (h *hostOS) setup(ctx context.Context) error {
 	if err := os.MkdirAll(h.cfg.ChrootBaseDir, 0o700); err != nil {
 		return err
 	}
+	if h.cfg.DiffSnapshots {
+		if err := storage.CheckHoles(h.cfg.SnapshotsDir); err != nil {
+			return fmt.Errorf("diff snapshots need a filesystem that reports holes: %w", err)
+		}
+	}
 	return netns.Setup(ctx)
 }
 
@@ -191,7 +199,8 @@ func (h *hostOS) configureAndBoot(ctx context.Context, j *jailer.Jail, boot boot
 			return c.PutLogger(ctx, firecracker.Logger{LogPath: firecrackerLogPath, Level: firecracker.LogLevelInfo})
 		}},
 		{"machine", func() error {
-			return c.PutMachineConfig(ctx, firecracker.MachineConfig{VCPUCount: boot.VCPUs, MemSizeMiB: boot.MemoryMiB})
+			return c.PutMachineConfig(ctx, firecracker.MachineConfig{VCPUCount: boot.VCPUs, MemSizeMiB: boot.MemoryMiB,
+				TrackDirtyPages: h.cfg.DiffSnapshots})
 		}},
 		{"kernel", func() error {
 			return c.PutBootSource(ctx, firecracker.BootSource{KernelImagePath: kernelPath, BootArgs: boot.BootArgs})
@@ -232,11 +241,15 @@ func (h *hostOS) paused(ctx context.Context, j *jailer.Jail) (bool, error) {
 	return info.State == firecracker.StatePaused, err
 }
 
-func (h *hostOS) writeSnapshot(ctx context.Context, j *jailer.Jail) error {
+func (h *hostOS) writeSnapshot(ctx context.Context, j *jailer.Jail, diff bool) error {
+	typ := firecracker.SnapshotFull
+	if diff {
+		typ = firecracker.SnapshotDiff
+	}
 	return h.firecracker(j).CreateSnapshot(ctx, firecracker.SnapshotCreate{
 		SnapshotPath: snapshotStatePath,
 		MemFilePath:  snapshotMemPath,
-		SnapshotType: firecracker.SnapshotFull,
+		SnapshotType: typ,
 		// Snapshots needn't survive the host crashing, and waiting for the
 		// disk would keep the VM paused for longer.
 		SyncSnapshotFiles: firecracker.Bool(false),
@@ -247,14 +260,33 @@ func (h *hostOS) cloneDisk(j *jailer.Jail, dst string) error {
 	return storage.Clone(j.HostPath(rootfsPath), dst, 0o600)
 }
 
-func (h *hostOS) collectSnapshot(j *jailer.Jail, b *snapshot.Building) error {
+func (h *hostOS) collectSnapshot(j *jailer.Jail, b *snapshot.Building, merge diffMerge) (int64, error) {
 	// The jail and the store are on the same filesystem, so these are renames.
-	for from, to := range map[string]string{snapshotStatePath: snapshot.StateFile, snapshotMemPath: snapshot.MemoryFile} {
-		if err := os.Rename(j.HostPath(from), b.Path(to)); err != nil {
-			return err
-		}
+	if err := os.Rename(j.HostPath(snapshotStatePath), b.Path(snapshot.StateFile)); err != nil {
+		return 0, err
 	}
-	return nil
+	mem, dst := j.HostPath(snapshotMemPath), b.Path(snapshot.MemoryFile)
+	if merge.Base == "" {
+		return 0, os.Rename(mem, dst)
+	}
+	var err error
+	if merge.Copy {
+		err = storage.Copy(merge.Base, dst, 0o600)
+	} else {
+		err = storage.Clone(merge.Base, dst, 0o600)
+	}
+	if err != nil {
+		return 0, fmt.Errorf("diff snapshot: base: %w", err)
+	}
+	n, err := storage.ApplyDiff(dst, mem)
+	if err != nil {
+		return n, fmt.Errorf("diff snapshot: %w", err)
+	}
+	// The diff and the link to the base are done with.
+	if err := os.Remove(mem); err != nil {
+		return n, err
+	}
+	return n, os.Remove(merge.Base)
 }
 
 func (h *hostOS) flushSnapshot(path string) error {
@@ -317,10 +349,11 @@ func (h *hostOS) loadSnapshot(ctx context.Context, j *jailer.Jail) error {
 		return fmt.Errorf("logger: %w", err)
 	}
 	if err := c.LoadSnapshot(ctx, firecracker.SnapshotLoad{
-		SnapshotPath:  restoreStatePath,
-		MemBackend:    firecracker.MemoryBackend{BackendType: firecracker.MemoryBackendFile, BackendPath: restoreMemPath},
-		ResumeVM:      true,
-		ClockRealtime: h.cfg.ClockRealtime,
+		SnapshotPath:    restoreStatePath,
+		MemBackend:      firecracker.MemoryBackend{BackendType: firecracker.MemoryBackendFile, BackendPath: restoreMemPath},
+		ResumeVM:        true,
+		ClockRealtime:   h.cfg.ClockRealtime,
+		TrackDirtyPages: h.cfg.DiffSnapshots,
 	}); err != nil {
 		return fmt.Errorf("load: %w", err)
 	}

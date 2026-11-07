@@ -76,6 +76,12 @@ type Metadata struct {
 	Bytes map[string]int64 `json:"bytes"`
 	// TimingsMs is how long each step of taking it took, in milliseconds.
 	TimingsMs map[string]float64 `json:"timings_ms,omitempty"`
+	// Base is the snapshot whose memory this one's was made from, with a
+	// diff of the pages the VM changed since written over it. Empty for a
+	// full snapshot. The two are independent once made.
+	Base string `json:"base,omitempty"`
+	// DiffBytes is the memory the diff held: what the VM changed.
+	DiffBytes int64 `json:"diff_bytes,omitempty"`
 }
 
 // Host is what a snapshot depends on in the host that took it.

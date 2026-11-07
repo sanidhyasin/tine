@@ -157,6 +157,9 @@ func (m *Manager) Fork(ctx context.Context, parentID string, req ForkRequest) (F
 	out := ForkResult{Snapshot: snap, Children: children, Timings: t.millis()}
 	if meta, err := m.snaps.Load(snap.ID); err == nil {
 		out.Timings["paused"] = meta.TimingsMs["paused"]
+		if merge, ok := meta.TimingsMs["merge"]; ok {
+			out.Timings["merge"] = merge
+		}
 	}
 	failed := out.Failed()
 	m.cfg.Metrics.Forked(req.Count, failed, out.Timings)

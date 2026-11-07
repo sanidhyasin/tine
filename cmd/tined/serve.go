@@ -73,6 +73,10 @@ its own cgroup, outside tined's.`,
 	f.IntVar(&opts.vm.ForkParallelism, "fork-parallelism", opts.vm.ForkParallelism, "how many of a fork's children are restored at once")
 	f.BoolVar(&opts.vm.ClockRealtime, "clock-realtime", opts.vm.ClockRealtime,
 		"have Firecracker advance a restored guest's clock (tine-agent sets it either way)")
+	f.BoolVar(&opts.vm.DiffSnapshots, "diff-snapshots", opts.vm.DiffSnapshots,
+		"track the pages VMs change, so snapshots after a VM's first save only those (Firecracker developer preview)")
+	f.StringVar(&opts.vm.DiffMerge, "diff-merge", opts.vm.DiffMerge,
+		`how a diff becomes a whole snapshot: "reflink" the base, or "copy" it into the page cache (default: copy for forks, reflink otherwise)`)
 	f.StringVar(&opts.vm.JailerBin, "jailer", opts.vm.JailerBin, "jailer binary")
 	f.StringVar(&opts.vm.FirecrackerBin, "firecracker", opts.vm.FirecrackerBin, "firecracker binary (same release as the jailer)")
 	f.StringVar(&opts.vm.CgroupParent, "cgroup-parent", opts.vm.CgroupParent, "cgroup holding every VM's cgroup")
@@ -133,7 +137,7 @@ func serve(ctx context.Context, opts serveOptions) error {
 		return err
 	}
 	srv := &http.Server{
-		Handler:           api.NewServer(manager, version.Version, log, api.WithMetrics(met)),
+		Handler:           api.NewServer(manager, version.Version, log, api.WithMetrics(met), api.WithFeatures(features(opts.vm)...)),
 		ReadHeaderTimeout: 10 * time.Second,
 		ErrorLog:          slog.NewLogLogger(log.Handler(), slog.LevelWarn),
 	}
@@ -235,4 +239,13 @@ func notifySystemd(msg string) {
 	}
 	defer func() { _ = conn.Close() }()
 	_, _ = conn.Write([]byte(msg))
+}
+
+// features are the optional behaviours GET /v1/health reports.
+func features(c vm.Config) []string {
+	var f []string
+	if c.DiffSnapshots {
+		f = append(f, "diff-snapshots")
+	}
+	return f
 }

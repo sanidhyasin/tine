@@ -130,6 +130,7 @@ func (m *Manager) Rollback(ctx context.Context, id, snapID string) (state.VM, er
 	}
 	t := newTimer()
 	fail := func(stage string, cause error) (state.VM, error) {
+		m.untrack(id)
 		reason := fmt.Sprintf("rollback to %s failed at %s: %v", snapID, stage, cause)
 		log.ErrorContext(ctx, "rollback failed; the VM is marked failed", "stage", stage, "err", cause)
 		failed, _ := m.store.Transition(ctx, id, state.StateFailed, reason)
@@ -200,6 +201,7 @@ func (m *Manager) Rollback(ctx context.Context, id, snapID string) (state.VM, er
 	if err != nil {
 		return fail("record", err)
 	}
+	m.tracking(id, snapID)
 	_ = m.store.Note(ctx, id, fmt.Sprintf("rolled back to %s in %.0fms", snapID, timings["total"]))
 	m.cfg.Metrics.RolledBack(timings)
 	log.InfoContext(ctx, "rolled back", "timings_ms", timings)
