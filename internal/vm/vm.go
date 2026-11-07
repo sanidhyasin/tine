@@ -77,6 +77,12 @@ var (
 type Config struct {
 	JailerBin      string
 	FirecrackerBin string
+	// PageServerBin is tine-uffd, which serves the memory of VMs restored
+	// with a page server (the uffd fork strategies).
+	PageServerBin string
+	// PageCluster is how many pages, aligned, a page server copies in for
+	// each fault: 1 for just the page.
+	PageCluster int
 	// ChrootBaseDir holds the jails, ImagesDir the images, and SnapshotsDir
 	// the snapshots. All three must be on the same filesystem (the XFS data
 	// volume), for hard links and reflinks between them.
@@ -165,6 +171,8 @@ func DefaultConfig() Config {
 	return Config{
 		JailerBin:         "/usr/local/bin/jailer",
 		FirecrackerBin:    "/usr/local/bin/firecracker",
+		PageServerBin:     "/usr/local/bin/tine-uffd",
+		PageCluster:       1,
 		ChrootBaseDir:     "/srv/tine/jail",
 		ImagesDir:         image.DefaultImagesDir,
 		SnapshotsDir:      snapshot.DefaultDir,
@@ -212,6 +220,8 @@ func (c Config) withDefaults() Config {
 	}
 	set(&c.JailerBin, d.JailerBin)
 	set(&c.FirecrackerBin, d.FirecrackerBin)
+	set(&c.PageServerBin, d.PageServerBin)
+	setInt(&c.PageCluster, d.PageCluster)
 	set(&c.ChrootBaseDir, d.ChrootBaseDir)
 	set(&c.ImagesDir, d.ImagesDir)
 	set(&c.SnapshotsDir, d.SnapshotsDir)
@@ -390,11 +400,21 @@ type CreateRequest struct {
 	ParentID string
 	// admitted is the room Fork already reserved for this VM.
 	admitted *reservation
-	// strategy is how a fork's child gets its memory (Fork sets it).
-	strategy ForkStrategy
+	// Strategy is how a VM restored from a snapshot or template gets its
+	// memory: the fork strategies, ForkShare when empty. A booted VM
+	// ignores it. With ForkUffdPrefetch, the first restore of a snapshot
+	// records its working set, and the ones after copy that in.
+	Strategy ForkStrategy
+	// prefetch is a working set for the page server to copy in, and
+	// record has it record one for the snapshot (Fork sets them).
+	prefetch string
+	record   bool
 }
 
 func (m *Manager) normalize(ctx context.Context, req CreateRequest) (CreateRequest, error) {
+	if !validStrategy(req.Strategy) {
+		return req, fmt.Errorf("%w: no strategy %q", ErrInvalidRequest, req.Strategy)
+	}
 	if req.SnapshotID != "" && req.Cold {
 		return req, fmt.Errorf("%w: a VM can't be restored from a snapshot and booted cold", ErrInvalidRequest)
 	}
@@ -555,7 +575,7 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (state.VM, erro
 	}
 
 	memoryMode := jailer.Link
-	if req.strategy == ForkCopy {
+	if req.Strategy == ForkCopy {
 		memoryMode = jailer.Copy
 	}
 	n, j, err := m.resourcesFor(vm, memoryMode)
@@ -583,8 +603,24 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (state.VM, erro
 	undo = append(undo, func() error { return m.stopOwned(vm.ID, tr) })
 	t.mark("start")
 
+	var pages pageServer
+	if vm.SnapshotID != "" && req.Strategy == ForkUffdPrefetch && req.prefetch == "" && !req.record {
+		if req.prefetch = m.workingSetOf(vm.SnapshotID); req.prefetch == "" {
+			req.record = true // the first restore of it: the next ones get its working set
+		}
+	}
+	if vm.SnapshotID != "" && req.Strategy.pageServed() {
+		pages, err = m.host.startPageServer(ctx, j, pageServerSpec{
+			UID: vm.UID, GID: vm.UID, Cluster: m.cfg.PageCluster, Prefetch: req.prefetch,
+		})
+		if err != nil {
+			return fail("pages", err)
+		}
+		undo = append(undo, func() error { pages.kill(); return nil })
+		t.mark("pages")
+	}
 	if vm.SnapshotID != "" {
-		if err := m.host.loadSnapshot(ctx, j); err != nil {
+		if err := m.host.loadSnapshot(ctx, j, pages != nil); err != nil {
 			return fail("restore", err)
 		}
 		t.mark("restore")
@@ -607,6 +643,18 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (state.VM, erro
 		return fail("sync", err)
 	}
 	t.mark("sync")
+	if pages != nil {
+		if req.record {
+			// The pages a restore touches, for the next restores to copy in.
+			if ws, err := pages.workingSet(ctx); err != nil {
+				log.WarnContext(ctx, "couldn't get the working set from the page server", "err", err)
+			} else if err := m.saveWorkingSet(vm.SnapshotID, ws); err != nil {
+				log.WarnContext(ctx, "couldn't save the working set", "err", err)
+			}
+			t.mark("record")
+		}
+		pages.release()
+	}
 
 	vm, err = m.store.UpdateVM(ctx, vm.ID, "agent is ready", func(v *state.VM) error {
 		v.State = state.StateRunning

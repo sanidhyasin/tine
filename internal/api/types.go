@@ -103,6 +103,10 @@ type CreateVMRequest struct {
 	TTLSeconds int    `json:"ttl_seconds,omitempty"`
 	// Cold boots the VM even if its image has a template it could start from.
 	Cold bool `json:"cold,omitempty"`
+	// Strategy is how a VM restored from a template gets its memory, as for
+	// a fork (ForkRequest.Strategy). With "uffd-prefetch", the template's
+	// first restore records the pages it touches, and later ones copy them in.
+	Strategy string `json:"strategy,omitempty"`
 }
 
 // ListVMsResponse is GET /v1/vms's answer.
@@ -140,7 +144,9 @@ type ForkRequest struct {
 	// Strategy is how the children get their memory (see vm.ForkStrategy).
 	// "share" (the default, when empty) maps one memory file into every
 	// child; "copy" gives each child its own copy, the naive way, kept to
-	// benchmark against.
+	// benchmark against; "uffd" has a page server copy each page into the
+	// child as it's touched, and "uffd-prefetch" copies in the pages the
+	// first child touched as it started before the others ask.
 	Strategy string `json:"strategy,omitempty"`
 }
 

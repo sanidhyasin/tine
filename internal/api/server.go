@@ -248,6 +248,7 @@ func (s *Server) vms(w http.ResponseWriter, r *http.Request) {
 		}
 		created, err := s.backend.Create(r.Context(), vm.CreateRequest{
 			Image: req.Image, VCPUs: req.VCPUs, MemoryMiB: req.MemoryMiB, TTL: time.Duration(req.TTLSeconds) * time.Second, Cold: req.Cold,
+			Strategy: vm.ForkStrategy(req.Strategy),
 		})
 		if err != nil {
 			s.fail(w, r, err)

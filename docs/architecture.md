@@ -203,7 +203,8 @@ On this EBS volume a flush takes about 8 s per GiB, so back-to-back snapshots of
 ├── vmstate        Firecracker's device and CPU state     0444
 ├── memory         guest memory: never changes again        0444
 ├── rootfs.ext4    reflink copy of the disk at that moment  0400
-└── snapshot.json  metadata                                 0444
+├── snapshot.json  metadata                                 0444
+└── workingset     pages a restore touched, if recorded     0400
 ```
 
 - **Atomic.** A snapshot is gathered in `.new-<id>` and renamed into place when it's complete, so a directory named after a snapshot always holds a whole one.

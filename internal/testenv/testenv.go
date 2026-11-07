@@ -42,6 +42,31 @@ func RequireAgentBinary(t testing.TB) string {
 	return p
 }
 
+// RequirePageServer returns a copy of tine-uffd, built next to the agent
+// ($TINE_AGENT_BIN), that any user can run: a page server runs as its VM's
+// user. It skips the test if there's none.
+func RequirePageServer(t testing.TB) string {
+	t.Helper()
+	src := filepath.Join(filepath.Dir(RequireAgentBinary(t)), "tine-uffd")
+	data, err := os.ReadFile(src) //nolint:gosec // test-only path from the environment
+	if err != nil {
+		t.Skipf("%v: run make build", err)
+	}
+	dir, err := os.MkdirTemp("", "tine-uffd-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	if err := os.Chmod(dir, 0o755); err != nil { //nolint:gosec // VM users must reach it
+		t.Fatal(err)
+	}
+	bin := filepath.Join(dir, "tine-uffd")
+	if err := os.WriteFile(bin, data, 0o755); err != nil { //nolint:gosec // VM users must run it
+		t.Fatal(err)
+	}
+	return bin
+}
+
 // RequireArtifacts finds the artifacts in $TINE_ARTIFACTS (by default
 // ~/tine/artifacts), or skips the test if any is missing.
 func RequireArtifacts(t testing.TB) Artifacts {

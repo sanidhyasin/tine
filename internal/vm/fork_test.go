@@ -3,6 +3,7 @@ package vm
 import (
 	"context"
 	"errors"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -85,6 +86,64 @@ func TestForkStrategies(t *testing.T) {
 	parent := f.running(t)
 	if _, err := f.m.Fork(ctx, parent.ID, ForkRequest{Count: 1, Strategy: "teleport"}); !errors.Is(err, ErrInvalidRequest) {
 		t.Errorf("an unknown strategy = %v, want ErrInvalidRequest", err)
+	}
+}
+
+// The uffd strategies restore each child through a page server; with
+// prefetch, the first child records the working set and the others copy it in.
+func TestForkWithPageServers(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, func(c *Config) { c.ForkParallelism = 2; c.PageCluster = 4 })
+	parent := f.running(t)
+
+	res, err := f.m.Fork(ctx, parent.ID, ForkRequest{Count: 3, Strategy: ForkUffd})
+	if err != nil || res.Failed() != 0 {
+		t.Fatalf("Fork(uffd): %v, %d failed", err, res.Failed())
+	}
+	if len(f.host.pageServers) != 3 || f.host.uffdLoads != 3 {
+		t.Fatalf("%d page servers, %d uffd loads; want 3 each", len(f.host.pageServers), f.host.uffdLoads)
+	}
+	for _, p := range f.host.pageServers {
+		if p.spec.Prefetch != "" || p.asked != 0 || !p.released || p.killed || p.spec.Cluster != 4 || p.spec.UID == 0 {
+			t.Errorf("page server %+v", p)
+		}
+	}
+	if f.m.workingSetOf(res.Snapshot.ID) != "" {
+		t.Error("uffd recorded a working set")
+	}
+
+	f.host.pageServers = nil
+	res, err = f.m.Fork(ctx, parent.ID, ForkRequest{Count: 4, Strategy: ForkUffdPrefetch})
+	if err != nil || res.Failed() != 0 {
+		t.Fatalf("Fork(uffd-prefetch): %v, %d failed", err, res.Failed())
+	}
+	ws := f.m.workingSetOf(res.Snapshot.ID)
+	if ws == "" {
+		t.Fatal("no working set was saved")
+	}
+	if data, _ := os.ReadFile(ws); string(data) != "working set of "+res.Children[0].VM.ID { //nolint:gosec // a test file
+		t.Errorf("working set = %q, want the first child's", data)
+	}
+	first := f.host.pageServers[0]
+	if first.vmID != res.Children[0].VM.ID || first.asked != 1 || first.spec.Prefetch != "" {
+		t.Errorf("first child's page server %+v: want it to record, not prefetch", first)
+	}
+	for _, p := range f.host.pageServers[1:] {
+		if p.spec.Prefetch != ws || p.asked != 0 {
+			t.Errorf("page server %+v: want it to prefetch %s", p, ws)
+		}
+	}
+	if res.Timings["first"] <= 0 {
+		t.Errorf("timings %v, want first", res.Timings)
+	}
+
+	// A child that fails after its page server started stops it.
+	f.host.pageServers = nil
+	f.host.fail("loadSnapshot", errors.New("no"))
+	res, _ = f.m.Fork(ctx, parent.ID, ForkRequest{Count: 1, Strategy: ForkUffd})
+	f.host.fail("loadSnapshot", nil)
+	if res.Failed() != 1 || len(f.host.pageServers) != 1 || !f.host.pageServers[0].killed {
+		t.Errorf("a failed child: %d failed, page servers %+v", res.Failed(), f.host.pageServers)
 	}
 }
 
@@ -254,5 +313,37 @@ func TestForkChildrenHaveTheirOwnIdentity(t *testing.T) {
 			t.Errorf("sync %+v: not a child's own", s)
 		}
 		hostnames[s.Hostname], machineIDs[s.MachineID], entropy[string(s.Entropy)] = true, true, true
+	}
+}
+
+// A create from a snapshot with uffd-prefetch records the snapshot's working
+// set the first time, and copies it in after that.
+func TestCreateWithPrefetch(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, nil)
+	vm := f.running(t)
+	snap, err := f.m.Snapshot(ctx, vm.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range 2 {
+		if _, err := f.m.Create(ctx, CreateRequest{SnapshotID: snap.ID, Strategy: ForkUffdPrefetch}); err != nil {
+			t.Fatal(err)
+		}
+		p := f.host.pageServers[i]
+		if i == 0 && (p.asked != 1 || p.spec.Prefetch != "") {
+			t.Errorf("first restore: %+v, want it to record", p)
+		}
+		if i == 1 && (p.asked != 0 || p.spec.Prefetch != f.m.workingSetOf(snap.ID) || p.spec.Prefetch == "") {
+			t.Errorf("second restore: %+v, want it to prefetch the working set", p)
+		}
+	}
+	if _, err := f.m.Create(ctx, CreateRequest{SnapshotID: snap.ID, Strategy: "teleport"}); !errors.Is(err, ErrInvalidRequest) {
+		t.Errorf("an unknown strategy = %v, want ErrInvalidRequest", err)
+	}
+	// A booted VM has no memory to serve: the strategy changes nothing.
+	f.host.pageServers = nil
+	if _, err := f.m.Create(ctx, CreateRequest{Cold: true, Strategy: ForkUffd}); err != nil || len(f.host.pageServers) != 0 {
+		t.Errorf("a cold create with uffd: %v, %d page servers", err, len(f.host.pageServers))
 	}
 }

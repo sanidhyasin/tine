@@ -771,3 +771,47 @@ func TestRealDiffSnapshot(t *testing.T) {
 		}
 	}
 }
+
+// Children restored through a page server have the parent's memory, all
+// of it their own.
+func TestRealForkWithPageServer(t *testing.T) {
+	bin := testenv.RequirePageServer(t)
+	m := realManager(t, func(c *Config) { c.PageServerBin = bin })
+	ctx := context.Background()
+	parent, err := m.Create(ctx, CreateRequest{MemoryMiB: 512})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = m.Destroy(context.Background(), parent.ID) })
+	a := shaOfRandom(t, m, parent.ID, "a", 64)
+	for _, strategy := range []ForkStrategy{ForkUffd, ForkUffdPrefetch} {
+		res, err := m.Fork(ctx, parent.ID, ForkRequest{Count: 3, Strategy: strategy})
+		if err != nil || res.Failed() > 0 {
+			t.Fatalf("Fork(%s): %v %+v", strategy, err, res.Children)
+		}
+		t.Logf("%s fork of 3: %s", strategy, formatTimings(res.Timings))
+		if got := m.workingSetOf(res.Snapshot.ID) != ""; got != (strategy == ForkUffdPrefetch) {
+			t.Errorf("%s: working set saved: %v", strategy, got)
+		}
+		for _, c := range res.Children {
+			t.Cleanup(func() { _, _ = m.Destroy(context.Background(), c.VM.ID) })
+			if got := shaOf(t, m, c.VM.ID, "a"); got != a {
+				t.Errorf("%s child %s: /dev/shm/a = %s, want %s", strategy, c.VM.ID, got, a)
+			}
+			rss, pss := smapsRollup(t, c.VM)
+			t.Logf("%s child %s: RSS %d MiB, PSS %d MiB, restored in %.0fms", strategy, c.VM.ID, rss>>20, pss>>20, c.VM.Timings["total"])
+			if pss < rss*8/10 {
+				t.Errorf("%s child %s: PSS %d MiB of RSS %d MiB: it shares its memory", strategy, c.VM.ID, pss>>20, rss>>20)
+			}
+		}
+		for _, c := range res.Children {
+			if _, err := m.Destroy(ctx, c.VM.ID); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if _, err := m.Destroy(ctx, parent.ID); err != nil {
+		t.Fatal(err)
+	}
+	requireClean(t, m, "after the test")
+}

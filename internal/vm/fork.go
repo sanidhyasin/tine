@@ -39,12 +39,18 @@ const (
 	// ForkCopy: every child gets its own full copy of the memory file, so
 	// nothing is shared (rung 2, the naive way, for comparison).
 	ForkCopy ForkStrategy = "copy"
+	// ForkUffd: every child's memory is served by a page server, a page at
+	// a time as it's touched, into memory of its own (rung 5; pages.go).
+	ForkUffd ForkStrategy = "uffd"
+	// ForkUffdPrefetch is ForkUffd, with the pages the first child touched
+	// as it started copied in for the others before they ask.
+	ForkUffdPrefetch ForkStrategy = "uffd-prefetch"
 )
 
 // validStrategy reports whether s is a fork strategy tined knows.
 func validStrategy(s ForkStrategy) bool {
 	switch s {
-	case "", ForkShare, ForkCopy:
+	case "", ForkShare, ForkCopy, ForkUffd, ForkUffdPrefetch:
 		return true
 	}
 	return false
@@ -135,19 +141,34 @@ func (m *Manager) Fork(ctx context.Context, parentID string, req ForkRequest) (F
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Duration(req.Count)*m.cfg.AgentTimeout+time.Minute)
 	defer cancel()
 	children := make([]ForkChild, req.Count)
+	child := CreateRequest{SnapshotID: snap.ID, TTL: req.TTL, ParentID: parent.ID, admitted: res, Strategy: req.Strategy}
+	first := 0
+	if req.Strategy == ForkUffdPrefetch {
+		if child.prefetch = m.workingSetOf(snap.ID); child.prefetch == "" {
+			// The first child alone, recording the pages it touches as it
+			// starts; the others then copy those in.
+			rec := child
+			rec.record = true
+			vm, err := m.Create(ctx, rec)
+			children[0] = ForkChild{VM: vm, Err: err}
+			first = 1
+			child.prefetch = m.workingSetOf(snap.ID)
+			t.mark("first")
+		}
+	}
 	jobs := make(chan int)
 	var wg sync.WaitGroup
-	for range min(m.cfg.ForkParallelism, req.Count) {
+	for range min(m.cfg.ForkParallelism, req.Count-first) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for i := range jobs {
-				vm, err := m.Create(ctx, CreateRequest{SnapshotID: snap.ID, TTL: req.TTL, ParentID: parent.ID, admitted: res, strategy: req.Strategy})
+				vm, err := m.Create(ctx, child)
 				children[i] = ForkChild{VM: vm, Err: err}
 			}
 		}()
 	}
-	for i := range req.Count {
+	for i := first; i < req.Count; i++ {
 		jobs <- i
 	}
 	close(jobs)

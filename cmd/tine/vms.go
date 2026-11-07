@@ -80,6 +80,7 @@ restored from it, in milliseconds. Otherwise, or with --cold, it boots.`,
 	f.DurationVar(&ttl, "ttl", 0, "destroy the VM automatically after this long (default: tined's, normally 1h)")
 	f.BoolVarP(&quiet, "quiet", "q", false, "print only the VM's ID")
 	f.BoolVar(&req.Cold, "cold", false, "boot the VM, even if its image has a template to start from")
+	f.StringVar(&req.Strategy, "strategy", "", `how a VM restored from a template gets its memory: "share" (the default), "copy", "uffd" or "uffd-prefetch"`)
 	return cmd
 }
 

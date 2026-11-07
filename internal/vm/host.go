@@ -66,8 +66,12 @@ type host interface {
 	// run, and this host's CPU and kernel.
 	hostInfo(ctx context.Context) (snapshot.Host, error)
 	// loadSnapshot has a new Firecracker load the snapshot in the VM's jail
-	// (restoreStatePath, restoreMemPath) and resume it.
-	loadSnapshot(ctx context.Context, j *jailer.Jail) error
+	// (restoreStatePath, restoreMemPath) and resume it. With uffd, its
+	// memory comes from the page server startPageServer started.
+	loadSnapshot(ctx context.Context, j *jailer.Jail, uffd bool) error
+	// startPageServer starts tine-uffd for the VM, once its Firecracker has
+	// started, to serve its memory from restoreMemPath (see pages.go).
+	startPageServer(ctx context.Context, j *jailer.Jail, spec pageServerSpec) (pageServer, error)
 	// syncGuest makes the guest current and unique, through its agent.
 	syncGuest(ctx context.Context, j *jailer.Jail, req agentproto.SyncRequest) (agentproto.SyncResult, error)
 	// memory reads how much host memory the VM's Firecracker uses.
@@ -337,7 +341,7 @@ func (h *hostOS) hostInfo(ctx context.Context) (snapshot.Host, error) {
 	return info, nil
 }
 
-func (h *hostOS) loadSnapshot(ctx context.Context, j *jailer.Jail) error {
+func (h *hostOS) loadSnapshot(ctx context.Context, j *jailer.Jail, uffd bool) error {
 	c := h.firecracker(j)
 	readyCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
@@ -348,9 +352,13 @@ func (h *hostOS) loadSnapshot(ctx context.Context, j *jailer.Jail) error {
 	if err := c.PutLogger(ctx, firecracker.Logger{LogPath: firecrackerLogPath, Level: firecracker.LogLevelInfo}); err != nil {
 		return fmt.Errorf("logger: %w", err)
 	}
+	backend := firecracker.MemoryBackend{BackendType: firecracker.MemoryBackendFile, BackendPath: restoreMemPath}
+	if uffd {
+		backend = firecracker.MemoryBackend{BackendType: firecracker.MemoryBackendUffd, BackendPath: pageServerSocket}
+	}
 	if err := c.LoadSnapshot(ctx, firecracker.SnapshotLoad{
 		SnapshotPath:    restoreStatePath,
-		MemBackend:      firecracker.MemoryBackend{BackendType: firecracker.MemoryBackendFile, BackendPath: restoreMemPath},
+		MemBackend:      backend,
 		ResumeVM:        true,
 		ClockRealtime:   h.cfg.ClockRealtime,
 		TrackDirtyPages: h.cfg.DiffSnapshots,

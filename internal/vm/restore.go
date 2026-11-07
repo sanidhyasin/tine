@@ -173,7 +173,7 @@ func (m *Manager) Rollback(ctx context.Context, id, snapID string) (state.VM, er
 	}
 	m.track(id, proc)
 	t.mark("start")
-	if err := m.host.loadSnapshot(ctx, j); err != nil {
+	if err := m.host.loadSnapshot(ctx, j, false); err != nil {
 		return fail("restore", err)
 	}
 	t.mark("restore")

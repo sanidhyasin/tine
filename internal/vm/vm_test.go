@@ -60,6 +60,10 @@ type fakeHost struct {
 	mem hostMemory
 	// merges are what collectSnapshot was asked to do, in order.
 	merges []diffMerge
+	// pageServers are the page servers started, in order; uffdLoads counts
+	// the loads that used one.
+	pageServers []*fakePageServer
+	uffdLoads   int
 	// memoryModes is how each jail got a snapshot's memory file, by VM ID.
 	memoryModes map[string]jailer.FileMode
 }
@@ -185,8 +189,11 @@ func (f *fakeHost) hostInfo(context.Context) (snapshot.Host, error) {
 	}
 	return fakeSnapshotHost, nil
 }
-func (f *fakeHost) loadSnapshot(context.Context, *jailer.Jail) error {
+func (f *fakeHost) loadSnapshot(_ context.Context, _ *jailer.Jail, uffd bool) error {
 	f.mu.Lock()
+	if uffd {
+		f.uffdLoads++
+	}
 	f.loading++
 	f.maxLoading = max(f.maxLoading, f.loading)
 	delay := f.loadDelay
@@ -791,4 +798,29 @@ func counterValue(t *testing.T, m *metrics.Metrics, series string) float64 {
 		}
 	}
 	return 0
+}
+
+type fakePageServer struct {
+	vmID             string
+	spec             pageServerSpec
+	asked            int // working sets asked for
+	released, killed bool
+}
+
+func (p *fakePageServer) workingSet(context.Context) ([]byte, error) {
+	p.asked++
+	return []byte("working set of " + p.vmID), nil
+}
+func (p *fakePageServer) release() { p.released = true }
+func (p *fakePageServer) kill()    { p.killed = true }
+
+func (f *fakeHost) startPageServer(_ context.Context, j *jailer.Jail, spec pageServerSpec) (pageServer, error) {
+	if err := f.record("startPageServer"); err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	p := &fakePageServer{vmID: j.ID, spec: spec}
+	f.pageServers = append(f.pageServers, p)
+	return p, nil
 }

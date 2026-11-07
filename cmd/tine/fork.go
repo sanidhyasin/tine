@@ -12,9 +12,10 @@ import (
 
 func newForkCmd(g *globals) *cobra.Command {
 	var (
-		count int
-		ttl   time.Duration
-		quiet bool
+		count    int
+		ttl      time.Duration
+		quiet    bool
+		strategy string
 	)
 	cmd := &cobra.Command{
 		Use:   "fork VM -n COUNT",
@@ -24,7 +25,12 @@ paused only while the snapshot is taken, and carries on as before.
 
 Each child starts exactly where the VM was, programs and all, with its own ID,
 network, disk, hostname and machine ID. The children share the VM's memory as
-it was until they change it ('tine ls --tree' shows how much).`,
+it was until they change it ('tine ls --tree' shows how much).
+
+--strategy picks another way to give the children memory, for comparing them:
+"copy" gives each its own copy of the memory file; "uffd" has a page server copy
+pages in as each child touches them; "uffd-prefetch" also copies in, for every
+child after the first, the pages the first touched as it started.`,
 		Example: `  tine fork vm-7f3k -n 5
   for id in $(tine fork -q vm-7f3k -n 10); do tine exec $id -- ./try.sh & done`,
 		Args: cobra.ExactArgs(1),
@@ -36,7 +42,7 @@ it was until they change it ('tine ls --tree' shows how much).`,
 			if err != nil {
 				return err
 			}
-			res, err := c.Fork(ctx, id, api.ForkRequest{Count: count, TTLSeconds: int(ttl.Seconds())})
+			res, err := c.Fork(ctx, id, api.ForkRequest{Count: count, TTLSeconds: int(ttl.Seconds()), Strategy: strategy})
 			if err != nil {
 				return err
 			}
@@ -84,5 +90,6 @@ it was until they change it ('tine ls --tree' shows how much).`,
 	f.IntVarP(&count, "count", "n", 1, "how many children")
 	f.DurationVar(&ttl, "ttl", 0, "how long each child lives (default: tined's, normally 1h)")
 	f.BoolVarP(&quiet, "quiet", "q", false, "print only the children's IDs, one a line")
+	f.StringVar(&strategy, "strategy", "", `how the children get their memory: "share" (the default), "copy", "uffd" or "uffd-prefetch"`)
 	return cmd
 }

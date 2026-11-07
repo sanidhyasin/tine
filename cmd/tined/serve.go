@@ -77,6 +77,8 @@ its own cgroup, outside tined's.`,
 		"track the pages VMs change, so snapshots after a VM's first save only those (Firecracker developer preview)")
 	f.StringVar(&opts.vm.DiffMerge, "diff-merge", opts.vm.DiffMerge,
 		`how a diff becomes a whole snapshot: "reflink" the base, or "copy" it into the page cache (default: copy for forks, reflink otherwise)`)
+	f.StringVar(&opts.vm.PageServerBin, "page-server", opts.vm.PageServerBin, "tine-uffd binary, for forks with the uffd strategies")
+	f.IntVar(&opts.vm.PageCluster, "page-cluster", opts.vm.PageCluster, "pages a page server copies in for each fault, aligned around it")
 	f.StringVar(&opts.vm.JailerBin, "jailer", opts.vm.JailerBin, "jailer binary")
 	f.StringVar(&opts.vm.FirecrackerBin, "firecracker", opts.vm.FirecrackerBin, "firecracker binary (same release as the jailer)")
 	f.StringVar(&opts.vm.CgroupParent, "cgroup-parent", opts.vm.CgroupParent, "cgroup holding every VM's cgroup")
