@@ -258,26 +258,37 @@ def chart_create_cdf(sets: list[Results], out: Path):
 
 
 def chart_restore_stages(res: Results, out: Path):
-    runs = [r for rs in res.points("create-template").values() for r in rs]
-    stages = ["allocate", "network", "jail", "start", "restore", "agent", "sync"]
-    med = [statistics.median(timing(runs, s)) if timing(runs, s) else 0 for s in stages]
-    if not any(med):
+    # The small first stages as one; "pages" (starting a page server) and
+    # "record" (saving the working set) only with the uffd strategies.
+    stages = [("setup", ["allocate", "network", "jail", "start"]), ("page server", ["pages"]), ("restore", ["restore"]),
+              ("agent", ["agent"]), ("sync", ["sync"]), ("record", ["record"])]
+    rows = []
+    for params, runs in res.points("create-template").items():
+        med = [sum(statistics.median(timing(runs, k)) for k in keys if timing(runs, k)) for _, keys in stages]
+        if any(med):
+            rows.append((series(dict(params)), med))
+    if not rows:
         return
-    fig, ax = plt.subplots(figsize=(7.5, 2.0))
-    left = 0.0
-    for i, (s, m) in enumerate(zip(stages, med)):
-        ax.barh(0, max(m - 0.4, 0.05), left=left, height=0.5, color=SLOTS[i % len(SLOTS)], label=s)
-        if m > 8:
-            ax.text(left + m / 2, 0.42, f"{s}\n{fmt_ms(m)}", ha="center", va="bottom", color=INK2, fontsize=8)
-        left += m
-    ax.set_yticks([])
-    ax.set_xlim(0, left * 1.02)
+    rows.sort(key=lambda r: sum(r[1]), reverse=True)
+    fig, ax = plt.subplots(figsize=(7.5, 0.9 + 0.5 * len(rows)))
+    used = set()
+    for y, (name, med) in enumerate(rows):
+        left = 0.0
+        for i, ((stage, _), m) in enumerate(zip(stages, med)):
+            if m <= 0:
+                continue
+            ax.barh(y, max(m - 0.4, 0.05), left=left, height=0.55, color=SLOTS[i], label=stage if stage not in used else None)
+            used.add(stage)
+            left += m
+        ax.text(left, y, f"  {fmt_ms(left)}", va="center", color=INK2, fontsize=9)
+    ax.set_yticks(range(len(rows)), [name for name, _ in rows])
     ms_axis(ax, "x")
+    ax.set_xlim(0, max(sum(m) for _, m in rows) * 1.15)
     ax.grid(axis="y", visible=False)
-    ax.set_ylim(-0.4, 1.3)
-    ax.legend(ncol=7, loc="upper center", bbox_to_anchor=(0.5, -0.28), fontsize=8, handlelength=1.2, columnspacing=1.2)
-    finish(fig, ax, out / "restore-stages.png", f"Where a restore's {fmt_ms(left)} go",
-           "Median of each stage, creating a VM from its image's template")
+    ax.legend(ncol=6, loc="upper center", bbox_to_anchor=(0.5, -0.9 / (0.9 + 0.5 * len(rows)) - 0.05), fontsize=8,
+              handlelength=1.2, columnspacing=1.2, frameon=False)
+    finish(fig, ax, out / "restore-stages.png", "Where a create from a template spends its time",
+           "Median of each stage, by how the VM gets its memory")
 
 
 def chart_fork(sets: list[Results], out: Path, key: str, filename: str, title: str, subtitle: str, ylabel: str):
