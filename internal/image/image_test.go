@@ -295,3 +295,26 @@ func TestOpenAndList(t *testing.T) {
 		t.Errorf("List of a missing directory = %v, %v; want empty", list, err)
 	}
 }
+
+func TestInstallExtra(t *testing.T) {
+	root := t.TempDir()
+	src := filepath.Join(t.TempDir(), "tool")
+	if err := os.WriteFile(src, []byte("#!/bin/sh\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := installExtra(root, []ExtraFile{{Source: src, Path: "/usr/local/bin/tool"}}); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(filepath.Join(root, "usr/local/bin/tool"))
+	if err != nil || fi.Mode().Perm() != 0o755 {
+		t.Errorf("installed: %v, %v; want mode 0755", fi, err)
+	}
+	// Never through a symlink that points out of the guest.
+	out := t.TempDir()
+	if err := os.Symlink(out, filepath.Join(root, "evil")); err != nil {
+		t.Fatal(err)
+	}
+	if err := installExtra(root, []ExtraFile{{Source: src, Path: "/evil/tool"}}); err == nil {
+		t.Error("installing through a symlinked directory: want an error")
+	}
+}

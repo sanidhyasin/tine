@@ -4,6 +4,8 @@
 
 MODULE   := github.com/sanidhyasin/tine
 BINARIES := tine tined tine-agent tine-bench
+# Benchmark workloads: built for the guest, and baked into the "bench" image.
+WORKLOADS := tine-touch tine-dirty
 OUT      := bin/linux-amd64
 
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
@@ -24,7 +26,7 @@ help: ## List the targets
 .PHONY: build
 build: ## Build every binary for the Linux server into bin/linux-amd64/
 	@mkdir -p $(OUT)
-	@for b in $(BINARIES); do \
+	@for b in $(BINARIES) $(WORKLOADS); do \
 		echo "build $(OUT)/$$b"; \
 		CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags '$(LDFLAGS)' -o $(OUT)/$$b ./cmd/$$b || exit 1; \
 	done
@@ -106,6 +108,12 @@ base-image: deploy ## Build the "base" image on the dev server with this tree's 
 	./scripts/dev-server.sh ssh 'set -e; cd ~/tine/artifacts && sudo tined image import base --force \
 		--kernel "$$(ls vmlinux-* | sort -V | tail -1)" --rootfs "$$(ls ubuntu-*.squashfs | sort -V | tail -1)" \
 		&& tine image warm base && tine images'
+
+.PHONY: bench-image
+bench-image: deploy ## Build the "bench" image: base, plus tine-touch and tine-dirty (server must be up)
+	./scripts/dev-server.sh ssh 'set -e; cd ~/tine/artifacts && sudo tined image import bench --force \
+		--kernel "$$(ls vmlinux-* | sort -V | tail -1)" --rootfs "$$(ls ubuntu-*.squashfs | sort -V | tail -1)" \
+		$(foreach w,$(WORKLOADS),--add ~/tine/$(OUT)/$(w):/usr/local/bin/$(w)) && tine images'
 
 .PHONY: clean
 clean: ## Remove build output

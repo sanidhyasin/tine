@@ -218,3 +218,15 @@ func (g guestFS) symlink(target, guestPath string) error {
 	}
 	return os.Symlink(target, p)
 }
+
+// installExtra copies more executables into the unpacked root filesystem,
+// never through a symlink.
+func installExtra(root string, files []ExtraFile) error {
+	g := guestFS{root: root}
+	for _, f := range files {
+		if err := g.copyIn(f.Source, f.Path, 0o755); err != nil {
+			return fmt.Errorf("install %s: %w", f.Path, err)
+		}
+	}
+	return nil
+}

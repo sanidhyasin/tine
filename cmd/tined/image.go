@@ -26,8 +26,9 @@ func newImageCmd() *cobra.Command {
 
 func newImageImportCmd() *cobra.Command {
 	var (
-		opts image.ImportOptions
-		size string
+		opts  image.ImportOptions
+		size  string
+		extra []string
 	)
 	cmd := &cobra.Command{
 		Use:   "import NAME",
@@ -49,6 +50,13 @@ Example, on the dev server:
 				return err
 			}
 			opts.SizeBytes = n
+			for _, x := range extra {
+				src, dst, ok := strings.Cut(x, ":")
+				if !ok || src == "" || dst == "" {
+					return fmt.Errorf("--add %q: want HOST_PATH:GUEST_PATH", x)
+				}
+				opts.Extra = append(opts.Extra, image.ExtraFile{Source: src, Path: dst})
+			}
 			opts.Log = slog.New(slog.NewTextHandler(cmd.ErrOrStderr(), nil))
 			img, err := image.Import(cmd.Context(), opts)
 			if err != nil {
@@ -67,6 +75,7 @@ Example, on the dev server:
 	f.StringVar(&size, "size", "4G", `disk size, e.g. "4G" or "512M" (sparse: unused space costs nothing)`)
 	f.StringVar(&opts.ImagesDir, "images-dir", image.DefaultImagesDir, "where images are stored")
 	f.BoolVar(&opts.Force, "force", false, "replace an existing image of the same name")
+	f.StringArrayVar(&extra, "add", nil, "another executable to install, as HOST_PATH:GUEST_PATH (repeatable)")
 	_ = cmd.MarkFlagRequired("kernel")
 	_ = cmd.MarkFlagRequired("rootfs")
 	return cmd

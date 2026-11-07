@@ -67,9 +67,10 @@ type Metadata struct {
 	// BuildSeconds is how long Import took.
 	BuildSeconds float64 `json:"build_seconds"`
 
-	Kernel KernelInfo `json:"kernel"`
-	Rootfs RootfsInfo `json:"rootfs"`
-	Agent  AgentInfo  `json:"agent"`
+	Kernel KernelInfo  `json:"kernel"`
+	Rootfs RootfsInfo  `json:"rootfs"`
+	Agent  AgentInfo   `json:"agent"`
+	Extra  []ExtraFile `json:"extra,omitempty"`
 }
 
 // KernelInfo describes an image's kernel.
@@ -88,6 +89,15 @@ type RootfsInfo struct {
 }
 
 // AgentInfo describes the tine-agent inside an image.
+// ExtraFile is a file installed in an image besides the agent.
+type ExtraFile struct {
+	// Source is the file on the host.
+	Source string `json:"-"`
+	// Path is where it goes in the guest: an absolute path.
+	Path   string `json:"path"`
+	SHA256 string `json:"sha256"`
+}
+
 type AgentInfo struct {
 	// Version is what the agent printed for --version, if it could run here.
 	Version string `json:"version,omitempty"`
@@ -119,6 +129,9 @@ type ImportOptions struct {
 	RootfsSquashfs string
 	// Agent is the tine-agent binary to install, built for the guest (linux/amd64).
 	Agent string
+	// Extra are more files to install in the guest, as executables: for
+	// example the benchmark workloads in the "bench" image.
+	Extra []ExtraFile
 	// SizeBytes defaults to DefaultSizeBytes.
 	SizeBytes int64
 	// Force replaces an existing image of the same name. VMs already
@@ -179,8 +192,22 @@ func Import(ctx context.Context, opts ImportOptions) (*Image, error) {
 	if err := run(ctx, "unsquashfs", "-no-progress", "-d", root, opts.RootfsSquashfs); err != nil {
 		return nil, fmt.Errorf("import %s: unpack rootfs: %w", opts.Name, err)
 	}
+	for i, x := range opts.Extra {
+		if !filepath.IsAbs(x.Path) {
+			return nil, fmt.Errorf("import %s: %s: the path in the guest must be absolute", opts.Name, x.Path)
+		}
+		sum, err := hashFile(x.Source)
+		if err != nil {
+			return nil, fmt.Errorf("import %s: %w", opts.Name, err)
+		}
+		opts.Extra[i].SHA256 = sum
+	}
+	meta.Extra = opts.Extra
 	log.Info("customizing the guest")
 	if err := Customize(root, opts.Agent, meta); err != nil {
+		return nil, fmt.Errorf("import %s: %w", opts.Name, err)
+	}
+	if err := installExtra(root, opts.Extra); err != nil {
 		return nil, fmt.Errorf("import %s: %w", opts.Name, err)
 	}
 
