@@ -137,6 +137,14 @@ func (h *hostOS) setup(ctx context.Context) error {
 	if err := os.MkdirAll(h.cfg.ChrootBaseDir, 0o700); err != nil {
 		return err
 	}
+	if h.cfg.KSM {
+		if err := enableKSM(); err != nil {
+			return err
+		}
+		if run, _ := os.ReadFile("/sys/kernel/mm/ksm/run"); strings.TrimSpace(string(run)) != "1" {
+			h.cfg.Log.Warn("ksm is off: VMs' memory is mergeable, but nothing merges it until /sys/kernel/mm/ksm/run is 1")
+		}
+	}
 	if h.cfg.DiffSnapshots {
 		if err := storage.CheckHoles(h.cfg.SnapshotsDir); err != nil {
 			return fmt.Errorf("diff snapshots need a filesystem that reports holes: %w", err)
@@ -217,6 +225,12 @@ func (h *hostOS) configureAndBoot(ctx context.Context, j *jailer.Jail, boot boot
 		}},
 		{"vsock", func() error { return c.PutVsock(ctx, firecracker.Vsock{GuestCID: guestCID, UDSPath: vsockPath}) }},
 		{"entropy", func() error { return c.PutEntropy(ctx, firecracker.EntropyDevice{}) }},
+		{"balloon", func() error {
+			if !h.cfg.Balloon {
+				return nil
+			}
+			return c.PutBalloon(ctx, firecracker.Balloon{DeflateOnOOM: true, FreePageReporting: true})
+		}},
 		{"start", func() error { return c.StartInstance(ctx) }},
 	}
 	for _, s := range steps {
@@ -353,8 +367,10 @@ func (h *hostOS) loadSnapshot(ctx context.Context, j *jailer.Jail, uffd bool) er
 		return fmt.Errorf("logger: %w", err)
 	}
 	backend := firecracker.MemoryBackend{BackendType: firecracker.MemoryBackendFile, BackendPath: restoreMemPath}
+	var huge firecracker.HugePages
 	if uffd {
 		backend = firecracker.MemoryBackend{BackendType: firecracker.MemoryBackendUffd, BackendPath: pageServerSocket}
+		huge = firecracker.HugePages(h.cfg.PageServerHugePages)
 	}
 	if err := c.LoadSnapshot(ctx, firecracker.SnapshotLoad{
 		SnapshotPath:    restoreStatePath,
@@ -362,6 +378,7 @@ func (h *hostOS) loadSnapshot(ctx context.Context, j *jailer.Jail, uffd bool) er
 		ResumeVM:        true,
 		ClockRealtime:   h.cfg.ClockRealtime,
 		TrackDirtyPages: h.cfg.DiffSnapshots,
+		HugePages:       huge,
 	}); err != nil {
 		return fmt.Errorf("load: %w", err)
 	}

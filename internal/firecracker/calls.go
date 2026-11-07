@@ -64,6 +64,11 @@ func (c *Client) PutEntropy(ctx context.Context, e EntropyDevice) error {
 	return c.do(ctx, http.MethodPut, "/entropy", "/entropy", e, nil)
 }
 
+// PutBalloon adds a virtio-balloon device. It must be set before the VM starts.
+func (c *Client) PutBalloon(ctx context.Context, b Balloon) error {
+	return c.do(ctx, http.MethodPut, "/balloon", "/balloon", b, nil)
+}
+
 // Actions.
 
 // StartInstance boots the configured VM.

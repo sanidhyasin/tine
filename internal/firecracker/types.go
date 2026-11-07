@@ -91,6 +91,18 @@ type EntropyDevice struct {
 	RateLimiter *RateLimiter `json:"rate_limiter,omitempty"`
 }
 
+// Balloon is a virtio-balloon device (PUT /balloon). tine uses it only for
+// free page reporting: the guest tells Firecracker which of its pages are
+// free, and Firecracker gives them back to the host (MADV_DONTNEED).
+type Balloon struct {
+	// AmountMiB is how much memory the balloon takes from the guest.
+	AmountMiB     int  `json:"amount_mib"`
+	DeflateOnOOM  bool `json:"deflate_on_oom"`
+	StatsInterval int  `json:"stats_polling_interval_s,omitempty"`
+	// FreePageReporting needs CONFIG_PAGE_REPORTING in the guest kernel.
+	FreePageReporting bool `json:"free_page_reporting,omitempty"`
+}
+
 // RateLimiter limits a device's bandwidth and operations.
 type RateLimiter struct {
 	Bandwidth *TokenBucket `json:"bandwidth,omitempty"`

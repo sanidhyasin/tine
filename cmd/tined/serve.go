@@ -79,6 +79,10 @@ its own cgroup, outside tined's.`,
 		`how a diff becomes a whole snapshot: "reflink" the base, or "copy" it into the page cache (default: copy for forks, reflink otherwise)`)
 	f.StringVar(&opts.vm.PageServerBin, "page-server", opts.vm.PageServerBin, "tine-uffd binary, for forks with the uffd strategies")
 	f.IntVar(&opts.vm.PageCluster, "page-cluster", opts.vm.PageCluster, "pages a page server copies in for each fault, aligned around it")
+	f.StringVar(&opts.vm.PageServerHugePages, "page-server-huge-pages", opts.vm.PageServerHugePages,
+		`"2M": back VMs restored through a page server with 2 MiB huge pages, from the host's pool (vm.nr_hugepages)`)
+	f.BoolVar(&opts.vm.Balloon, "balloon", opts.vm.Balloon, "give booted VMs a balloon with free page reporting, so their free pages go back to the host")
+	f.BoolVar(&opts.vm.KSM, "ksm", opts.vm.KSM, "let KSM merge identical pages across VMs (it must be running: /sys/kernel/mm/ksm/run)")
 	f.StringVar(&opts.vm.JailerBin, "jailer", opts.vm.JailerBin, "jailer binary")
 	f.StringVar(&opts.vm.FirecrackerBin, "firecracker", opts.vm.FirecrackerBin, "firecracker binary (same release as the jailer)")
 	f.StringVar(&opts.vm.CgroupParent, "cgroup-parent", opts.vm.CgroupParent, "cgroup holding every VM's cgroup")
@@ -248,6 +252,15 @@ func features(c vm.Config) []string {
 	var f []string
 	if c.DiffSnapshots {
 		f = append(f, "diff-snapshots")
+	}
+	if c.PageServerHugePages != "" {
+		f = append(f, "huge-pages-"+c.PageServerHugePages)
+	}
+	if c.Balloon {
+		f = append(f, "balloon")
+	}
+	if c.KSM {
+		f = append(f, "ksm")
 	}
 	return f
 }

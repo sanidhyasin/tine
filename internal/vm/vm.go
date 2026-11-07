@@ -83,6 +83,18 @@ type Config struct {
 	// PageCluster is how many pages, aligned, a page server copies in for
 	// each fault: 1 for just the page.
 	PageCluster int
+	// PageServerHugePages backs the memory of VMs restored through a page
+	// server with huge pages: "2M" for 2 MiB hugetlbfs pages, from the
+	// host's pool (vm.nr_hugepages). Empty keeps the snapshot's.
+	PageServerHugePages string
+	// Balloon gives booted VMs a balloon device with free page reporting,
+	// so their free pages go back to the host. Their snapshots, and VMs
+	// restored from them, have it too.
+	Balloon bool
+	// KSM lets the kernel merge identical pages across VMs (it must be
+	// running: /sys/kernel/mm/ksm/run). Set by tined for itself, every
+	// Firecracker it starts inherits it.
+	KSM bool
 	// ChrootBaseDir holds the jails, ImagesDir the images, and SnapshotsDir
 	// the snapshots. All three must be on the same filesystem (the XFS data
 	// volume), for hard links and reflinks between them.
