@@ -24,6 +24,22 @@ type Artifacts struct {
 	Rootfs      string
 	// GuestKey is the SSH key that can log in to Rootfs's guest as root.
 	GuestKey string
+	// Squashfs is the pristine Ubuntu image that tined image import starts from.
+	Squashfs string
+}
+
+// RequireAgentBinary returns the linux/amd64 tine-agent built by `make build`
+// ($TINE_AGENT_BIN, which `make test-integration` sets), or skips the test.
+func RequireAgentBinary(t testing.TB) string {
+	t.Helper()
+	p := os.Getenv("TINE_AGENT_BIN")
+	if p == "" {
+		t.Skip("TINE_AGENT_BIN isn't set: run with make test-integration")
+	}
+	if _, err := os.Stat(p); err != nil { //nolint:gosec // test-only path from the environment
+		t.Skipf("%v: run make build", err)
+	}
+	return p
 }
 
 // RequireArtifacts finds the artifacts in $TINE_ARTIFACTS (by default
@@ -40,12 +56,18 @@ func RequireArtifacts(t testing.TB) Artifacts {
 	if len(kernels) == 0 {
 		t.Skipf("no guest kernel in %s: run scripts/host-setup.sh, or set TINE_ARTIFACTS", dir)
 	}
+	squashfs, _ := filepath.Glob(filepath.Join(dir, "ubuntu-*.squashfs"))
+	sort.Strings(squashfs)
+	if len(squashfs) == 0 {
+		t.Skipf("no Ubuntu squashfs in %s: re-run scripts/host-setup.sh", dir)
+	}
 	a := Artifacts{
 		Firecracker: filepath.Join(dir, "bin", "firecracker"),
 		Jailer:      filepath.Join(dir, "bin", "jailer"),
 		Kernel:      kernels[len(kernels)-1],
 		Rootfs:      filepath.Join(dir, "rootfs.ext4"),
 		GuestKey:    filepath.Join(dir, "guest_key"),
+		Squashfs:    squashfs[len(squashfs)-1],
 	}
 	for _, p := range []string{a.Firecracker, a.Jailer, a.Rootfs, a.GuestKey} {
 		if _, err := os.Stat(p); err != nil {
