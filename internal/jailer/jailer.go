@@ -112,6 +112,10 @@ const (
 	// Clone makes a reflink copy that belongs to the VM: its own writable
 	// copy, e.g. its disk. The copy is owned by the VM's uid with mode 0600.
 	Clone
+	// Copy makes a full byte-for-byte copy that belongs to the VM, read-only
+	// (mode 0400). It's slow on purpose: the naive way to give a forked VM
+	// its memory, which tine's benchmarks compare with sharing it.
+	Copy
 )
 
 func (m FileMode) String() string {
@@ -120,6 +124,8 @@ func (m FileMode) String() string {
 		return "link"
 	case Clone:
 		return "clone"
+	case Copy:
+		return "copy"
 	default:
 		return "FileMode(" + strconv.Itoa(int(m)) + ")"
 	}
@@ -267,7 +273,7 @@ func (s Spec) validate() error {
 			return fmt.Errorf("jail %s: two files go to %s", s.ID, f.Target)
 		}
 		seen[f.Target] = true
-		if f.Mode != Link && f.Mode != Clone {
+		if f.Mode != Link && f.Mode != Clone && f.Mode != Copy {
 			return fmt.Errorf("jail %s: file %s: unknown mode %v", s.ID, f.Source, f.Mode)
 		}
 		if !filepath.IsAbs(f.Source) {
@@ -300,6 +306,9 @@ func (j *Jail) HostPath(jailPath string) string {
 
 // APISocket is the host path of Firecracker's API socket.
 func (j *Jail) APISocket() string { return j.HostPath(APISocketPath) }
+
+// Files are the files Prepare places into the jail.
+func (j *Jail) Files() []File { return append([]File(nil), j.spec.Files...) }
 
 // ConsoleLogPath is a place for the guest's console log: inside the jail's
 // directory, but outside its root, so the jailed Firecracker can't reopen it.
@@ -360,6 +369,11 @@ func (j *Jail) place(f File) error {
 		return storage.Link(f.Source, dst)
 	case Clone:
 		if err := storage.Clone(f.Source, dst, 0o600); err != nil {
+			return err
+		}
+		return os.Chown(dst, j.spec.UID, j.spec.GID)
+	case Copy:
+		if err := storage.Copy(f.Source, dst, 0o400); err != nil {
 			return err
 		}
 		return os.Chown(dst, j.spec.UID, j.spec.GID)

@@ -34,14 +34,17 @@ type ForkStrategy string
 
 const (
 	// ForkShare: every child maps the one snapshot memory file, shared
-	// through the page cache. The default.
+	// through the page cache. The default (rung 3).
 	ForkShare ForkStrategy = "share"
+	// ForkCopy: every child gets its own full copy of the memory file, so
+	// nothing is shared (rung 2, the naive way, for comparison).
+	ForkCopy ForkStrategy = "copy"
 )
 
 // validStrategy reports whether s is a fork strategy tined knows.
 func validStrategy(s ForkStrategy) bool {
 	switch s {
-	case "", ForkShare:
+	case "", ForkShare, ForkCopy:
 		return true
 	}
 	return false
@@ -139,7 +142,7 @@ func (m *Manager) Fork(ctx context.Context, parentID string, req ForkRequest) (F
 		go func() {
 			defer wg.Done()
 			for i := range jobs {
-				vm, err := m.Create(ctx, CreateRequest{SnapshotID: snap.ID, TTL: req.TTL, ParentID: parent.ID, admitted: res})
+				vm, err := m.Create(ctx, CreateRequest{SnapshotID: snap.ID, TTL: req.TTL, ParentID: parent.ID, admitted: res, strategy: req.Strategy})
 				children[i] = ForkChild{VM: vm, Err: err}
 			}
 		}()

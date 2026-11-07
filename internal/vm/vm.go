@@ -367,6 +367,8 @@ type CreateRequest struct {
 	ParentID string
 	// admitted is the room Fork already reserved for this VM.
 	admitted *reservation
+	// strategy is how a fork's child gets its memory (Fork sets it).
+	strategy ForkStrategy
 }
 
 func (m *Manager) normalize(ctx context.Context, req CreateRequest) (CreateRequest, error) {
@@ -529,7 +531,11 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (state.VM, erro
 		return failed, createErr
 	}
 
-	n, j, err := m.resources(vm)
+	memoryMode := jailer.Link
+	if req.strategy == ForkCopy {
+		memoryMode = jailer.Copy
+	}
+	n, j, err := m.resourcesFor(vm, memoryMode)
 	if err != nil {
 		return fail("plan", err)
 	}
@@ -730,6 +736,12 @@ func (m *Manager) Ping(ctx context.Context) error { return m.store.Ping(ctx) }
 // resources works out a VM's network and jail from its record. It's
 // deterministic, so it works for VMs created before a restart too.
 func (m *Manager) resources(vm state.VM) (netns.Network, *jailer.Jail, error) {
+	return m.resourcesFor(vm, jailer.Link)
+}
+
+// resourcesFor is resources, placing a restored VM's memory file with
+// memoryMode: shared through a hard link, or copied for the naive fork.
+func (m *Manager) resourcesFor(vm state.VM, memoryMode jailer.FileMode) (netns.Network, *jailer.Jail, error) {
 	n, err := netns.Plan(vm.ID, vm.Slot)
 	if err != nil {
 		return netns.Network{}, nil, err
@@ -745,7 +757,7 @@ func (m *Manager) resources(vm state.VM) (netns.Network, *jailer.Jail, error) {
 		// snapshotted VM had it. The kernel is in the memory already.
 		files = []jailer.File{
 			{Source: m.snaps.Path(vm.SnapshotID, snapshot.StateFile), Target: restoreStatePath, Mode: jailer.Link},
-			{Source: m.snaps.Path(vm.SnapshotID, snapshot.MemoryFile), Target: restoreMemPath, Mode: jailer.Link},
+			{Source: m.snaps.Path(vm.SnapshotID, snapshot.MemoryFile), Target: restoreMemPath, Mode: memoryMode},
 			{Source: m.snaps.Path(vm.SnapshotID, snapshot.DiskFile), Target: rootfsPath, Mode: jailer.Clone},
 		}
 	}

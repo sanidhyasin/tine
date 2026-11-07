@@ -1,6 +1,7 @@
 package jailer
 
 import (
+	"bytes"
 	"errors"
 	"os"
 	"path/filepath"
@@ -424,5 +425,35 @@ func TestExistingAndListing(t *testing.T) {
 	}
 	if _, err := Existing(cfg, "../x"); err == nil {
 		t.Error("Existing with a bad ID: want an error")
+	}
+}
+
+func TestPrepareCopiesFiles(t *testing.T) {
+	cfg := testConfig(t)
+	src := filepath.Join(t.TempDir(), "memory")
+	data := make([]byte, 3<<20+17) // more than one buffer
+	for i := range data {
+		data[i] = byte(i * 7)
+	}
+	if err := os.WriteFile(src, data, 0o444); err != nil { //nolint:gosec // a snapshot's memory is read-only, not secret
+		t.Fatal(err)
+	}
+	spec := testSpec()
+	spec.Files = []File{{Source: src, Target: "/restore/memory", Mode: Copy}}
+	j, err := New(cfg, spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Prepare(); err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	a, _ := os.Stat(src)
+	b, err := os.Stat(j.HostPath("/restore/memory"))
+	if err != nil || os.SameFile(a, b) || b.Mode().Perm() != 0o400 {
+		t.Fatalf("copy: %v, %v; want a separate file with mode 0400", b, err)
+	}
+	got, _ := os.ReadFile(j.HostPath("/restore/memory"))
+	if !bytes.Equal(got, data) {
+		t.Error("the copy's contents differ")
 	}
 }

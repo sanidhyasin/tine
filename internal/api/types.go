@@ -138,7 +138,9 @@ type ForkRequest struct {
 	Count      int `json:"count"`
 	TTLSeconds int `json:"ttl_seconds,omitempty"`
 	// Strategy is how the children get their memory (see vm.ForkStrategy).
-	// Empty means tined's default, "share".
+	// "share" (the default, when empty) maps one memory file into every
+	// child; "copy" gives each child its own copy, the naive way, kept to
+	// benchmark against.
 	Strategy string `json:"strategy,omitempty"`
 }
 

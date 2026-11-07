@@ -58,6 +58,8 @@ type fakeHost struct {
 	loading, maxLoading int
 	// mem is what hostMemory reports; zero means 16 GiB, 15 available.
 	mem hostMemory
+	// memoryModes is how each jail got a snapshot's memory file, by VM ID.
+	memoryModes map[string]jailer.FileMode
 }
 
 type hold struct {
@@ -232,8 +234,20 @@ func (f *fakeHost) createNetwork(context.Context, netns.Network, netns.Owner) er
 	return f.record("createNetwork")
 }
 func (f *fakeHost) destroyNetwork(netns.Network) error { return f.record("destroyNetwork") }
-func (f *fakeHost) prepareJail(*jailer.Jail) error     { return f.record("prepareJail") }
-func (f *fakeHost) cleanupJail(*jailer.Jail) error     { return f.record("cleanupJail") }
+func (f *fakeHost) prepareJail(j *jailer.Jail) error {
+	f.mu.Lock()
+	for _, file := range j.Files() {
+		if file.Target == restoreMemPath {
+			if f.memoryModes == nil {
+				f.memoryModes = map[string]jailer.FileMode{}
+			}
+			f.memoryModes[j.ID] = file.Mode
+		}
+	}
+	f.mu.Unlock()
+	return f.record("prepareJail")
+}
+func (f *fakeHost) cleanupJail(*jailer.Jail) error { return f.record("cleanupJail") }
 func (f *fakeHost) configureAndBoot(context.Context, *jailer.Jail, bootSpec) error {
 	return f.record("configureAndBoot")
 }

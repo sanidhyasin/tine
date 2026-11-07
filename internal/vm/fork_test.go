@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sanidhyasin/tine/internal/jailer"
 	"github.com/sanidhyasin/tine/internal/state"
 )
 
@@ -50,6 +51,40 @@ func TestFork(t *testing.T) {
 	// A child can roll back to the point it was forked at.
 	if _, err := f.m.Rollback(ctx, res.Children[0].VM.ID, res.Snapshot.ID); err != nil {
 		t.Errorf("rolling a child back to its fork: %v", err)
+	}
+}
+
+// The copy strategy gives each child its own copy of the memory file, where
+// the default shares one.
+func TestForkStrategies(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		strategy ForkStrategy
+		want     jailer.FileMode
+	}{{"", jailer.Link}, {ForkShare, jailer.Link}, {ForkCopy, jailer.Copy}} {
+		f := newFixture(t, nil)
+		parent := f.running(t)
+		res, err := f.m.Fork(ctx, parent.ID, ForkRequest{Count: 2, Strategy: tc.strategy})
+		if err != nil || res.Failed() != 0 {
+			t.Fatalf("Fork(%q): %v", tc.strategy, err)
+		}
+		for _, c := range res.Children {
+			if got := f.host.memoryModes[c.VM.ID]; got != tc.want {
+				t.Errorf("strategy %q: child %s got its memory by %v, want %v", tc.strategy, c.VM.ID, got, tc.want)
+			}
+		}
+		// A child restored again later, e.g. after a rollback, shares it.
+		if _, err := f.m.Rollback(ctx, res.Children[0].VM.ID, res.Snapshot.ID); err != nil {
+			t.Fatal(err)
+		}
+		if got := f.host.memoryModes[res.Children[0].VM.ID]; got != jailer.Link {
+			t.Errorf("strategy %q: after a rollback the memory came by %v, want link", tc.strategy, got)
+		}
+	}
+	f := newFixture(t, nil)
+	parent := f.running(t)
+	if _, err := f.m.Fork(ctx, parent.ID, ForkRequest{Count: 1, Strategy: "teleport"}); !errors.Is(err, ErrInvalidRequest) {
+		t.Errorf("an unknown strategy = %v, want ErrInvalidRequest", err)
 	}
 }
 
