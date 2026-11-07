@@ -6,6 +6,7 @@
 #   ./scripts/dev-server.sh status       show its state, IP, settings and data volume
 #   ./scripts/dev-server.sh ssh [cmd]    SSH in (or run one command)
 #   ./scripts/dev-server.sh sync         copy this repo to ~/tine on the server
+#   ./scripts/dev-server.sh ssh-config   print a ~/.ssh/config block, for tine --host ssh://tine-dev
 #   ./scripts/dev-server.sh stop         stop it (no compute charges while stopped)
 #   ./scripts/dev-server.sh allow-my-ip  let your current IP in over SSH (after it changes)
 #   ./scripts/dev-server.sh down         terminate it for good (deletes both of its disks)
@@ -393,6 +394,16 @@ cmd_ssh() {
   exec ssh "${SSH_OPTS[@]}" "ubuntu@$ip" "$@"
 }
 
+# ssh-config prints a block for ~/.ssh/config, so plain "ssh tine-dev" works,
+# and with it tine --host ssh://tine-dev and the Python SDK. The IP changes
+# when the server stops and starts: print it again then.
+cmd_ssh_config() {
+  local ip
+  ip="$(running_ip)"
+  printf 'Host %s\n  HostName %s\n  User ubuntu\n  IdentityFile %s\n  UserKnownHostsFile %s\n  StrictHostKeyChecking accept-new\n' \
+    "$NAME" "$ip" "$SSH_KEY" "$KNOWN_HOSTS"
+}
+
 cmd_sync() {
   local ip
   ip="$(running_ip)"
@@ -427,6 +438,7 @@ case "$cmd" in
   setup)       cmd_setup ;;
   status)      cmd_status ;;
   ssh)         cmd_ssh "$@" ;;
+  ssh-config)  cmd_ssh_config ;;
   sync)        cmd_sync ;;
   stop)        cmd_stop ;;
   allow-my-ip) allow_my_ip ;;

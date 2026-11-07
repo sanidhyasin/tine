@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -34,8 +35,9 @@ class SSHTunnel:
         dest = f"{u.username}@{u.hostname}" if u.username else u.hostname
         d = tempfile.mkdtemp(prefix="tine-")
         local = os.path.join(d, "tine.sock")
-        argv = [
-            "ssh",
+        # $TINE_SSH replaces "ssh", as $GIT_SSH_COMMAND does for git.
+        argv = shlex.split(os.environ.get("TINE_SSH", "")) or ["ssh"]
+        argv += [
             "-N",
             "-T",
             "-o",

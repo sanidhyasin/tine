@@ -8,6 +8,7 @@ import (
 )
 
 func TestSSHCommand(t *testing.T) {
+	t.Setenv("TINE_SSH", "")
 	for target, want := range map[string][]string{
 		"ssh://tine-dev":                    {"ssh", "-T", "-o", "BatchMode=yes", "--", "tine-dev", "tine", "dial-stdio"},
 		"ssh://me@10.0.0.5:2222":            {"ssh", "-T", "-o", "BatchMode=yes", "-p", "2222", "--", "me@10.0.0.5", "tine", "dial-stdio"},
@@ -17,6 +18,10 @@ func TestSSHCommand(t *testing.T) {
 		if err != nil || !reflect.DeepEqual(got, want) {
 			t.Errorf("sshCommand(%q) = %q, %v; want %q", target, got, err, want)
 		}
+	}
+	t.Setenv("TINE_SSH", "ssh -F /tmp/cfg")
+	if got, _ := sshCommand("ssh://h"); !reflect.DeepEqual(got[:3], []string{"ssh", "-F", "/tmp/cfg"}) {
+		t.Errorf("with TINE_SSH: %q", got)
 	}
 	for _, bad := range []string{"tine-dev", "http://tine-dev", "ssh://", "ssh:///path"} {
 		if _, err := sshCommand(bad); err == nil {

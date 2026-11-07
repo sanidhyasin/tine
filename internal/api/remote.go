@@ -22,7 +22,8 @@ import (
 // NewSSHClient returns a client for tined on the machine a URL names:
 // ssh://[user@]host[:port], optionally with the socket's path, as in
 // ssh://me@tine-dev/run/tine/tine.sock. The remote machine needs tine
-// installed, and the user must be able to use tined's socket.
+// installed, and the user must be able to use tined's socket. $TINE_SSH,
+// if set, is the ssh command to run.
 func NewSSHClient(target string) (*Client, error) {
 	argv, err := sshCommand(target)
 	if err != nil {
@@ -37,7 +38,13 @@ func sshCommand(target string) ([]string, error) {
 	if err != nil || u.Scheme != "ssh" || u.Hostname() == "" {
 		return nil, fmt.Errorf("host %q: want ssh://[user@]host[:port][/socket]", target)
 	}
-	argv := []string{"ssh", "-T", "-o", "BatchMode=yes"}
+	// $TINE_SSH replaces "ssh", as $GIT_SSH_COMMAND does for git: e.g.
+	// "ssh -F ~/.ssh/tine_config".
+	argv := strings.Fields(os.Getenv("TINE_SSH"))
+	if len(argv) == 0 {
+		argv = []string{"ssh"}
+	}
+	argv = append(argv, "-T", "-o", "BatchMode=yes")
 	if p := u.Port(); p != "" {
 		argv = append(argv, "-p", p)
 	}
