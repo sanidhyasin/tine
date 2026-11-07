@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -214,4 +215,111 @@ func TestVMThatDiesWhileTinedIsDown(t *testing.T) {
 		t.Errorf("after restart: %s with error %q (%v); want destroyed, saying why", got.State, got.Error, err)
 	}
 	requireGone(t, vm.ID)
+}
+
+// TestTenVMsAtOnceAreIsolated runs 10 VMs together and checks each can reach
+// the internet but not the metadata service, the host, or another VM.
+//
+// Blocked traffic is dropped, so it times out (timeout exits 124). Without the
+// firewall, a connection to another VM's namespace address would instead be
+// refused at once, by the kernel answering a closed port. Requiring the
+// timeout proves the firewall, not just that nothing was listening.
+func TestTenVMsAtOnceAreIsolated(t *testing.T) {
+	const count = 10
+	vms := make([]api.VM, count)
+	var wg sync.WaitGroup
+	for i := range vms {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			defer cancel()
+			vm, err := tined.CreateVM(ctx, api.CreateVMRequest{VCPUs: 1, MemoryMiB: 256, TTLSeconds: 600})
+			if err != nil {
+				t.Errorf("create %d: %v", i, err)
+				return
+			}
+			vms[i] = vm
+		}()
+	}
+	wg.Wait()
+	t.Cleanup(func() {
+		for _, vm := range vms {
+			if vm.ID != "" {
+				_, _ = tined.DestroyVM(context.Background(), vm.ID)
+				requireGone(t, vm.ID)
+			}
+		}
+	})
+	if t.Failed() {
+		t.FailNow()
+	}
+
+	// Read the addresses here: vethAddr can fail the test, and only the
+	// test's own goroutine may do that.
+	gateways, own := make([]string, count), make([]string, count)
+	for i, vm := range vms {
+		gateways[i], own[i] = vethAddr(t, vm.ID, "peer"), vethAddr(t, vm.ID, "self")
+	}
+
+	// tcp tries a TCP connection from inside a VM and returns the exit code:
+	// 0 connected, 124 timed out, anything else refused or unreachable.
+	tcp := func(id, addr string, seconds int) int {
+		host, port, _ := strings.Cut(addr, ":")
+		_, code, err := run(context.Background(), id, "timeout", strconv.Itoa(seconds), "bash", "-c", "echo > /dev/tcp/"+host+"/"+port)
+		if err != nil {
+			t.Errorf("%s: exec: %v", id, err)
+			return -1
+		}
+		return code
+	}
+	var wg2 sync.WaitGroup
+	for i, vm := range vms {
+		other := vms[(i+1)%count]
+		gateway, otherNS := gateways[i], own[(i+1)%count]
+		wg2.Add(1)
+		go func() {
+			defer wg2.Done()
+			if code := tcp(vm.ID, "1.1.1.1:443", 5); code != 0 {
+				t.Errorf("%s can't reach the internet (exit %d)", vm.ID, code)
+			}
+			for what, addr := range map[string]string{
+				"the EC2 metadata service":                "169.254.169.254:80",
+				"the host, through its gateway":           gateway + ":22",
+				"another VM's network (" + other.ID + ")": otherNS + ":9",
+			} {
+				if code := tcp(vm.ID, addr, 2); code != 124 {
+					t.Errorf("%s -> %s (%s): exit %d, want 124 (dropped by the firewall)", vm.ID, what, addr, code)
+				}
+			}
+		}()
+	}
+	wg2.Wait()
+	t.Logf("%d VMs at once: each reached the internet, and the metadata service, the host and its neighbour's network were all dropped", count)
+}
+
+// vethAddr reads a VM's veth addresses from its network namespace: "self" is
+// the namespace's own end, "peer" the host's end (the VM's gateway).
+func vethAddr(t *testing.T, id, which string) string {
+	t.Helper()
+	out, err := exec.CommandContext(context.Background(), "ip", "-n", "tine-"+id, "-4", "-o", "addr", "show", "veth0").Output() //nolint:gosec // test command
+	if err != nil {
+		t.Fatalf("read %s's veth address: %v", id, err)
+	}
+	// e.g. "2: veth0    inet 10.200.0.6/30 brd ... scope global veth0"
+	fields := strings.Fields(string(out))
+	for i, f := range fields {
+		if f == "inet" && i+1 < len(fields) {
+			ip, _, _ := strings.Cut(fields[i+1], "/")
+			if which == "self" {
+				return ip
+			}
+			parts := strings.Split(ip, ".")
+			last, _ := strconv.Atoi(parts[3])
+			parts[3] = strconv.Itoa(last - 1) // the host's end is one below, in the same /30
+			return strings.Join(parts, ".")
+		}
+	}
+	t.Fatalf("no address on %s's veth0: %q", id, out)
+	return ""
 }
