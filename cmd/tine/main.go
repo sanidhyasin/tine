@@ -19,9 +19,25 @@ import (
 func main() {
 	// Ctrl+C cancels the request; for exec, tined then stops the command too.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	err := newRootCmd().ExecuteContext(ctx)
+	code := run(ctx, os.Args[1:], os.Stdin, os.Stdout, os.Stderr)
 	stop()
-	os.Exit(exitCode(err, os.Stderr))
+	os.Exit(code)
+}
+
+// run runs tine with args and returns its exit code.
+func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	root := newRootCmd()
+	root.SetArgs(args)
+	root.SetIn(stdin)
+	root.SetOut(stdout)
+	root.SetErr(stderr)
+	err := root.ExecuteContext(ctx)
+	if err != nil && ctx.Err() != nil {
+		// Interrupted (Ctrl+C): exit like a shell does for SIGINT.
+		_, _ = fmt.Fprintln(stderr, "tine: interrupted")
+		return 130
+	}
+	return exitCode(err, stderr)
 }
 
 // globals are the flags every command shares.

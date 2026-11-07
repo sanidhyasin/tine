@@ -87,7 +87,7 @@ func (b *backend) Destroy(_ context.Context, id string) (state.VM, error) {
 }
 
 // Exec plays the guest: the command's name says what to do.
-func (b *backend) Exec(_ context.Context, id string, req agentproto.ExecRequest, onOutput func(string, []byte)) (agentproto.ExitStatus, error) {
+func (b *backend) Exec(ctx context.Context, id string, req agentproto.ExecRequest, onOutput func(string, []byte)) (agentproto.ExitStatus, error) {
 	b.mu.Lock()
 	b.lastRun = req
 	b.mu.Unlock()
@@ -109,6 +109,9 @@ func (b *backend) Exec(_ context.Context, id string, req agentproto.ExecRequest,
 		return agentproto.ExitStatus{Code: -1, Signal: "killed", TimedOut: true}, nil
 	case "crash":
 		return agentproto.ExitStatus{Code: -1, Signal: "segmentation fault"}, nil
+	case "hang": // runs until tine hangs up
+		<-ctx.Done()
+		return agentproto.ExitStatus{}, ctx.Err()
 	case "flood":
 		onOutput(agentproto.StreamStdout, []byte("lots"))
 		return agentproto.ExitStatus{OutputTruncated: true}, nil
@@ -154,13 +157,13 @@ type result struct {
 // tine runs the CLI, as main does, against the socket.
 func tine(t *testing.T, sock, stdin string, args ...string) result {
 	t.Helper()
+	return tineCtx(t, context.Background(), sock, stdin, args...)
+}
+
+func tineCtx(t *testing.T, ctx context.Context, sock, stdin string, args ...string) result {
+	t.Helper()
 	var out, errOut bytes.Buffer
-	root := newRootCmd()
-	root.SetArgs(append([]string{"--socket", sock}, args...))
-	root.SetOut(&out)
-	root.SetErr(&errOut)
-	root.SetIn(strings.NewReader(stdin))
-	code := exitCode(root.ExecuteContext(context.Background()), &errOut)
+	code := run(ctx, append([]string{"--socket", sock}, args...), strings.NewReader(stdin), &out, &errOut)
 	return result{out.String(), errOut.String(), code}
 }
 
@@ -369,5 +372,16 @@ func TestExecNeedsACommand(t *testing.T) {
 	tine(t, sock, "", "create")
 	if r := tine(t, sock, "", "exec", "vm-aaaaaaaaab", "--"); r.code != 1 || !strings.Contains(r.stderr, "no command to run") {
 		t.Errorf("exec with no command = exit %d, %q", r.code, r.stderr)
+	}
+}
+
+func TestInterruptExitsWith130(t *testing.T) {
+	sock, _ := startTined(t)
+	tine(t, sock, "", "create")
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond) // Ctrl+C after 200ms
+	defer cancel()
+	r := tineCtx(t, ctx, sock, "", "exec", "vm-aaaaaaaaab", "hang")
+	if r.code != 130 || strings.TrimSpace(r.stderr) != "tine: interrupted" {
+		t.Errorf("interrupted exec = exit %d, %q; want 130 and \"tine: interrupted\"", r.code, r.stderr)
 	}
 }
