@@ -413,7 +413,9 @@ func (s *Server) fork(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := logging.WithVM(r.Context(), r.PathValue("id"))
-	res, err := s.backend.Fork(ctx, r.PathValue("id"), vm.ForkRequest{Count: req.Count, TTL: time.Duration(req.TTLSeconds) * time.Second})
+	res, err := s.backend.Fork(ctx, r.PathValue("id"), vm.ForkRequest{
+		Count: req.Count, TTL: time.Duration(req.TTLSeconds) * time.Second, Strategy: vm.ForkStrategy(req.Strategy),
+	})
 	if err != nil {
 		s.fail(w, r, err)
 		return

@@ -604,7 +604,7 @@ Every cliff gets a chart and an explanation.
 
 ### Tasks
 
-- [ ] **4.1 Harness:** `tine-bench` scenarios, JSONL output, and host details.
+- [x] **4.1 Harness:** `tine-bench` scenarios, JSONL output, and host details. *`cmd/tine-bench` drives tined's API through the scenarios `create-cold`, `create-template`, `exec`, `rollback`, `snapshot`, `fork`, `fork-touch`, `fork-dirty` and `density`; `suite` runs them all. Each data point has warm-up runs (recorded, but marked) and waits for the disk to settle first, and `-drop-caches` empties the page cache before each run, to measure as after a reboot. It writes one JSON line per run with tined's stage timings, the client's own, and memory figures. The first line describes the host: instance type (from the EC2 metadata service), whether it's virtualized (`systemd-detect-virt`), CPU, memory, kernel, Firecracker and tine versions, the data disk's model, and the kernel settings that matter. `make bench` runs it on the dev server and fetches the results into `bench/results/<date>-<name>/`.*
 - [ ] **4.2 Analysis:** `bench/analyze.py` with charts and tables.
 - [ ] **4.3 Workloads:** `tine-touch` and `tine-dirty`, baked into a benchmark image.
 - [ ] **4.4 Rungs 1–3:** benchmark all three. Rung 2 is a strategy flag.

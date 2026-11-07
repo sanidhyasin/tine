@@ -24,6 +24,27 @@ type ForkRequest struct {
 	Count int
 	// TTL is how long each child lives. Zero means the default.
 	TTL time.Duration
+	// Strategy is how the children get their memory. Empty means ForkShare.
+	Strategy ForkStrategy
+}
+
+// ForkStrategy is how a fork's children get their memory: one rung of the
+// ladder that step 4 benchmarks.
+type ForkStrategy string
+
+const (
+	// ForkShare: every child maps the one snapshot memory file, shared
+	// through the page cache. The default.
+	ForkShare ForkStrategy = "share"
+)
+
+// validStrategy reports whether s is a fork strategy tined knows.
+func validStrategy(s ForkStrategy) bool {
+	switch s {
+	case "", ForkShare:
+		return true
+	}
+	return false
 }
 
 // ForkChild is one child: the VM, or why it couldn't be made.
@@ -65,6 +86,9 @@ func (r ForkResult) Failed() int {
 // request was bad, the parent isn't running, or the snapshot failed.
 func (m *Manager) Fork(ctx context.Context, parentID string, req ForkRequest) (ForkResult, error) {
 	ctx = logging.WithVM(ctx, parentID)
+	if !validStrategy(req.Strategy) {
+		return ForkResult{}, fmt.Errorf("%w: no fork strategy %q", ErrInvalidRequest, req.Strategy)
+	}
 	if req.Count < 1 || req.Count > m.cfg.MaxForkChildren {
 		return ForkResult{}, fmt.Errorf("%w: a fork makes 1 to %d children, not %d", ErrInvalidRequest, m.cfg.MaxForkChildren, req.Count)
 	}

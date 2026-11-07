@@ -137,6 +137,9 @@ type Template struct {
 type ForkRequest struct {
 	Count      int `json:"count"`
 	TTLSeconds int `json:"ttl_seconds,omitempty"`
+	// Strategy is how the children get their memory (see vm.ForkStrategy).
+	// Empty means tined's default, "share".
+	Strategy string `json:"strategy,omitempty"`
 }
 
 // ForkResponse is what a fork made. It's 201 Created if at least one child

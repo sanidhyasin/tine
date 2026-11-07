@@ -3,7 +3,7 @@
 # Everything is built on your Mac (or in CI) and run on the Linux dev server.
 
 MODULE   := github.com/sanidhyasin/tine
-BINARIES := tine tined tine-agent
+BINARIES := tine tined tine-agent tine-bench
 OUT      := bin/linux-amd64
 
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
@@ -79,6 +79,18 @@ e2e: deploy ## End-to-end tests against the real tined on the dev server (server
 .PHONY: measure
 measure: deploy ## Measure creates, execs, memory, snapshots and rollbacks on the dev server (server must be up; about 15 minutes; SECTIONS= picks some)
 	./scripts/dev-server.sh ssh 'cd ~/tine && ./scripts/measure.sh $(SECTIONS)'
+
+# Benchmarks: tine-bench on the dev server, results fetched to
+# bench/results/<date>-<BENCH_NAME>/ and charted there by bench/analyze.py.
+BENCH_ARGS ?= suite
+BENCH_NAME ?= dev
+
+.PHONY: bench
+bench: deploy ## Benchmark on the dev server, fetch and chart the results (server must be up; BENCH_ARGS= picks scenarios)
+	./scripts/dev-server.sh ssh 'sudo /usr/local/bin/tine-bench -out /tmp/tine-bench.jsonl $(BENCH_ARGS)'
+	@dir="bench/results/$$(date -u +%Y-%m-%d)-$(BENCH_NAME)"; mkdir -p "$$dir"; \
+		./scripts/dev-server.sh ssh 'cat /tmp/tine-bench.jsonl' > "$$dir/results.jsonl"; \
+		echo "results in $$dir"; uv run bench/analyze.py "$$dir"
 
 .PHONY: deploy
 deploy: build ## Build, copy to the dev server, install the binaries and the tined service, (re)start it
