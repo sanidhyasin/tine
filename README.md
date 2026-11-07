@@ -13,7 +13,8 @@ Fork a running microVM into many copies in milliseconds. Built on [Firecracker](
 | `docs/` | The plan and step-by-step walkthroughs |
 | `cmd/`, `internal/` | The Go code: `tine` (CLI), `tined` (service), `tine-agent` (runs in each VM) |
 | `deploy/` | `tined.service`, the systemd unit `make deploy` installs |
-| `Makefile` | `make build`, `make check`, `make deploy`. Run `make` to list them all. |
+| `e2e/` | End-to-end tests against the real tined: `make e2e` |
+| `Makefile` | `make build`, `make check`, `make deploy`, `make e2e`. Run `make` to list them all. |
 | `scripts/dev-server.sh` | Create, start, stop and SSH into the AWS dev server. Runs on your Mac. |
 | `scripts/host-setup.sh` | Prepares the server: KVM, the `/srv/tine` data volume, Firecracker, a guest kernel and disk image |
 | `artifacts/` | Downloaded binaries and images. Created on the server, never committed. |
