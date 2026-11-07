@@ -17,6 +17,7 @@
 //	POST   /v1/vms/{id}/snapshots  Snapshot (201)
 //	GET    /v1/vms/{id}/snapshots  ListSnapshotsResponse, the VM's
 //	POST   /v1/vms/{id}/rollback   RollbackRequest → VM
+//	POST   /v1/vms/{id}/fork       ForkRequest → ForkResponse (201)
 //	GET    /v1/snapshots[?vm=&kind=&image=]  ListSnapshotsResponse
 //	GET    /v1/snapshots/{id}      Snapshot
 //	DELETE /v1/snapshots/{id}      Snapshot (409 in_use while VMs run from it)
@@ -49,6 +50,8 @@ type VM struct {
 	// SnapshotID is the snapshot the VM was restored from, and runs from. It's
 	// empty for a VM that was booted from scratch.
 	SnapshotID string `json:"snapshot_id,omitempty"`
+	// ParentID is the VM this one was forked from.
+	ParentID string `json:"parent_id,omitempty"`
 	// TimingsMs is how long each step of creating (and destroying) it took.
 	TimingsMs map[string]float64 `json:"timings_ms,omitempty"`
 }
@@ -115,6 +118,29 @@ type Template struct {
 	// Problem says why new VMs can't start from it, so they boot instead.
 	// It's empty when they can.
 	Problem string `json:"problem,omitempty"`
+}
+
+// ForkRequest asks for children of a running VM.
+type ForkRequest struct {
+	Count      int `json:"count"`
+	TTLSeconds int `json:"ttl_seconds,omitempty"`
+}
+
+// ForkResponse is what a fork made. It's 201 Created if at least one child
+// was made; each child either has a VM or an error.
+type ForkResponse struct {
+	// Snapshot is the parent's snapshot the children were restored from.
+	Snapshot Snapshot    `json:"snapshot"`
+	Children []ForkChild `json:"children"`
+	// TimingsMs: snapshot, paused (how long the parent was frozen),
+	// children (restoring them all) and total.
+	TimingsMs map[string]float64 `json:"timings_ms"`
+}
+
+// ForkChild is one child of a fork: the VM, or why it couldn't be made.
+type ForkChild struct {
+	VM    *VM          `json:"vm,omitempty"`
+	Error *ErrorDetail `json:"error,omitempty"`
 }
 
 // ListSnapshotsResponse is GET /v1/snapshots's answer.

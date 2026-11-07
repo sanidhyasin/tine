@@ -112,12 +112,23 @@ func (m *Manager) takeSnapshot(ctx context.Context, vm state.VM, kind state.Snap
 		return state.Snapshot{}, err
 	}
 	log = log.With("snapshot", rec.ID)
+	if kind == state.SnapshotKindFork {
+		// Ready but not yet claimed by any child, it would look like
+		// garbage. The fork unpins it once its children are made.
+		m.pin(rec.ID)
+	}
 	b, err := m.snaps.Begin(rec.ID)
 	if err != nil {
 		m.forgetSnapshot(ctx, rec.ID)
+		if kind == state.SnapshotKindFork {
+			m.unpin(rec.ID)
+		}
 		return state.Snapshot{}, err
 	}
 	fail := func(stage string, cause error) (state.Snapshot, error) {
+		if kind == state.SnapshotKindFork {
+			defer m.unpin(rec.ID)
+		}
 		log.WarnContext(ctx, "snapshot failed", "stage", stage, "err", cause)
 		m.cfg.Metrics.SnapshotFailed(string(kind), stage)
 		_ = b.Abort()
@@ -342,8 +353,8 @@ func (m *Manager) DeleteSnapshot(ctx context.Context, id string) (state.Snapshot
 	if err != nil {
 		return state.Snapshot{}, err
 	}
-	if snap.State == state.SnapshotCreating {
-		return state.Snapshot{}, fmt.Errorf("%w: snapshot %s is still being taken", ErrBusy, id)
+	if snap.State == state.SnapshotCreating || m.pinned(id) {
+		return state.Snapshot{}, fmt.Errorf("%w: snapshot %s is still being taken, or forked from", ErrBusy, id)
 	}
 	if snap, err = m.store.MarkSnapshotDeleting(ctx, id); err != nil {
 		return state.Snapshot{}, err
@@ -379,6 +390,9 @@ func (m *Manager) collectGarbage(ctx context.Context) int {
 	}
 	n := 0
 	for _, s := range garbage {
+		if m.pinned(s.ID) {
+			continue // a fork is still making its children
+		}
 		// A VM may have claimed it since it was listed: then this refuses.
 		if _, err := m.store.MarkSnapshotDeleting(ctx, s.ID); err != nil {
 			if !errors.Is(err, state.ErrInUse) && !errors.Is(err, state.ErrNotFound) {

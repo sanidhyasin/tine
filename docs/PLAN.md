@@ -501,7 +501,7 @@ vm-7f3k2q9d1a  running
 
 ### Tasks
 
-- [ ] **3.1 Fork API:** fork with a worker pool and per-child results, cleaning up failed children.
+- [x] **3.1 Fork API:** fork with a worker pool and per-child results, cleaning up failed children. *`POST /v1/vms/{id}/fork {"count", "ttl_seconds"}` snapshots the parent, then restores the children `ForkParallelism` (the CPU count) at a time, each through the usual create path, so a failed one undoes itself. It's 201 if any child was made, with each child's VM or error. A fork's snapshot has its own kind, `fork` (migration 3), and is garbage as soon as no child runs from it, so forking a long-lived VM again and again doesn't pile them up. The fork pins it until the children have claimed it, so the reaper can't collect it in between. Once the parent is snapshotted, the fork finishes even if the caller gives up. A VM can now have up to 512 VMs on the host, and a fork up to 100 children. On the dev server, forking a 512 MiB VM into 4 took 663 ms: the parent was paused for 131 ms, and the children took 509 ms. Each child had the parent's files and running processes, its own hostname, machine ID and internet, and a PSS of about 56 MiB against an RSS of 116 MiB.*
 - [ ] **3.2 Lineage:** track parents and children in state, and add `tine ls --tree`.
 - [ ] **3.3 Admission control:** memory estimate, overcommit ratio, clear errors.
 - [ ] **3.4 Fork identity:** machine-id, hostname and entropy through `/sync`.

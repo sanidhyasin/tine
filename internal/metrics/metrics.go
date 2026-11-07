@@ -50,6 +50,8 @@ type Metrics struct {
 	snapshotBytes    prometheus.Histogram
 	snapshotsDeleted *prometheus.CounterVec
 	rollbackStage    *prometheus.HistogramVec
+	forkStage        *prometheus.HistogramVec
+	forkChildren     *prometheus.CounterVec
 }
 
 // New returns metrics in a registry of their own, along with the Go runtime
@@ -86,6 +88,10 @@ func New(version string) *Metrics {
 			prometheus.ExponentialBuckets(64<<20, 2, 10)), // 64 MiB to 32 GiB
 		snapshotsDeleted: f.counterVec("snapshots_deleted_total",
 			"Snapshots deleted, by why: requested, or garbage (nothing needed them any more).", "reason"),
+		forkStage: f.histogramVec("vm_fork_stage_seconds",
+			"How long each stage of a fork took: snapshot, paused (how long the parent was frozen), children (restoring them all), and the total.",
+			operationBuckets, "stage"),
+		forkChildren: f.counterVec("vm_fork_children_total", "Children forks made, by result (ok or failed).", "result"),
 		rollbackStage: f.histogramVec("vm_rollback_stage_seconds",
 			"How long each stage of rolling a VM back to a snapshot took: stop, jail, start, restore, agent, sync, and the total.",
 			operationBuckets, "stage"),
@@ -186,6 +192,19 @@ func (m *Metrics) SnapshotDeleted(reason string) {
 		return
 	}
 	m.snapshotsDeleted.WithLabelValues(reason).Inc()
+}
+
+// Forked records a fork of count children, failed of which couldn't be
+// made, and its stage timings in milliseconds.
+func (m *Metrics) Forked(count, failed int, timingsMs map[string]float64) {
+	if m == nil {
+		return
+	}
+	m.forkChildren.WithLabelValues("ok").Add(float64(count - failed))
+	m.forkChildren.WithLabelValues("failed").Add(float64(failed))
+	for stage, ms := range timingsMs {
+		m.forkStage.WithLabelValues(stage).Observe(ms / 1000)
+	}
 }
 
 // RolledBack records a rollback and its stage timings, in milliseconds.

@@ -21,6 +21,9 @@ const (
 	// new VMs can start from it instead of booting. Only the newest template
 	// for an image and size is used; older ones go once nothing runs from them.
 	SnapshotKindTemplate SnapshotKind = "template"
+	// SnapshotKindFork is taken to fork a VM: its children are restored from
+	// it. It goes as soon as none of them runs from it.
+	SnapshotKindFork SnapshotKind = "fork"
 )
 
 // SnapshotState is where a snapshot is in its life.
@@ -62,7 +65,7 @@ func (s *Store) CreateSnapshot(ctx context.Context, snap Snapshot) (Snapshot, er
 	if !validVMID.MatchString(snap.ID) {
 		return Snapshot{}, fmt.Errorf("create snapshot: bad ID %q", snap.ID)
 	}
-	if snap.Kind != SnapshotKindVM && snap.Kind != SnapshotKindTemplate {
+	if snap.Kind != SnapshotKindVM && snap.Kind != SnapshotKindTemplate && snap.Kind != SnapshotKindFork {
 		return Snapshot{}, fmt.Errorf("create snapshot %s: bad kind %q", snap.ID, snap.Kind)
 	}
 	now := s.now()
@@ -222,8 +225,13 @@ func (s *Store) LatestTemplate(ctx context.Context, image string, vcpus, memoryM
 // GarbageSnapshots returns the snapshots nothing needs any more, oldest
 // first: ready snapshots that no live VM runs from and that are either
 //
-//   - a VM's snapshot, whose VM is destroyed or gone, or
+//   - a VM's snapshot, whose VM is destroyed or gone,
+//   - a fork's snapshot, or
 //   - a template that a newer one has replaced.
+//
+// A fork's snapshot is garbage from the moment it's ready until its
+// children claim it, so the fork must keep the caller from collecting it
+// in between.
 //
 // It also returns snapshots stuck in SnapshotDeleting, to finish them.
 // (Templates whose image is gone are the caller's to find: images live on
@@ -233,7 +241,8 @@ func (s *Store) GarbageSnapshots(ctx context.Context) ([]Snapshot, error) {
 		WHERE s.state = 'deleting'
 		   OR (s.state = 'ready'
 		       AND NOT EXISTS (SELECT 1 FROM vms v WHERE v.snapshot_id = s.id AND v.state != 'destroyed')
-		       AND ((s.kind = 'vm'
+		       AND (s.kind = 'fork'
+		         OR (s.kind = 'vm'
 		             AND NOT EXISTS (SELECT 1 FROM vms v WHERE v.id = s.vm_id AND v.state != 'destroyed'))
 		         OR (s.kind = 'template'
 		             AND EXISTS (SELECT 1 FROM snapshots n

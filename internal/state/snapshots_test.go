@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"sync"
 	"testing"
+	"testing/fstest"
 	"time"
 )
 
@@ -292,5 +294,64 @@ func TestDeleteAndRestoreRace(t *testing.T) {
 		case createErr != nil && deleteErr != nil:
 			t.Errorf("round %d: both failed: %v; %v", i, createErr, deleteErr)
 		}
+	}
+}
+
+// Migration 3 rebuilds the snapshots table: what's in it must survive.
+func TestMigrationToForksKeepsSnapshots(t *testing.T) {
+	ctx := context.Background()
+	path := t.TempDir() + "/tine.db"
+	upTo2 := fstest.MapFS{}
+	for _, name := range []string{"migrations/0001_init.sql", "migrations/0002_snapshots.sql"} {
+		data, err := fs.ReadFile(migrationFiles, name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		upTo2[name] = &fstest.MapFile{Data: data}
+	}
+	old, err := open(ctx, path, upTo2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustSnapshot(t, old, template("snap-tmpl", "base", 1024), true)
+	_ = old.Close()
+
+	s, err := Open(ctx, path)
+	if err != nil {
+		t.Fatalf("migrating to 3: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+	got, err := s.GetSnapshot(ctx, "snap-tmpl")
+	if err != nil || got.State != SnapshotReady || got.Kind != SnapshotKindTemplate || string(got.Metadata) != string(testMetadata) {
+		t.Errorf("after the migration: %+v, %v", got, err)
+	}
+	if _, err := s.LatestTemplate(ctx, "base", 2, 1024); err != nil {
+		t.Errorf("the template index went missing: %v", err)
+	}
+	if _, err := s.CreateSnapshot(ctx, Snapshot{ID: "snap-fork", Kind: SnapshotKindFork, VMID: "vm-p", Image: "base", VCPUs: 2, MemoryMiB: 1024}); err != nil {
+		t.Errorf("a fork snapshot after the migration: %v", err)
+	}
+}
+
+func TestForkSnapshotsAreGarbageOnceUnused(t *testing.T) {
+	ctx := context.Background()
+	s, _ := openTest(t)
+	mustCreate(t, s, newVM("vm-parent", 0))
+	mustSnapshot(t, s, Snapshot{ID: "snap-fork", Kind: SnapshotKindFork, VMID: "vm-parent", Image: "base", VCPUs: 2, MemoryMiB: 1024}, true)
+	// Unused, although its parent lives: garbage.
+	if g, _ := s.GarbageSnapshots(ctx); len(g) != 1 || g[0].ID != "snap-fork" {
+		t.Errorf("garbage = %+v, want the unused fork snapshot", g)
+	}
+	child := newVM("vm-child", 1)
+	child.SnapshotID, child.ParentID, child.Source = "snap-fork", "vm-parent", SourceSnapshot
+	got := mustCreate(t, s, child)
+	if got, _ := s.GetVM(ctx, got.ID); got.ParentID != "vm-parent" {
+		t.Errorf("ParentID = %q", got.ParentID)
+	}
+	if g, _ := s.GarbageSnapshots(ctx); len(g) != 0 {
+		t.Errorf("garbage with a child running = %+v", g)
+	}
+	if _, err := s.UpdateVM(ctx, "vm-child", "", func(v *VM) error { v.ParentID = "vm-other"; return nil }); err == nil {
+		t.Error("changing a VM's parent: want an error")
 	}
 }

@@ -104,6 +104,39 @@ func (f *fakeBackend) DeleteSnapshot(ctx context.Context, id string) (state.Snap
 	return s.Snapshot, nil
 }
 
+func (f *fakeBackend) Fork(_ context.Context, id string, req vm.ForkRequest) (vm.ForkResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	parent, ok := f.vms[id]
+	if !ok {
+		return vm.ForkResult{}, fmt.Errorf("VM %s: %w", id, state.ErrNotFound)
+	}
+	if req.Count < 1 {
+		return vm.ForkResult{}, fmt.Errorf("%w: count", vm.ErrInvalidRequest)
+	}
+	res := vm.ForkResult{
+		Snapshot: state.Snapshot{ID: "snap-forkforkfo", Kind: state.SnapshotKindFork, State: state.SnapshotReady, VMID: id},
+		Timings:  map[string]float64{"snapshot": 50, "paused": 47.5, "children": 120, "total": 171},
+	}
+	for i := range req.Count {
+		if i == 2 { // the third child always fails
+			res.Children = append(res.Children, vm.ForkChild{Err: fmt.Errorf("%w: out of slots", vm.ErrCapacity)})
+			continue
+		}
+		f.next++
+		c := parent
+		c.ID, c.ParentID, c.SnapshotID, c.Source = fmt.Sprintf("vm-%010d", f.next), id, "snap-forkforkfo", state.SourceSnapshot
+		f.vms[c.ID] = c
+		res.Children = append(res.Children, vm.ForkChild{VM: c})
+	}
+	if req.Count == 3 && req.TTL == time.Minute { // all fail
+		for i := range res.Children {
+			res.Children[i] = vm.ForkChild{Err: fmt.Errorf("%w: no memory", vm.ErrCapacity)}
+		}
+	}
+	return res, nil
+}
+
 func (f *fakeBackend) Rollback(_ context.Context, id, snapID string) (state.VM, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -401,6 +434,42 @@ func TestSnapshotListing(t *testing.T) {
 	}
 	if _, err := c.GetSnapshot(ctx, "snap-nope"); !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusNotFound {
 		t.Errorf("GetSnapshot of nothing = %#v", err)
+	}
+}
+
+func TestForkAPI(t *testing.T) {
+	ctx := context.Background()
+	c, _ := serve(t, newFakeBackend())
+	parent, err := c.CreateVM(ctx, CreateVMRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := c.Fork(ctx, parent.ID, ForkRequest{Count: 4, TTLSeconds: 600})
+	if err != nil {
+		t.Fatalf("Fork: %v", err)
+	}
+	if res.Snapshot.Kind != "fork" || len(res.Children) != 4 || res.TimingsMs["paused"] != 47.5 {
+		t.Fatalf("Fork = %+v", res)
+	}
+	for i, ch := range res.Children {
+		if i == 2 {
+			if ch.VM != nil || ch.Error == nil || ch.Error.Code != CodeCapacity {
+				t.Errorf("child 3 = %+v, want a capacity error", ch)
+			}
+			continue
+		}
+		if ch.VM == nil || ch.VM.ParentID != parent.ID || ch.VM.SnapshotID != "snap-forkforkfo" || ch.Error != nil {
+			t.Errorf("child %d = %+v", i+1, ch)
+		}
+	}
+	// When no child could be made, the fork is an error.
+	_, err = c.Fork(ctx, parent.ID, ForkRequest{Count: 3, TTLSeconds: 60})
+	var apiErr *Error
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusServiceUnavailable || !strings.Contains(apiErr.Message, "no child") {
+		t.Errorf("a fork with no children = %#v", err)
+	}
+	if _, err := c.Fork(ctx, parent.ID, ForkRequest{Count: 0}); !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusBadRequest {
+		t.Errorf("count 0 = %#v", err)
 	}
 }
 

@@ -123,6 +123,13 @@ func (c *Client) DeleteSnapshot(ctx context.Context, id string) (Snapshot, error
 	return snap, c.do(ctx, http.MethodDelete, "/v1/snapshots/"+url.PathEscape(id), nil, http.StatusOK, &snap)
 }
 
+// Fork makes children of a running VM. It returns an error only if none
+// could be made; otherwise each child has a VM or an error.
+func (c *Client) Fork(ctx context.Context, vmID string, req ForkRequest) (ForkResponse, error) {
+	var res ForkResponse
+	return res, c.do(ctx, http.MethodPost, "/v1/vms/"+url.PathEscape(vmID)+"/fork", req, http.StatusCreated, &res)
+}
+
 // Rollback rolls a VM back to a snapshot.
 func (c *Client) Rollback(ctx context.Context, vmID, snapshotID string) (VM, error) {
 	var v VM

@@ -29,6 +29,7 @@ import (
 	"io"
 	"log/slog"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -112,8 +113,13 @@ type Config struct {
 	ReaperInterval time.Duration
 	// DestroyedRetention is how long destroyed VMs' records are kept.
 	DestroyedRetention time.Duration
-	// MaxSnapshotsPerVM is how many snapshots one VM may have.
+	// MaxSnapshotsPerVM is how many snapshots one VM may have. A fork's
+	// snapshots don't count.
 	MaxSnapshotsPerVM int
+	// MaxForkChildren is the most children one fork may make.
+	MaxForkChildren int
+	// ForkParallelism is how many of a fork's children are restored at once.
+	ForkParallelism int
 	// MinFreeMiB is the disk space a snapshot must leave free.
 	MinFreeMiB int
 	// SettleCommand runs in a template's VM before it's saved, and returns
@@ -143,7 +149,7 @@ func DefaultConfig() Config {
 		DefaultVCPUs:      2,
 		DefaultMemoryMiB:  1024,
 		DefaultTTL:        time.Hour,
-		MaxVMs:            64,
+		MaxVMs:            512,
 		MemoryOverheadMiB: 256,
 		MaxPIDs:           128,
 		// rw: mount the disk read-write at boot rather than remounting it later.
@@ -154,6 +160,8 @@ func DefaultConfig() Config {
 		ReaperInterval:     15 * time.Second,
 		DestroyedRetention: 7 * 24 * time.Hour,
 		MaxSnapshotsPerVM:  16,
+		MaxForkChildren:    100,
+		ForkParallelism:    runtime.NumCPU(),
 		MinFreeMiB:         2048,
 		WarmImages:         []string{"base"},
 		SettleCommand:      []string{"systemctl", "is-system-running", "--wait"},
@@ -186,6 +194,8 @@ func (c Config) withDefaults() Config {
 	setInt(&c.MemoryOverheadMiB, d.MemoryOverheadMiB)
 	setInt(&c.MaxPIDs, d.MaxPIDs)
 	setInt(&c.MaxSnapshotsPerVM, d.MaxSnapshotsPerVM)
+	setInt(&c.MaxForkChildren, d.MaxForkChildren)
+	setInt(&c.ForkParallelism, d.ForkParallelism)
 	setInt(&c.MinFreeMiB, d.MinFreeMiB)
 	if c.DefaultTTL == 0 {
 		c.DefaultTTL = d.DefaultTTL
@@ -237,6 +247,8 @@ type Manager struct {
 	// when it last failed for each.
 	warming    map[string]bool
 	warmFailed map[string]time.Time
+	// pins are snapshots that mustn't be collected or deleted yet (see pin).
+	pins map[string]int
 }
 
 type tracked struct {
@@ -268,7 +280,7 @@ func newManager(cfg Config, store *state.Store, h host) (*Manager, error) {
 	m := &Manager{
 		cfg: cfg, store: store, host: h, log: cfg.Log, slots: slots, snaps: snaps, gate: newGate(),
 		procs: map[string]*tracked{}, ops: map[string]*createOp{}, flushes: map[string]chan struct{}{},
-		warming: map[string]bool{}, warmFailed: map[string]time.Time{},
+		warming: map[string]bool{}, warmFailed: map[string]time.Time{}, pins: map[string]int{},
 	}
 	// Slots held by VMs from before a restart stay theirs.
 	live, err := store.ListVMs(context.Background(), state.ListOptions{})
@@ -322,6 +334,8 @@ type CreateRequest struct {
 	SnapshotID string
 	// Cold boots the VM even if there's a template it could restore from.
 	Cold bool
+	// ParentID is the VM this one is forked from (Fork sets it).
+	ParentID string
 }
 
 func (m *Manager) normalize(ctx context.Context, req CreateRequest) (CreateRequest, error) {
@@ -409,7 +423,7 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (state.VM, erro
 	record := state.VM{
 		ID: newID(), Image: req.Image, VCPUs: req.VCPUs, MemoryMiB: req.MemoryMiB,
 		Slot: slot, UID: m.cfg.UIDBase + slot, ExpiresAt: time.Now().Add(req.TTL),
-		SnapshotID: req.SnapshotID, Source: source,
+		SnapshotID: req.SnapshotID, Source: source, ParentID: req.ParentID,
 	}
 	vm, err := m.store.CreateVM(ctx, record)
 	if errors.Is(err, state.ErrNotFound) && source == state.SourceTemplate {

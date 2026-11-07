@@ -49,6 +49,12 @@ type fakeHost struct {
 	lastSync agentproto.SyncRequest
 	// busyUntil makes paused wait until then, like a Firecracker busy writing a snapshot.
 	busyUntil time.Time
+	// failTimes makes the next N calls of an op fail.
+	failTimes map[string]int
+	// loadDelay makes loadSnapshot take this long; loading and maxLoading
+	// count how many run at once.
+	loadDelay           time.Duration
+	loading, maxLoading int
 }
 
 type hold struct {
@@ -141,7 +147,18 @@ func (f *fakeHost) hostInfo(context.Context) (snapshot.Host, error) {
 	}
 	return fakeSnapshotHost, nil
 }
-func (f *fakeHost) loadSnapshot(context.Context, *jailer.Jail) error { return f.record("loadSnapshot") }
+func (f *fakeHost) loadSnapshot(context.Context, *jailer.Jail) error {
+	f.mu.Lock()
+	f.loading++
+	f.maxLoading = max(f.maxLoading, f.loading)
+	delay := f.loadDelay
+	f.mu.Unlock()
+	time.Sleep(delay)
+	f.mu.Lock()
+	f.loading--
+	f.mu.Unlock()
+	return f.record("loadSnapshot")
+}
 func (f *fakeHost) syncGuest(_ context.Context, _ *jailer.Jail, req agentproto.SyncRequest) (agentproto.SyncResult, error) {
 	f.mu.Lock()
 	f.lastSync = req
@@ -156,6 +173,10 @@ func (f *fakeHost) record(op string) error {
 	f.mu.Lock()
 	f.calls = append(f.calls, op)
 	err := f.failAt[op]
+	if f.failTimes[op] > 0 {
+		f.failTimes[op]--
+		err = errors.New(op + " failed, as the test asked")
+	}
 	h := f.holds[op]
 	delete(f.holds, op)
 	f.mu.Unlock()

@@ -40,6 +40,7 @@ type Backend interface {
 	GetSnapshot(ctx context.Context, id string) (vm.SnapshotInfo, error)
 	DeleteSnapshot(ctx context.Context, id string) (state.Snapshot, error)
 	Rollback(ctx context.Context, id, snapshotID string) (state.VM, error)
+	Fork(ctx context.Context, id string, req vm.ForkRequest) (vm.ForkResult, error)
 	Images(ctx context.Context) ([]*image.Image, error)
 	Templates(ctx context.Context) ([]vm.Template, error)
 	WarmTemplate(ctx context.Context, image string, vcpus, memoryMiB int) (state.Snapshot, error)
@@ -87,6 +88,7 @@ func NewServer(backend Backend, version string, log *slog.Logger, opts ...Option
 	s.mux.HandleFunc("/v1/vms/{id}/exec", s.exec)
 	s.mux.HandleFunc("/v1/vms/{id}/snapshots", s.vmSnapshots)
 	s.mux.HandleFunc("/v1/vms/{id}/rollback", s.rollback)
+	s.mux.HandleFunc("/v1/vms/{id}/fork", s.fork)
 	s.mux.HandleFunc("/v1/snapshots", s.snapshots)
 	s.mux.HandleFunc("/v1/snapshots/{id}", s.oneSnapshot)
 	s.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -375,8 +377,52 @@ func (s *Server) rollback(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, toAPI(v))
 }
 
+func (s *Server) fork(w http.ResponseWriter, r *http.Request) {
+	if !allow(w, r, http.MethodPost) {
+		return
+	}
+	var req ForkRequest
+	if !decode(w, r, maxJSONBytes, &req) {
+		return
+	}
+	if req.TTLSeconds < 0 {
+		writeError(w, http.StatusBadRequest, CodeInvalidRequest, "ttl_seconds can't be negative")
+		return
+	}
+	ctx := logging.WithVM(r.Context(), r.PathValue("id"))
+	res, err := s.backend.Fork(ctx, r.PathValue("id"), vm.ForkRequest{Count: req.Count, TTL: time.Duration(req.TTLSeconds) * time.Second})
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	if res.Failed() == len(res.Children) && len(res.Children) > 0 {
+		s.fail(w, r, fmt.Errorf("no child could be made: %w", res.Children[0].Err))
+		return
+	}
+	out := ForkResponse{Snapshot: toAPISnapshot(res.Snapshot, nil), Children: []ForkChild{}, TimingsMs: res.Timings}
+	for _, c := range res.Children {
+		if c.Err != nil {
+			_, code := errorStatus(c.Err)
+			out.Children = append(out.Children, ForkChild{Error: &ErrorDetail{Code: code, Message: c.Err.Error()}})
+			continue
+		}
+		v := toAPI(c.VM)
+		out.Children = append(out.Children, ForkChild{VM: &v})
+	}
+	writeJSON(w, http.StatusCreated, out)
+}
+
 // fail answers with the error's status and code.
 func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
+	status, code := errorStatus(err)
+	if status >= 500 {
+		s.log.ErrorContext(r.Context(), "request failed", "err", err)
+	}
+	writeError(w, status, code, err.Error())
+}
+
+// errorStatus is the HTTP status and error code for err.
+func errorStatus(err error) (int, string) {
 	status, code := http.StatusInternalServerError, CodeInternal
 	var agentErr *agentproto.Error
 	switch {
@@ -403,16 +449,13 @@ func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
 	case errors.Is(err, state.ErrInvalidTransition), errors.Is(err, state.ErrConflict):
 		status, code = http.StatusConflict, CodeConflict
 	}
-	if status >= 500 {
-		s.log.ErrorContext(r.Context(), "request failed", "err", err)
-	}
-	writeError(w, status, code, err.Error())
+	return status, code
 }
 
 func toAPI(v state.VM) VM {
 	out := VM{
 		ID: v.ID, State: string(v.State), Image: v.Image, VCPUs: v.VCPUs, MemoryMiB: v.MemoryMiB,
-		CreatedAt: v.CreatedAt, Error: v.Error, Source: string(v.Source), SnapshotID: v.SnapshotID, TimingsMs: v.Timings,
+		CreatedAt: v.CreatedAt, Error: v.Error, Source: string(v.Source), SnapshotID: v.SnapshotID, ParentID: v.ParentID, TimingsMs: v.Timings,
 	}
 	if !v.ExpiresAt.IsZero() {
 		t := v.ExpiresAt

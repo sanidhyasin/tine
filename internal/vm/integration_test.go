@@ -344,6 +344,95 @@ func TestRealRollbackToSnapshot(t *testing.T) {
 	requireClean(t, m, "after the test")
 }
 
+// TestRealFork forks a real VM into 4 children: each has the parent's disk
+// and running processes as at the fork, and its own identity and network,
+// and the parent carries on. The children's PSS shows the memory they share.
+func TestRealFork(t *testing.T) {
+	m := realManager(t, nil)
+	ctx := context.Background()
+	parent, err := m.Create(ctx, CreateRequest{MemoryMiB: 512})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = m.Destroy(context.Background(), parent.ID) })
+	execOut(t, m, parent.ID, "sh", "-c", "echo parent > /root/who; setsid sleep 100000 >/dev/null 2>&1 < /dev/null & echo $! > /root/sleeper")
+
+	res, err := m.Fork(ctx, parent.ID, ForkRequest{Count: 4})
+	if err != nil {
+		t.Fatalf("Fork: %v", err)
+	}
+	t.Logf("fork of 4: %s", formatTimings(res.Timings))
+	if res.Failed() > 0 {
+		t.Fatalf("failed children: %+v", res.Children)
+	}
+	machineIDs := map[string]bool{strings.TrimSpace(execOut(t, m, parent.ID, "cat", "/etc/machine-id")): true}
+	for i, c := range res.Children {
+		child := c.VM
+		t.Cleanup(func() { _, _ = m.Destroy(context.Background(), child.ID) })
+		if got := strings.TrimSpace(execOut(t, m, child.ID, "cat", "/root/who")); got != "parent" {
+			t.Errorf("child %d: /root/who = %q", i+1, got)
+		}
+		if out, code := execCode(t, m, child.ID, "sh", "-c", "kill -0 $(cat /root/sleeper)"); code != 0 {
+			t.Errorf("child %d: the parent's process isn't running in it: %q", i+1, out)
+		}
+		if got := strings.TrimSpace(execOut(t, m, child.ID, "hostname")); got != child.ID {
+			t.Errorf("child %d: hostname = %q", i+1, got)
+		}
+		id := strings.TrimSpace(execOut(t, m, child.ID, "cat", "/etc/machine-id"))
+		if machineIDs[id] {
+			t.Errorf("child %d shares machine ID %s", i+1, id)
+		}
+		machineIDs[id] = true
+		if out, code := execCode(t, m, child.ID, "timeout", "5", "bash", "-c", "echo > /dev/tcp/1.1.1.1/443"); code != 0 {
+			t.Errorf("child %d: no internet: exit %d %q", i+1, code, out)
+		}
+		execOut(t, m, child.ID, "sh", "-c", "echo child > /root/who")
+	}
+	// Each child's writes are its own, and the parent is as it was.
+	if got := strings.TrimSpace(execOut(t, m, parent.ID, "cat", "/root/who")); got != "parent" {
+		t.Errorf("the parent's /root/who = %q", got)
+	}
+	for _, c := range res.Children {
+		rss, pss := smapsRollup(t, c.VM)
+		t.Logf("child %s: RSS %d MiB, PSS %d MiB", c.VM.ID, rss>>20, pss>>20)
+		if pss >= rss {
+			t.Errorf("child %s: PSS %d >= RSS %d: it shares no memory", c.VM.ID, pss, rss)
+		}
+	}
+	for _, c := range res.Children {
+		if _, err := m.Destroy(ctx, c.VM.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := m.Destroy(ctx, parent.ID); err != nil {
+		t.Fatal(err)
+	}
+	requireClean(t, m, "after the test")
+}
+
+// smapsRollup reads a VM's Firecracker's RSS and PSS, in bytes.
+func smapsRollup(t *testing.T, vm state.VM) (rss, pss int64) {
+	t.Helper()
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/smaps_rollup", vm.PID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		f := strings.Fields(line)
+		if len(f) < 2 {
+			continue
+		}
+		kb, _ := strconv.ParseInt(f[1], 10, 64)
+		switch f[0] {
+		case "Rss:":
+			rss = kb << 10
+		case "Pss:":
+			pss = kb << 10
+		}
+	}
+	return rss, pss
+}
+
 // TestRealTemplate warms a real template, and creates VMs from it and cold.
 func TestRealTemplate(t *testing.T) {
 	m := realManager(t, nil)

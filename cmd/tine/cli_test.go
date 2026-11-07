@@ -200,6 +200,32 @@ func (b *backend) DeleteSnapshot(ctx context.Context, id string) (state.Snapshot
 	return s.Snapshot, nil
 }
 
+func (b *backend) Fork(_ context.Context, id string, req vm.ForkRequest) (vm.ForkResult, error) {
+	parent, err := b.Get(context.Background(), id)
+	if err != nil {
+		return vm.ForkResult{}, err
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	res := vm.ForkResult{
+		Snapshot: state.Snapshot{ID: "snap-forkaaaaaa", Kind: state.SnapshotKindFork, State: state.SnapshotReady, VMID: id},
+		Timings:  map[string]float64{"snapshot": 49.1, "paused": 47.5, "children": 212.3, "total": 262.0},
+	}
+	for i := range req.Count {
+		if req.Count == 4 && i == 3 {
+			res.Children = append(res.Children, vm.ForkChild{Err: fmt.Errorf("%w: the host is short of memory", vm.ErrCapacity)})
+			continue
+		}
+		c := parent
+		c.ID = strings.NewReplacer("0", "f", "1", "g", "2", "h", "3", "i").Replace(fmt.Sprintf("vm-%010d", len(b.vms)+1))
+		c.ParentID, c.SnapshotID, c.Source = id, "snap-forkaaaaaa", state.SourceSnapshot
+		c.Timings = map[string]float64{"restore": 13, "agent": 61, "sync": 32, "total": 110}
+		b.vms = append(b.vms, c)
+		res.Children = append(res.Children, vm.ForkChild{VM: c})
+	}
+	return res, nil
+}
+
 func (b *backend) Rollback(_ context.Context, id, snapID string) (state.VM, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
