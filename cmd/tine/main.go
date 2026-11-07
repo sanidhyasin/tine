@@ -60,7 +60,8 @@ VM IDs can be shortened to any unique prefix, like docker's.`,
 		Example: `  tine create
   tine exec vm-7f3k -- uname -r
   tine snapshot vm-7f3k
-  tine ls
+  tine fork vm-7f3k -n 5
+  tine ls --tree
   tine destroy vm-7f3k`,
 		Version:       version.String(),
 		SilenceUsage:  true,
@@ -77,7 +78,7 @@ VM IDs can be shortened to any unique prefix, like docker's.`,
 	})
 	root.AddCommand(
 		newCreateCmd(g), newListCmd(g), newInspectCmd(g), newExecCmd(g), newDestroyCmd(g),
-		newSnapshotCmd(g), newRollbackCmd(g), newImagesCmd(g), newImageCmd(g), newVersionCmd(g),
+		newSnapshotCmd(g), newRollbackCmd(g), newForkCmd(g), newImagesCmd(g), newImageCmd(g), newVersionCmd(g),
 	)
 	return root
 }

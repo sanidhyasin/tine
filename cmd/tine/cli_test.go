@@ -568,6 +568,30 @@ func TestListTree(t *testing.T) {
 	}
 }
 
+func TestFork(t *testing.T) {
+	sock, _ := startTined(t)
+	parent := strings.TrimSpace(tine(t, sock, "", "create", "-q").stdout)
+	r := tine(t, sock, "", "fork", parent[3:7], "-n", "3")
+	lines := strings.Split(strings.TrimSpace(r.stdout), "\n")
+	if r.code != 0 || len(lines) != 4 || lines[0] != "forked "+parent+" into 3 in 262ms (parent paused 48ms; snapshot 49ms · children 212ms)" ||
+		!strings.HasSuffix(lines[1], "running  (110ms)") {
+		t.Errorf("fork = %d:\n%s%s", r.code, r.stdout, r.stderr)
+	}
+	r = tine(t, sock, "", "fork", "-q", parent, "-n", "2")
+	if ids := strings.Fields(r.stdout); r.code != 0 || len(ids) != 2 || !strings.HasPrefix(ids[0], "vm-") {
+		t.Errorf("fork -q = %q", r.stdout)
+	}
+	// A child that couldn't be made: the rest are listed, and tine exits 1.
+	r = tine(t, sock, "", "fork", parent, "-n", "4")
+	if r.code != 1 || !strings.Contains(r.stdout, "into 3") || !strings.Contains(r.stderr, "short of memory") || !strings.Contains(r.stderr, "1 of 4") {
+		t.Errorf("fork with a failure = %d %q %q", r.code, r.stdout, r.stderr)
+	}
+	var res api.ForkResponse
+	if r := tine(t, sock, "", "--json", "fork", parent); json.Unmarshal([]byte(r.stdout), &res) != nil || len(res.Children) != 1 || res.TimingsMs["paused"] != 47.5 {
+		t.Errorf("fork --json = %q", r.stdout)
+	}
+}
+
 func TestImagesAndVersion(t *testing.T) {
 	sock, _ := startTined(t)
 	for _, args := range [][]string{{"images"}, {"image", "ls"}} {
