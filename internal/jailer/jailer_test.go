@@ -345,3 +345,24 @@ func TestFileModeString(t *testing.T) {
 		t.Error("unexpected FileMode strings")
 	}
 }
+
+func TestCreateFile(t *testing.T) {
+	cfg := testConfig(t)
+	j, _ := New(cfg, testSpec())
+	if err := j.Prepare(); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.CreateFile("/logs/firecracker.log"); err != nil {
+		t.Fatalf("CreateFile: %v", err)
+	}
+	info, err := os.Stat(j.HostPath("/logs/firecracker.log"))
+	if err != nil || info.Size() != 0 || info.Mode().Perm() != 0o600 {
+		t.Errorf("created file: %v, %v; want an empty file with mode 0600", info, err)
+	}
+	if err := j.CreateFile("/logs/firecracker.log"); err == nil {
+		t.Error("CreateFile over an existing file: want an error")
+	}
+	if err := j.CreateFile("relative.log"); err == nil {
+		t.Error("CreateFile with a relative path: want an error")
+	}
+}

@@ -298,6 +298,27 @@ func (j *Jail) place(f File) error {
 	}
 }
 
+// CreateFile makes an empty file inside the jail, owned by the VM's uid with
+// mode 0600, for Firecracker to write to (its log, for example). Call it
+// after Prepare.
+func (j *Jail) CreateFile(target string) error {
+	if err := checkJailPath(target); err != nil {
+		return fmt.Errorf("jail %s: %w", j.ID, err)
+	}
+	p := j.HostPath(target)
+	if err := j.mkdirInJail(filepath.Dir(p)); err != nil {
+		return fmt.Errorf("jail %s: %w", j.ID, err)
+	}
+	f, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600) //nolint:gosec // p was checked to be inside the jail
+	if err != nil {
+		return fmt.Errorf("jail %s: %w", j.ID, err)
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Chown(p, j.spec.UID, j.spec.GID)
+}
+
 // mkdirInJail creates dir, which must be inside the jail's root, and any
 // missing parents. They belong to the VM's uid with mode 0700: only that VM's
 // Firecracker needs to go through them.
