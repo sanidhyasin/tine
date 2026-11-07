@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -124,7 +125,10 @@ func (b *bench) snapshot(ctx context.Context, memoryMiB, runs int) {
 		return
 	}
 	defer b.destroy(vm.ID)
-	time.Sleep(3 * time.Second)
+	if err := b.settle(ctx, vm.ID); err != nil {
+		b.fail("snapshot", err)
+		return
+	}
 	b.point(ctx, "snapshot", map[string]any{"memory_mib": memoryMiB}, "paused", runs, func(ctx context.Context) Record {
 		start := time.Now()
 		snap, err := b.c.CreateSnapshot(ctx, vm.ID)
@@ -198,6 +202,14 @@ func (o forkOptions) params() map[string]any {
 // child's memory, and with TouchMiB, how fast each child writes to memory
 // it shares with its parent.
 func (b *bench) fork(ctx context.Context, o forkOptions, runs int) {
+	if o.Strategy == strategyCold {
+		if o.TouchMiB > 0 || o.DirtyMiB > 0 {
+			_, _ = fmt.Fprintf(b.log, "%-18s %-44s skipped: cold VMs share nothing with a parent\n", "fork", describe(o.params()))
+			return
+		}
+		b.forkCold(ctx, o, runs)
+		return
+	}
 	b.point(ctx, "fork", o.params(), "total", runs, func(ctx context.Context) Record {
 		parent, err := b.c.CreateVM(ctx, api.CreateVMRequest{Image: o.Image, VCPUs: o.VCPUs, MemoryMiB: o.MemoryMiB, Cold: true, TTLSeconds: b.ttl})
 		if err != nil {
@@ -205,6 +217,9 @@ func (b *bench) fork(ctx context.Context, o forkOptions, runs int) {
 		}
 		ids := []string{parent.ID}
 		defer func() { b.destroyAll(ids) }()
+		if err := b.settle(ctx, parent.ID); err != nil {
+			return Record{Error: err.Error()}
+		}
 		if o.TouchMiB > 0 {
 			if err := b.run(ctx, parent.ID, "tine-touch", "start", "-mb", strconv.Itoa(o.TouchMiB)); err != nil {
 				return Record{Error: "tine-touch start: " + err.Error()}
@@ -250,7 +265,59 @@ func (b *bench) fork(ctx context.Context, o forkOptions, runs int) {
 			b.touch(ctx, children, &r)
 		}
 		time.Sleep(3 * time.Second) // let the children settle before reading their memory
-		b.childMemory(ctx, parent.ID, &r)
+		b.childMemory(ctx, parent.ID, children, &r)
+		return r
+	})
+}
+
+// strategyCold isn't a fork at all: the baseline a fork is measured
+// against, booting the same number of fresh VMs instead.
+const strategyCold = "cold"
+
+// forkCold boots Children fresh VMs, as many at once as tined restores a
+// fork's children (one per CPU), and times them as one fork.
+func (b *bench) forkCold(ctx context.Context, o forkOptions, runs int) {
+	b.point(ctx, "fork", o.params(), "total", runs, func(ctx context.Context) Record {
+		var (
+			mu       sync.Mutex
+			ids      []string
+			restores []float64
+			errs     []string
+			wg       sync.WaitGroup
+		)
+		defer func() { b.destroyAll(ids) }()
+		slots := make(chan struct{}, runtime.NumCPU())
+		start := time.Now()
+		for range o.Children {
+			slots <- struct{}{}
+			wg.Add(1)
+			go func() {
+				defer func() { <-slots; wg.Done() }()
+				vm, err := b.c.CreateVM(ctx, api.CreateVMRequest{Image: o.Image, VCPUs: o.VCPUs, MemoryMiB: o.MemoryMiB, Cold: true, TTLSeconds: b.ttl})
+				mu.Lock()
+				defer mu.Unlock()
+				if err != nil {
+					errs = append(errs, err.Error())
+					return
+				}
+				ids = append(ids, vm.ID)
+				restores = append(restores, vm.TimingsMs["total"])
+			}()
+		}
+		wg.Wait()
+		total := ms(time.Since(start))
+		r := Record{OK: true, TimingsMs: map[string]float64{"total": total, "children": total, "client": total},
+			MemoryMiB: map[string]float64{}, Extra: map[string]any{}}
+		if len(errs) > 0 {
+			r.OK, r.Error = false, fmt.Sprintf("%d of %d VMs failed: %s", len(errs), o.Children, errs[0])
+		}
+		if len(restores) > 0 {
+			sort.Float64s(restores)
+			r.TimingsMs["child_p50"] = restores[len(restores)/2]
+			r.TimingsMs["child_max"] = restores[len(restores)-1]
+		}
+		time.Sleep(3 * time.Second)
+		b.childMemory(ctx, "", ids, &r)
 		return r
 	})
 }
@@ -288,10 +355,14 @@ func (b *bench) touch(ctx context.Context, children []string, r *Record) {
 }
 
 // childMemory records the children's mean RSS and PSS, and the parent's.
-func (b *bench) childMemory(ctx context.Context, parentID string, r *Record) {
+func (b *bench) childMemory(ctx context.Context, parentID string, children []string, r *Record) {
 	vms, err := b.c.ListVMsWith(ctx, api.ListOptions{Memory: true})
 	if err != nil {
 		return
+	}
+	child := map[string]bool{}
+	for _, id := range children {
+		child[id] = true
 	}
 	var rss, pss float64
 	n := 0
@@ -300,10 +371,10 @@ func (b *bench) childMemory(ctx context.Context, parentID string, r *Record) {
 			continue
 		}
 		switch {
-		case v.ID == parentID:
+		case parentID != "" && v.ID == parentID:
 			r.MemoryMiB["parent_rss"] = mib(v.Memory.RSSBytes)
 			r.MemoryMiB["parent_pss"] = mib(v.Memory.PSSBytes)
-		case v.ParentID == parentID:
+		case child[v.ID]:
 			rss, pss, n = rss+mib(v.Memory.RSSBytes), pss+mib(v.Memory.PSSBytes), n+1
 		}
 	}
@@ -323,6 +394,9 @@ func (b *bench) density(ctx context.Context, vcpus, memoryMiB int) {
 		}
 		ids := []string{parent.ID}
 		defer func() { b.destroyAll(ids) }()
+		if err := b.settle(ctx, parent.ID); err != nil {
+			return Record{Error: err.Error()}
+		}
 		start := time.Now()
 		// Batches of 50 until one is refused, then of 10, then of 1.
 		var refusal string
@@ -347,7 +421,7 @@ func (b *bench) density(ctx context.Context, vcpus, memoryMiB int) {
 		r := Record{OK: true, TimingsMs: map[string]float64{"children": float64(len(ids) - 1), "seconds": time.Since(start).Seconds()},
 			MemoryMiB: map[string]float64{}, Extra: map[string]any{"refused": refusal}}
 		time.Sleep(5 * time.Second)
-		b.childMemory(ctx, parent.ID, &r)
+		b.childMemory(ctx, parent.ID, ids[1:], &r)
 		r.MemoryMiB["host_available"] = float64(memAvailableMiB())
 		return r
 	})
@@ -371,6 +445,17 @@ func (b *bench) destroyAll(ids []string) {
 		go func() { defer func() { <-sem; wg.Done() }(); b.destroy(id) }()
 	}
 	wg.Wait()
+}
+
+// settle waits until a booted VM's guest has finished starting up, as
+// tined waits before saving a template. Forking a guest that's still
+// booting would have every child finish the boot, all at once.
+func (b *bench) settle(ctx context.Context, id string) error {
+	// "degraded" (a unit failed) exits 1, and is settled all the same.
+	if _, err := b.c.Exec(ctx, id, api.ExecRequest{Args: []string{"systemctl", "is-system-running", "--wait"}, TimeoutMs: 120_000}, nil); err != nil {
+		return fmt.Errorf("settle: %w", err)
+	}
+	return nil
 }
 
 func (b *bench) run(ctx context.Context, id string, args ...string) error {

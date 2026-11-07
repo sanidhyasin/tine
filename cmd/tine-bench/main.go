@@ -30,6 +30,7 @@ Scenarios:
   snapshot         snapshot VMs of each --snapshot-memory
   rollback         roll a VM back to a snapshot
   fork             fork a fresh VM into each --children, with each --strategy
+                   (share, copy, or cold: boot that many fresh VMs instead)
   fork-touch       fork, then time each child writing to its parent's memory
   fork-dirty       fork after the parent changes each --dirty MiB
   density          fork until admission control refuses
@@ -48,7 +49,7 @@ func main() {
 		forkRuns   = flag.Int("fork-runs", 10, "runs per fork data point (each boots a fresh parent)")
 		snapRuns   = flag.Int("snapshot-runs", 10, "runs per snapshot data point (each waits for the last to reach the disk)")
 		children   = flag.String("children", "1,10,30", "numbers of children to fork")
-		strategies = flag.String("strategy", "share", "fork strategies to compare")
+		strategies = flag.String("strategy", "share", "fork strategies to compare: share, copy, and cold (fresh VMs, the baseline)")
 		forkMemory = flag.Int("fork-memory", 256, "the fork parent's memory, in MiB")
 		snapMemory = flag.String("snapshot-memory", "256,1024,4096", "VM sizes to snapshot, in MiB")
 		dirty      = flag.String("dirty", "0,64,256", "MiB the parent changes before fork-dirty")
