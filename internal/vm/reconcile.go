@@ -216,18 +216,21 @@ func (m *Manager) reconcileSnapshots(ctx context.Context, r *Report, errorf func
 }
 
 // RunReaper destroys VMs whose time to live has run out, every interval,
-// and once an hour purges the records of VMs destroyed longer ago than
-// DestroyedRetention. It returns when ctx ends.
+// keeps the templates of WarmImages usable (see keepWarm), and once an hour
+// purges the records of VMs destroyed longer ago than DestroyedRetention.
+// It returns when ctx ends.
 func (m *Manager) RunReaper(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	var lastPurge time.Time
+	m.keepWarm(ctx)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case now := <-ticker.C:
 			m.reapOnce(ctx, now)
+			m.keepWarm(ctx)
 			if now.Sub(lastPurge) >= time.Hour {
 				m.purgeOnce(ctx, now)
 				lastPurge = now

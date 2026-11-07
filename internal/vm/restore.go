@@ -77,12 +77,3 @@ func describeOffset(ms float64) string {
 	}
 	return "right"
 }
-
-// createSource says how a VM was started, for metrics and logs: "cold" for
-// a boot, "snapshot" for a restore.
-func createSource(vm state.VM) string {
-	if vm.SnapshotID != "" {
-		return "snapshot"
-	}
-	return "cold"
-}

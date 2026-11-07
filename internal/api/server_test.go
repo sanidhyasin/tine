@@ -39,6 +39,30 @@ type fakeBackend struct {
 
 func newFakeBackend() *fakeBackend { return &fakeBackend{vms: map[string]state.VM{}} }
 
+func (*fakeBackend) Templates(context.Context) ([]vm.Template, error) {
+	return []vm.Template{
+		{Snapshot: state.Snapshot{ID: "snap-tmplaaaaaa", Kind: state.SnapshotKindTemplate, Image: "base", VCPUs: 2, MemoryMiB: 1024, CreatedAt: time.Now().Add(-time.Hour)}},
+		{Snapshot: state.Snapshot{ID: "snap-tmplbbbbbb", Kind: state.SnapshotKindTemplate, Image: "base", VCPUs: 4, MemoryMiB: 4096, CreatedAt: time.Now()}, Problem: "image base was imported again since"},
+	}, nil
+}
+
+func (*fakeBackend) WarmTemplate(_ context.Context, image string, vcpus, memoryMiB int) (state.Snapshot, error) {
+	if image != "base" {
+		return state.Snapshot{}, fmt.Errorf("%w: %s", vm.ErrImageNotFound, image)
+	}
+	if vcpus == 0 {
+		vcpus = 2
+	}
+	if memoryMiB == 0 {
+		memoryMiB = 1024
+	}
+	return state.Snapshot{
+		ID: "snap-tmplcccccc", Kind: state.SnapshotKindTemplate, State: state.SnapshotReady, VMID: "vm-warmwarmwa", Image: image,
+		VCPUs: vcpus, MemoryMiB: memoryMiB, SizeBytes: int64(memoryMiB) << 20, CreatedAt: time.Now(),
+		Metadata: json.RawMessage(`{"timings_ms":{"paused":250,"total":260}}`),
+	}, nil
+}
+
 func (f *fakeBackend) Snapshot(_ context.Context, id string) (state.Snapshot, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -356,7 +380,36 @@ func TestImages(t *testing.T) {
 	c, _ := serve(t, newFakeBackend())
 	imgs, err := c.Images(context.Background())
 	if err != nil || len(imgs) != 1 || imgs[0].Name != "base" || imgs[0].Kernel != "vmlinux-6.18.56" || imgs[0].DiskBytes != 4<<30 {
-		t.Errorf("Images = %+v, %v", imgs, err)
+		t.Fatalf("Images = %+v, %v", imgs, err)
+	}
+	tm := imgs[0].Templates
+	if len(tm) != 2 || tm[0].SnapshotID != "snap-tmplaaaaaa" || tm[0].Problem != "" || tm[1].MemoryMiB != 4096 || tm[1].Problem == "" {
+		t.Errorf("templates = %+v", tm)
+	}
+}
+
+func TestWarmTemplate(t *testing.T) {
+	ctx := context.Background()
+	c, _ := serve(t, newFakeBackend())
+	snap, err := c.WarmTemplate(ctx, "base", WarmRequest{VCPUs: 4})
+	if err != nil || snap.Kind != "template" || snap.VCPUs != 4 || snap.MemoryMiB != 1024 || snap.Image != "base" {
+		t.Errorf("WarmTemplate = %+v, %v", snap, err)
+	}
+	_, err = c.WarmTemplate(ctx, "nope", WarmRequest{})
+	var apiErr *Error
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusNotFound || apiErr.Code != CodeImageNotFound {
+		t.Errorf("WarmTemplate of a missing image = %#v", err)
+	}
+}
+
+func TestCreateCanAskForAColdBoot(t *testing.T) {
+	b := newFakeBackend()
+	c, _ := serve(t, b)
+	if _, err := c.CreateVM(context.Background(), CreateVMRequest{Cold: true}); err != nil {
+		t.Fatal(err)
+	}
+	if !b.lastReq.Cold {
+		t.Error("cold didn't reach the backend")
 	}
 }
 

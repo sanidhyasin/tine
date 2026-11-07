@@ -23,3 +23,9 @@ CREATE INDEX snapshots_templates ON snapshots (image, vcpus, memory_mib, created
 -- use, and can't be deleted.
 ALTER TABLE vms ADD COLUMN snapshot_id TEXT;
 CREATE INDEX vms_snapshot ON vms (snapshot_id) WHERE snapshot_id IS NOT NULL;
+
+-- How the VM started: cold (booted), template (restored from its image's
+-- template) or snapshot (restored from another snapshot). NULL for VMs from
+-- before this migration, which were all booted.
+ALTER TABLE vms ADD COLUMN source TEXT
+    CHECK (source IS NULL OR source IN ('cold', 'template', 'snapshot'));

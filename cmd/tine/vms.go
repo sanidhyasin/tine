@@ -35,8 +35,13 @@ func newCreateCmd(g *globals) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "create",
 		Short: "Create a VM and wait until it's running",
+		Long: `Create starts a VM and waits until it's ready to run commands.
+
+If the image has a template of that size (see 'tine image warm'), the VM is
+restored from it, in milliseconds. Otherwise, or with --cold, it boots.`,
 		Example: `  tine create
   tine create --vcpus 4 --memory 2G --ttl 30m
+  tine create --cold
   ID=$(tine create -q)`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -61,8 +66,8 @@ func newCreateCmd(g *globals) *cobra.Command {
 			case quiet:
 				_, err = fmt.Fprintln(out, vm.ID)
 			default:
-				_, err = fmt.Fprintf(out, "%s  %s  (created in %s: %s)\n",
-					vm.ID, vm.State, formatMillis(vm.TimingsMs["total"]), describeTimings(vm.TimingsMs))
+				_, err = fmt.Fprintf(out, "%s  %s  (%s in %s: %s)\n", vm.ID, vm.State, describeStart(vm),
+					formatMillis(vm.TimingsMs["total"]), describeTimings(vm.TimingsMs, vm.Source))
 			}
 			return err
 		},
@@ -73,6 +78,7 @@ func newCreateCmd(g *globals) *cobra.Command {
 	f.StringVar(&memory, "memory", "", `memory, e.g. "512M" or "2G" (default: tined's, normally 1G)`)
 	f.DurationVar(&ttl, "ttl", 0, "destroy the VM automatically after this long (default: tined's, normally 1h)")
 	f.BoolVarP(&quiet, "quiet", "q", false, "print only the VM's ID")
+	f.BoolVar(&req.Cold, "cold", false, "boot the VM, even if its image has a template to start from")
 	return cmd
 }
 
@@ -195,10 +201,10 @@ func newImagesCmd(g *globals) *cobra.Command {
 				return printJSON(cmd.OutOrStdout(), imgs)
 			}
 			w := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 4, 2, ' ', 0)
-			_, _ = fmt.Fprintln(w, "NAME\tKERNEL\tDISK\tAGENT\tCREATED")
+			_, _ = fmt.Fprintln(w, "NAME\tKERNEL\tDISK\tAGENT\tCREATED\tTEMPLATES")
 			for _, img := range imgs {
-				_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s ago\n", img.Name, img.Kernel, formatBytes(img.DiskBytes),
-					img.AgentVersion, humanDuration(time.Since(img.CreatedAt)))
+				_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s ago\t%s\n", img.Name, img.Kernel, formatBytes(img.DiskBytes),
+					img.AgentVersion, humanDuration(time.Since(img.CreatedAt)), describeTemplates(img.Templates))
 			}
 			return w.Flush()
 		},

@@ -8,6 +8,7 @@
 //
 //	GET    /healthz                Health
 //	GET    /v1/images              ListImagesResponse
+//	POST   /v1/images/{name}/warm  WarmRequest → Snapshot (201), the new template
 //	POST   /v1/vms                 CreateVMRequest → VM (201)
 //	GET    /v1/vms[?all=true]      ListVMsResponse
 //	GET    /v1/vms/{id}            VM
@@ -37,6 +38,9 @@ type VM struct {
 	DestroyedAt *time.Time `json:"destroyed_at,omitempty"`
 	// Error says why the VM failed, if it did.
 	Error string `json:"error,omitempty"`
+	// Source is how the VM started: "cold" (booted), "template" (restored
+	// from its image's template) or "snapshot".
+	Source string `json:"source,omitempty"`
 	// SnapshotID is the snapshot the VM was restored from, and runs from. It's
 	// empty for a VM that was booted from scratch.
 	SnapshotID string `json:"snapshot_id,omitempty"`
@@ -76,6 +80,8 @@ type CreateVMRequest struct {
 	VCPUs      int    `json:"vcpus,omitempty"`
 	MemoryMiB  int    `json:"memory_mib,omitempty"`
 	TTLSeconds int    `json:"ttl_seconds,omitempty"`
+	// Cold boots the VM even if its image has a template it could start from.
+	Cold bool `json:"cold,omitempty"`
 }
 
 // ListVMsResponse is GET /v1/vms's answer.
@@ -90,6 +96,27 @@ type Image struct {
 	Kernel       string    `json:"kernel"`
 	DiskBytes    int64     `json:"disk_bytes"`
 	AgentVersion string    `json:"agent_version,omitempty"`
+	// Templates are the image's newest templates, one for each size.
+	Templates []Template `json:"templates,omitempty"`
+}
+
+// Template is an image booted once and saved, which new VMs of its size
+// start from instead of booting.
+type Template struct {
+	SnapshotID string    `json:"snapshot_id"`
+	VCPUs      int       `json:"vcpus"`
+	MemoryMiB  int       `json:"memory_mib"`
+	CreatedAt  time.Time `json:"created_at"`
+	// Problem says why new VMs can't start from it, so they boot instead.
+	// It's empty when they can.
+	Problem string `json:"problem,omitempty"`
+}
+
+// WarmRequest asks for a template of an image. Zero values mean tined's
+// default VM size.
+type WarmRequest struct {
+	VCPUs     int `json:"vcpus,omitempty"`
+	MemoryMiB int `json:"memory_mib,omitempty"`
 }
 
 // ListImagesResponse is GET /v1/images's answer.

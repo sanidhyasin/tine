@@ -27,6 +27,8 @@ type backend struct {
 	vms     []state.VM
 	lastReq vm.CreateRequest
 	lastRun agentproto.ExecRequest
+	// nextSource, if "template", makes Create look like a restore.
+	nextSource string
 }
 
 func (b *backend) Create(_ context.Context, req vm.CreateRequest) (state.VM, error) {
@@ -39,6 +41,10 @@ func (b *backend) Create(_ context.Context, req vm.CreateRequest) (state.VM, err
 		Timings: map[string]float64{"allocate": 0.3, "network": 5.1, "jail": 0.9, "start": 0.1, "configure": 21.1, "agent": 1819.6, "total": 1847.3},
 	}
 	v.ID = strings.NewReplacer("0", "a", "1", "b", "2", "c", "3", "d").Replace(v.ID) // IDs use base32 letters
+	if b.nextSource == "template" && !req.Cold {
+		v.Source, v.SnapshotID = state.SourceTemplate, "snap-tmplaaaaaa"
+		v.Timings = map[string]float64{"allocate": 0.3, "network": 5.1, "jail": 0.9, "start": 0.1, "restore": 15.2, "agent": 9.2, "sync": 21.0, "total": 52.1}
+	}
 	b.vms = append(b.vms, v)
 	return v, nil
 }
@@ -128,6 +134,30 @@ func (b *backend) Images(context.Context) ([]*image.Image, error) {
 
 func (b *backend) Ping(context.Context) error { return nil }
 
+func (*backend) Templates(context.Context) ([]vm.Template, error) {
+	return []vm.Template{
+		{Snapshot: state.Snapshot{ID: "snap-tmplaaaaaa", Kind: state.SnapshotKindTemplate, Image: "base", VCPUs: 2, MemoryMiB: 1024, CreatedAt: time.Now().Add(-time.Hour)}},
+		{Snapshot: state.Snapshot{ID: "snap-tmplbbbbbb", Kind: state.SnapshotKindTemplate, Image: "base", VCPUs: 4, MemoryMiB: 4096, CreatedAt: time.Now()}, Problem: "image base was imported again since"},
+	}, nil
+}
+
+func (*backend) WarmTemplate(_ context.Context, image string, vcpus, memoryMiB int) (state.Snapshot, error) {
+	if image != "base" {
+		return state.Snapshot{}, fmt.Errorf("%w: %s", vm.ErrImageNotFound, image)
+	}
+	if vcpus == 0 {
+		vcpus = 2
+	}
+	if memoryMiB == 0 {
+		memoryMiB = 1024
+	}
+	return state.Snapshot{
+		ID: "snap-tmplcccccc", Kind: state.SnapshotKindTemplate, State: state.SnapshotReady, VMID: "vm-warmwarmwa", Image: image,
+		VCPUs: vcpus, MemoryMiB: memoryMiB, SizeBytes: int64(memoryMiB) << 20, CreatedAt: time.Now(),
+		Metadata: json.RawMessage(`{"timings_ms":{"paused":250,"total":260}}`),
+	}, nil
+}
+
 func (b *backend) Snapshot(_ context.Context, id string) (state.Snapshot, error) {
 	v, err := b.Get(context.Background(), id)
 	if err != nil {
@@ -191,7 +221,7 @@ func TestCreate(t *testing.T) {
 	if b.lastReq.VCPUs != 4 || b.lastReq.MemoryMiB != 2048 || b.lastReq.TTL != 30*time.Minute {
 		t.Errorf("tined got %+v", b.lastReq)
 	}
-	want := "vm-aaaaaaaaab  running  (created in 1.85s: allocate 0.3ms · network 5.1ms · jail 0.9ms · start 0.1ms · configure 21ms · boot 1.82s)\n"
+	want := "vm-aaaaaaaaab  running  (booted in 1.85s: allocate 0.3ms · network 5.1ms · jail 0.9ms · start 0.1ms · configure 21ms · boot 1.82s)\n"
 	if r.stdout != want {
 		t.Errorf("output:\n got %q\nwant %q", r.stdout, want)
 	}
@@ -355,10 +385,37 @@ func TestSnapshot(t *testing.T) {
 	}
 }
 
+func TestCreateFromATemplate(t *testing.T) {
+	sock, b := startTined(t)
+	b.nextSource = "template"
+	r := tine(t, sock, "", "create")
+	want := "vm-aaaaaaaaab  running  (restored from template snap-tmplaaaaaa in 52ms: allocate 0.3ms · network 5.1ms · jail 0.9ms · start 0.1ms · restore 15ms · agent 9.2ms · sync 21ms)\n"
+	if r.stdout != want {
+		t.Errorf("output:\n got %q\nwant %q", r.stdout, want)
+	}
+	if r := tine(t, sock, "", "create", "--cold"); r.code != 0 || !b.lastReq.Cold {
+		t.Errorf("create --cold: exit %d, request %+v", r.code, b.lastReq)
+	}
+}
+
+func TestImageWarm(t *testing.T) {
+	sock, _ := startTined(t)
+	r := tine(t, sock, "", "image", "warm", "--vcpus", "4", "--memory", "4G")
+	if r.code != 0 || r.stdout != "snap-tmplcccccc  template of base, 4 vCPUs, 4 GiB  (4 GiB, paused 250ms)\n" {
+		t.Errorf("image warm = %d %q %q", r.code, r.stdout, r.stderr)
+	}
+	if r := tine(t, sock, "", "image", "warm", "nope"); r.code != 1 || !strings.Contains(r.stderr, "nope") {
+		t.Errorf("warm of a missing image = %d %q", r.code, r.stderr)
+	}
+}
+
 func TestImagesAndVersion(t *testing.T) {
 	sock, _ := startTined(t)
-	if r := tine(t, sock, "", "images"); !strings.Contains(r.stdout, "base  vmlinux-6.18.56  4 GiB  a5f7186  2h ago") {
-		t.Errorf("images:\n%s", r.stdout)
+	for _, args := range [][]string{{"images"}, {"image", "ls"}} {
+		if r := tine(t, sock, "", args...); !strings.Contains(r.stdout, "base  vmlinux-6.18.56  4 GiB  a5f7186  2h ago") ||
+			!strings.Contains(r.stdout, "  2 vCPUs 1 GiB, 4 vCPUs 4 GiB (unusable)\n") {
+			t.Errorf("%v:\n%s", args, r.stdout)
+		}
 	}
 	r := tine(t, sock, "", "version")
 	if !strings.HasPrefix(r.stdout, "tine dev ") || !strings.Contains(r.stdout, "tined v-tined (up 0s, 0 VMs)") {
@@ -394,6 +451,11 @@ func TestFormatting(t *testing.T) {
 	for d, want := range map[time.Duration]string{30 * time.Second: "30s", 12 * time.Minute: "12m", 3 * time.Hour: "3h", 72 * time.Hour: "3d", -time.Second: "0s"} {
 		if got := humanDuration(d); got != want {
 			t.Errorf("humanDuration(%v) = %q, want %q", d, got, want)
+		}
+	}
+	for n, want := range map[int64]string{300 << 20: "300 MiB", 4 << 30: "4 GiB", 1390083686: "1.3 GiB"} {
+		if got := formatBytes(n); got != want {
+			t.Errorf("formatBytes(%d) = %q, want %q", n, got, want)
 		}
 	}
 	for mib, want := range map[int]string{512: "512 MiB", 1024: "1 GiB", 1536: "1.5 GiB"} {

@@ -90,10 +90,10 @@ deploy: build ## Build, copy to the dev server, install the binaries and the tin
 		&& echo "tined is $$(systemctl is-active tined): $$(tined version)"'
 
 .PHONY: base-image
-base-image: deploy ## Build the "base" image on the dev server, with this tree's tine-agent (server must be up)
-	./scripts/dev-server.sh ssh 'cd ~/tine/artifacts && sudo tined image import base --force \
+base-image: deploy ## Build the "base" image on the dev server with this tree's tine-agent, and warm its template (server must be up)
+	./scripts/dev-server.sh ssh 'set -e; cd ~/tine/artifacts && sudo tined image import base --force \
 		--kernel "$$(ls vmlinux-* | sort -V | tail -1)" --rootfs "$$(ls ubuntu-*.squashfs | sort -V | tail -1)" \
-		&& sudo tined image ls'
+		&& tine image warm base && tine images'
 
 .PHONY: clean
 clean: ## Remove build output

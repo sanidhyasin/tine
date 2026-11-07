@@ -81,6 +81,13 @@ func (c *Client) GetVM(ctx context.Context, id string) (VM, error) {
 	return v, c.do(ctx, http.MethodGet, "/v1/vms/"+url.PathEscape(id), nil, http.StatusOK, &v)
 }
 
+// WarmTemplate boots image and saves it as the template that new VMs of
+// its size start from.
+func (c *Client) WarmTemplate(ctx context.Context, image string, req WarmRequest) (Snapshot, error) {
+	var snap Snapshot
+	return snap, c.do(ctx, http.MethodPost, "/v1/images/"+url.PathEscape(image)+"/warm", req, http.StatusCreated, &snap)
+}
+
 // CreateSnapshot snapshots a running VM.
 func (c *Client) CreateSnapshot(ctx context.Context, vmID string) (Snapshot, error) {
 	var snap Snapshot

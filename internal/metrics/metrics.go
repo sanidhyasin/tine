@@ -59,7 +59,7 @@ func New(version string) *Metrics {
 	m := &Metrics{
 		registry: reg,
 		createStage: f.histogramVec("vm_create_stage_seconds",
-			"How long each stage of creating a VM took, by how it started: cold (booted) or snapshot (restored).",
+			"How long each stage of creating a VM took, by how it started: cold (booted), template or snapshot (restored).",
 			operationBuckets, "source", "stage"),
 		creates:        f.counterVec("vm_creates_total", "VM creates, by result (ok or failed).", "result"),
 		createFailures: f.counterVec("vm_create_failures_total", "Failed VM creates, by the stage that failed.", "stage"),
@@ -122,7 +122,7 @@ func (m *Metrics) WatchVMStates(states []string, count func() (map[string]int, e
 }
 
 // CreateSucceeded records a create and its stage timings, in milliseconds.
-// source is how the VM started: "cold" (booted) or "snapshot" (restored).
+// source is how the VM started: "cold" (booted), "template" or "snapshot" (restored).
 func (m *Metrics) CreateSucceeded(source string, timingsMs map[string]float64) {
 	if m == nil {
 		return

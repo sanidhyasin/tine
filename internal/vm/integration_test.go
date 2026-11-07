@@ -296,6 +296,35 @@ func TestRealRestore(t *testing.T) {
 	requireClean(t, m, "after destroying them all")
 }
 
+// TestRealTemplate warms a real template, and creates VMs from it and cold.
+func TestRealTemplate(t *testing.T) {
+	m := realManager(t, nil)
+	ctx := context.Background()
+	start := time.Now()
+	tmpl, err := m.WarmTemplate(ctx, "base", 0, 0)
+	if err != nil {
+		t.Fatalf("WarmTemplate: %v", err)
+	}
+	t.Logf("template %s warmed in %v", tmpl.ID, time.Since(start).Round(time.Millisecond))
+	for _, req := range []CreateRequest{{}, {}, {Cold: true}} {
+		vm, err := m.Create(ctx, req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Logf("%-8s %s", vm.Source, formatTimings(vm.Timings))
+		if want := map[bool]state.Source{false: state.SourceTemplate, true: state.SourceCold}[req.Cold]; vm.Source != want {
+			t.Errorf("source = %s, want %s", vm.Source, want)
+		}
+		if got := strings.TrimSpace(execOut(t, m, vm.ID, "hostname")); got != vm.ID {
+			t.Errorf("hostname = %q", got)
+		}
+		if _, err := m.Destroy(ctx, vm.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	requireClean(t, m, "after the test")
+}
+
 // TestRealRestoreClock compares a restore with and without Firecracker's
 // clock_realtime, 3 seconds after the snapshot: how far behind the guest's
 // clock is before tined sets it, and whether its uptime (monotonic clock)

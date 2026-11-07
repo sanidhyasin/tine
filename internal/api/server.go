@@ -37,6 +37,8 @@ type Backend interface {
 	Exec(ctx context.Context, id string, req agentproto.ExecRequest, onOutput func(stream string, data []byte)) (agentproto.ExitStatus, error)
 	Snapshot(ctx context.Context, id string) (state.Snapshot, error)
 	Images(ctx context.Context) ([]*image.Image, error)
+	Templates(ctx context.Context) ([]vm.Template, error)
+	WarmTemplate(ctx context.Context, image string, vcpus, memoryMiB int) (state.Snapshot, error)
 	Ping(ctx context.Context) error
 }
 
@@ -75,6 +77,7 @@ func NewServer(backend Backend, version string, log *slog.Logger, opts ...Option
 	// Methods are checked in the handlers, so wrong ones get a JSON error too.
 	s.mux.HandleFunc("/healthz", s.health)
 	s.mux.HandleFunc("/v1/images", s.images)
+	s.mux.HandleFunc("/v1/images/{name}/warm", s.warm)
 	s.mux.HandleFunc("/v1/vms", s.vms)
 	s.mux.HandleFunc("/v1/vms/{id}", s.oneVM)
 	s.mux.HandleFunc("/v1/vms/{id}/exec", s.exec)
@@ -162,14 +165,42 @@ func (s *Server) images(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
+	templates, err := s.backend.Templates(r.Context())
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	byImage := map[string][]Template{}
+	for _, t := range templates {
+		byImage[t.Snapshot.Image] = append(byImage[t.Snapshot.Image], Template{
+			SnapshotID: t.Snapshot.ID, VCPUs: t.Snapshot.VCPUs, MemoryMiB: t.Snapshot.MemoryMiB,
+			CreatedAt: t.Snapshot.CreatedAt, Problem: t.Problem,
+		})
+	}
 	out := ListImagesResponse{Images: []Image{}}
 	for _, img := range imgs {
 		out.Images = append(out.Images, Image{
 			Name: img.Name, CreatedAt: img.Meta.CreatedAt, Kernel: img.Meta.Kernel.Source,
-			DiskBytes: img.Meta.Rootfs.SizeBytes, AgentVersion: img.Meta.Agent.Version,
+			DiskBytes: img.Meta.Rootfs.SizeBytes, AgentVersion: img.Meta.Agent.Version, Templates: byImage[img.Name],
 		})
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) warm(w http.ResponseWriter, r *http.Request) {
+	if !allow(w, r, http.MethodPost) {
+		return
+	}
+	var req WarmRequest
+	if !decode(w, r, maxJSONBytes, &req) {
+		return
+	}
+	snap, err := s.backend.WarmTemplate(r.Context(), r.PathValue("name"), req.VCPUs, req.MemoryMiB)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, toAPISnapshot(snap, nil))
 }
 
 func (s *Server) vms(w http.ResponseWriter, r *http.Request) {
@@ -195,7 +226,7 @@ func (s *Server) vms(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		created, err := s.backend.Create(r.Context(), vm.CreateRequest{
-			Image: req.Image, VCPUs: req.VCPUs, MemoryMiB: req.MemoryMiB, TTL: time.Duration(req.TTLSeconds) * time.Second,
+			Image: req.Image, VCPUs: req.VCPUs, MemoryMiB: req.MemoryMiB, TTL: time.Duration(req.TTLSeconds) * time.Second, Cold: req.Cold,
 		})
 		if err != nil {
 			s.fail(w, r, err)
@@ -306,7 +337,7 @@ func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
 func toAPI(v state.VM) VM {
 	out := VM{
 		ID: v.ID, State: string(v.State), Image: v.Image, VCPUs: v.VCPUs, MemoryMiB: v.MemoryMiB,
-		CreatedAt: v.CreatedAt, Error: v.Error, SnapshotID: v.SnapshotID, TimingsMs: v.Timings,
+		CreatedAt: v.CreatedAt, Error: v.Error, Source: string(v.Source), SnapshotID: v.SnapshotID, TimingsMs: v.Timings,
 	}
 	if !v.ExpiresAt.IsZero() {
 		t := v.ExpiresAt

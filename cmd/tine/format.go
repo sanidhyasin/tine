@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/sanidhyasin/tine/internal/api"
 )
 
 // printJSON writes v as indented JSON.
@@ -23,21 +25,38 @@ var timingLabels = []struct{ key, label string }{
 	{"jail", "jail"},
 	{"start", "start"},
 	{"configure", "configure"},
-	{"agent", "boot"},
+	{"restore", "restore"},
+	{"agent", "agent"},
+	{"sync", "sync"},
 }
 
-// describeTimings is e.g. "network 5ms · jail 0.9ms · boot 1.82s".
-func describeTimings(t map[string]float64) string {
+// describeTimings is e.g. "network 5ms · jail 0.9ms · boot 1.82s". After a
+// cold start, waiting for the agent is the guest booting, so it's "boot".
+func describeTimings(t map[string]float64, source string) string {
 	var parts []string
 	for _, l := range timingLabels {
+		label := l.label
+		if l.key == "agent" && source != "template" && source != "snapshot" {
+			label = "boot"
+		}
 		if v, ok := t[l.key]; ok {
-			parts = append(parts, l.label+" "+formatMillis(v))
+			parts = append(parts, label+" "+formatMillis(v))
 		}
 	}
 	return strings.Join(parts, " · ")
 }
 
-// formatMillis shows a duration given in milliseconds, at a readable precision.
+// describeStart is how a VM started, e.g. "booted" or "restored from template snap-x".
+func describeStart(v api.VM) string {
+	switch v.Source {
+	case "template":
+		return "restored from template " + v.SnapshotID
+	case "snapshot":
+		return "restored from " + v.SnapshotID
+	}
+	return "booted"
+}
+
 func formatMillis(ms float64) string {
 	switch {
 	case ms >= 1000:
@@ -76,9 +95,11 @@ func formatMiB(mib int) string {
 	return strconv.Itoa(mib) + " MiB"
 }
 
+// formatBytes is e.g. "512 MiB", "4 GiB" or "1.3 GiB".
 func formatBytes(n int64) string {
 	if n >= 1<<30 {
-		return strconv.FormatFloat(float64(n)/(1<<30), 'f', -1, 64) + " GiB"
+		s := strconv.FormatFloat(float64(n)/(1<<30), 'f', 1, 64)
+		return strings.TrimSuffix(s, ".0") + " GiB"
 	}
 	return strconv.FormatInt(n>>20, 10) + " MiB"
 }

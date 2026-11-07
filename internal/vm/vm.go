@@ -116,6 +116,13 @@ type Config struct {
 	MaxSnapshotsPerVM int
 	// MinFreeMiB is the disk space a snapshot must leave free.
 	MinFreeMiB int
+	// SettleCommand runs in a template's VM before it's saved, and returns
+	// once the guest has finished booting.
+	SettleCommand []string
+	// WarmImages are the images to keep a template of, at the default size,
+	// so creates restore instead of booting. A missing or out-of-date
+	// template is warmed in the background. Nil keeps none warm.
+	WarmImages []string
 
 	// Metrics, if set, records how operations went. Nil records nothing.
 	Metrics *metrics.Metrics
@@ -148,6 +155,8 @@ func DefaultConfig() Config {
 		DestroyedRetention: 7 * 24 * time.Hour,
 		MaxSnapshotsPerVM:  16,
 		MinFreeMiB:         2048,
+		WarmImages:         []string{"base"},
+		SettleCommand:      []string{"systemctl", "is-system-running", "--wait"},
 	}
 }
 
@@ -193,6 +202,9 @@ func (c Config) withDefaults() Config {
 	if c.Log == nil {
 		c.Log = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
+	if len(c.SettleCommand) == 0 {
+		c.SettleCommand = d.SettleCommand
+	}
 	return c
 }
 
@@ -221,6 +233,10 @@ type Manager struct {
 	locks keyedMutex
 	// flushes are closed when the VM's last snapshot is on disk.
 	flushes map[string]chan struct{}
+	// warming is which images keepWarm is warming now, and warmFailed
+	// when it last failed for each.
+	warming    map[string]bool
+	warmFailed map[string]time.Time
 }
 
 type tracked struct {
@@ -252,6 +268,7 @@ func newManager(cfg Config, store *state.Store, h host) (*Manager, error) {
 	m := &Manager{
 		cfg: cfg, store: store, host: h, log: cfg.Log, slots: slots, snaps: snaps, gate: newGate(),
 		procs: map[string]*tracked{}, ops: map[string]*createOp{}, flushes: map[string]chan struct{}{},
+		warming: map[string]bool{}, warmFailed: map[string]time.Time{},
 	}
 	// Slots held by VMs from before a restart stay theirs.
 	live, err := store.ListVMs(context.Background(), state.ListOptions{})
@@ -303,9 +320,14 @@ type CreateRequest struct {
 	// SnapshotID, if set, restores the VM from that snapshot instead of
 	// booting it. The VM has the snapshot's image and size.
 	SnapshotID string
+	// Cold boots the VM even if there's a template it could restore from.
+	Cold bool
 }
 
 func (m *Manager) normalize(ctx context.Context, req CreateRequest) (CreateRequest, error) {
+	if req.SnapshotID != "" && req.Cold {
+		return req, fmt.Errorf("%w: a VM can't be restored from a snapshot and booted cold", ErrInvalidRequest)
+	}
 	if req.SnapshotID != "" {
 		snap, err := m.store.GetSnapshot(ctx, req.SnapshotID)
 		if err != nil {
@@ -341,10 +363,12 @@ func (m *Manager) normalize(ctx context.Context, req CreateRequest) (CreateReque
 	return req, nil
 }
 
-// Create starts a VM, by booting it or restoring it from a snapshot, waits
-// until its agent answers, and syncs the guest (clock, entropy, hostname,
-// machine ID). On failure it undoes everything it did (see the package doc)
-// and returns the error.
+// Create starts a VM, waits until its agent answers, and syncs the guest
+// (clock, entropy, hostname, machine ID). It restores the VM from
+// req.SnapshotID if that's set; otherwise from its image's template, if
+// there's one it can use and req.Cold isn't set; otherwise it boots it. On
+// failure it undoes everything it did (see the package doc) and returns the
+// error.
 func (m *Manager) Create(ctx context.Context, req CreateRequest) (state.VM, error) {
 	t := newTimer()
 	req, err := m.normalize(ctx, req)
@@ -354,9 +378,19 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (state.VM, erro
 	if _, err := image.Open(m.cfg.ImagesDir, req.Image); err != nil {
 		return state.VM{}, fmt.Errorf("%w: %s: %w", ErrImageNotFound, req.Image, err)
 	}
-	if req.SnapshotID != "" {
+	source, coldBecause := state.SourceCold, ""
+	switch {
+	case req.SnapshotID != "":
 		if err := m.checkRestorable(ctx, req.SnapshotID); err != nil {
 			return state.VM{}, err
+		}
+		source = state.SourceSnapshot
+	case !req.Cold:
+		var id string
+		if id, coldBecause = m.pickTemplate(ctx, req); id != "" {
+			req.SnapshotID, source = id, state.SourceTemplate
+		} else if coldBecause != "" {
+			m.log.WarnContext(ctx, "booting instead of restoring", "image", req.Image, "because", coldBecause)
 		}
 	}
 	live, err := m.store.ListVMs(ctx, state.ListOptions{})
@@ -372,13 +406,25 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (state.VM, erro
 	}
 	// With a SnapshotID, this also claims the snapshot: it can't be deleted
 	// from now on, while the VM lives.
-	vm, err := m.store.CreateVM(ctx, state.VM{
+	record := state.VM{
 		ID: newID(), Image: req.Image, VCPUs: req.VCPUs, MemoryMiB: req.MemoryMiB,
-		Slot: slot, UID: m.cfg.UIDBase + slot, ExpiresAt: time.Now().Add(req.TTL), SnapshotID: req.SnapshotID,
-	})
+		Slot: slot, UID: m.cfg.UIDBase + slot, ExpiresAt: time.Now().Add(req.TTL),
+		SnapshotID: req.SnapshotID, Source: source,
+	}
+	vm, err := m.store.CreateVM(ctx, record)
+	if errors.Is(err, state.ErrNotFound) && source == state.SourceTemplate {
+		// A newer template replaced this one, which was deleted between
+		// choosing it and claiming it. Booting is always possible.
+		coldBecause = "its template was deleted just as it was chosen"
+		record.SnapshotID, record.Source = "", state.SourceCold
+		vm, err = m.store.CreateVM(ctx, record)
+	}
 	if err != nil {
 		m.slots.Release(slot)
 		return state.VM{}, err
+	}
+	if coldBecause != "" {
+		_ = m.store.Note(ctx, vm.ID, "booted, not restored: "+coldBecause)
 	}
 	ctx = logging.WithVM(ctx, vm.ID)
 	log := m.log.With("vm", vm.ID)
@@ -485,8 +531,8 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (state.VM, erro
 	if err != nil {
 		return fail("record", err)
 	}
-	log.InfoContext(ctx, "created", "from", createSource(vm), "timings_ms", vm.Timings)
-	m.cfg.Metrics.CreateSucceeded(createSource(vm), vm.Timings)
+	log.InfoContext(ctx, "created", "from", vm.Source, "snapshot", vm.SnapshotID, "timings_ms", vm.Timings)
+	m.cfg.Metrics.CreateSucceeded(string(vm.Source), vm.Timings)
 	return vm, nil
 }
 
