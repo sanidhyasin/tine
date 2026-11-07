@@ -95,7 +95,8 @@ func TestReconcileRemovesOrphans(t *testing.T) {
 	r := m.Reconcile(context.Background())
 
 	calls := strings.Join(h.takeCalls(), ",")
-	if calls != "inventory,removeOrphan:vm-orphan000,removeVeth:tine99,removeVeth:tineweird" {
+	// The live VM's jail only has its snapshot directory cleared.
+	if calls != "prepareSnapshot,inventory,removeOrphan:vm-orphan000,removeVeth:tine99,removeVeth:tineweird" {
 		t.Errorf("host calls = %s; want only the orphans removed", calls)
 	}
 	if strings.Join(r.Orphans, ",") != "vm-orphan000,veth tine99,veth tineweird" {

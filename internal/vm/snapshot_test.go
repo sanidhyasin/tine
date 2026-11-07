@@ -377,3 +377,33 @@ func TestGarbageCollection(t *testing.T) {
 		t.Errorf("collected %d, want the template of the removed image", n)
 	}
 }
+
+// A restart can find a VM's Firecracker still busy writing a snapshot the
+// old tined asked for. Reconcile doesn't wait for it, but resumes the VM in
+// the background once it answers, and commands for the VM wait till then.
+func TestReconcileResumesABusyVMInTheBackground(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, nil)
+	vm := f.running(t)
+	m, h := restart(t, f)
+	h.agentClient = startAgent(t)
+	h.mu.Lock()
+	h.isPaused[vm.ID] = true
+	h.busyUntil = time.Now().Add(4 * time.Second) // longer than reconcile's quick check
+	h.mu.Unlock()
+
+	start := time.Now()
+	r := m.Reconcile(ctx)
+	if took := time.Since(start); took > 3500*time.Millisecond || len(r.Errors) > 0 || strings.Join(r.Resumed, ",") != vm.ID {
+		t.Fatalf("Reconcile took %v: %s", took, r)
+	}
+	if _, err := m.Exec(ctx, vm.ID, agentproto.ExecRequest{Args: []string{"true"}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if h.anyPaused() {
+		t.Error("the exec ran before the VM was resumed")
+	}
+	if took := time.Since(start); took < 4*time.Second {
+		t.Errorf("the exec finished %v after the restart, before Firecracker answered", took)
+	}
+}

@@ -47,6 +47,8 @@ type fakeHost struct {
 	// thisHost, if set, is what hostInfo reports instead of fakeSnapshotHost.
 	thisHost *snapshot.Host
 	lastSync agentproto.SyncRequest
+	// busyUntil makes paused wait until then, like a Firecracker busy writing a snapshot.
+	busyUntil time.Time
 }
 
 type hold struct {
@@ -94,7 +96,18 @@ func (f *fakeHost) resume(_ context.Context, j *jailer.Jail) error {
 	delete(f.isPaused, j.ID)
 	return nil
 }
-func (f *fakeHost) paused(_ context.Context, j *jailer.Jail) (bool, error) {
+func (f *fakeHost) paused(ctx context.Context, j *jailer.Jail) (bool, error) {
+	f.mu.Lock()
+	busyUntil := f.busyUntil
+	f.mu.Unlock()
+	// A Firecracker still writing a snapshot doesn't answer until it's done.
+	if wait := time.Until(busyUntil); wait > 0 {
+		select {
+		case <-time.After(wait):
+		case <-ctx.Done():
+			return false, ctx.Err()
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.isPaused[j.ID], nil

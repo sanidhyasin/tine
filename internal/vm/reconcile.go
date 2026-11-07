@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sanidhyasin/tine/internal/jailer"
 	"github.com/sanidhyasin/tine/internal/netns"
 	"github.com/sanidhyasin/tine/internal/state"
 )
@@ -106,15 +107,11 @@ func (m *Manager) Reconcile(ctx context.Context) (r Report) {
 				continue
 			}
 			if alive {
-				// tined may have stopped in the middle of a snapshot, with the VM paused.
-				if paused, err := m.host.paused(ctx, j); err != nil {
-					errorf("%s: check whether it's paused: %v", vm.ID, err)
-				} else if paused {
-					if err := m.host.resume(ctx, j); err != nil {
-						errorf("%s: resume: %v", vm.ID, err)
-					} else {
-						r.Resumed = append(r.Resumed, vm.ID)
-					}
+				switch resumed, err := m.recoverFromSnapshot(ctx, vm.ID, j); {
+				case err != nil:
+					errorf("%s: %v", vm.ID, err)
+				case resumed:
+					r.Resumed = append(r.Resumed, vm.ID)
 				}
 				r.Kept = append(r.Kept, vm.ID)
 				continue
@@ -169,6 +166,60 @@ func (m *Manager) Reconcile(ctx context.Context) (r Report) {
 		}
 	}
 	return r
+}
+
+// recoverFromSnapshot undoes what a snapshot cut off by a restart left: a
+// paused VM, and the snapshot's files in its jail, as big as its memory.
+//
+// The old tined's Firecracker may still be writing that snapshot, which
+// can take a while for a big VM, and its API doesn't answer until it's
+// done. Then the VM is resumed in the background, as soon as it answers;
+// until then, commands for it wait, as they would for a snapshot.
+func (m *Manager) recoverFromSnapshot(ctx context.Context, id string, j *jailer.Jail) (resumed bool, err error) {
+	quick, cancel := context.WithTimeout(ctx, 3*time.Second)
+	paused, err := m.host.paused(quick, j)
+	cancel()
+	if err == nil {
+		if paused {
+			if err := m.host.resume(ctx, j); err != nil {
+				return false, fmt.Errorf("resume: %w", err)
+			}
+		}
+		if err := m.host.prepareSnapshot(j); err != nil {
+			return paused, fmt.Errorf("clear the jail's snapshot directory: %w", err)
+		}
+		return paused, nil
+	}
+	leave, gateErr := m.gate.enterExclusive(id, "recovery")
+	if gateErr != nil {
+		return false, fmt.Errorf("check whether it's paused: %w", err)
+	}
+	m.log.Warn("the VM's Firecracker isn't answering, perhaps still writing a snapshot; resuming the VM once it does", "vm", id, "err", err)
+	go func() {
+		defer leave()
+		deadline := time.Now().Add(snapshotTimeout)
+		for {
+			attempt, cancel := context.WithTimeout(ctx, 30*time.Second)
+			paused, err := m.host.paused(attempt, j)
+			cancel()
+			if err == nil {
+				if paused {
+					if err := m.host.resume(ctx, j); err != nil {
+						m.log.Error("couldn't resume a VM after a restart", "vm", id, "err", err)
+						return
+					}
+				}
+				_ = m.host.prepareSnapshot(j)
+				m.log.Info("resumed a VM that a restart left paused", "vm", id, "was_paused", paused)
+				return
+			}
+			if ctx.Err() != nil || time.Now().After(deadline) {
+				m.log.Error("gave up resuming a VM after a restart; destroy it", "vm", id, "err", err)
+				return
+			}
+		}
+	}()
+	return true, nil
 }
 
 // reconcileSnapshots removes snapshots that were being taken, finishes

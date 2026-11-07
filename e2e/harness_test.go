@@ -19,9 +19,14 @@ import (
 
 // Where tined keeps things on the dev server (its defaults).
 const (
-	jailsDir   = "/srv/tine/jail/firecracker"
-	cgroupsDir = "/sys/fs/cgroup/tine"
+	jailsDir     = "/srv/tine/jail/firecracker"
+	cgroupsDir   = "/sys/fs/cgroup/tine"
+	snapshotsDir = "/srv/tine/snapshots"
 )
+
+// gcWait is how long the end of the suite gives tined's reaper (every 15s)
+// to delete the snapshots of destroyed VMs.
+const gcWait = 45 * time.Second
 
 var tined = api.NewUnixClient(api.DefaultSocket)
 
@@ -32,15 +37,27 @@ func TestMain(m *testing.M) {
 		fmt.Fprintln(os.Stderr, "e2e: needs root (make e2e runs it with sudo)")
 		os.Exit(1)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	if err := waitHealthy(ctx); err != nil {
 		cancel()
 		fmt.Fprintln(os.Stderr, "e2e: tined isn't answering:", err)
 		os.Exit(1)
 	}
+	// tined may be warming a template, which it does after a deploy.
+	if err := waitIdle(ctx); err != nil {
+		cancel()
+		fmt.Fprintln(os.Stderr, "e2e: tined is still busy:", err)
+		os.Exit(1)
+	}
 	if left := leftovers(); len(left) > 0 {
 		cancel()
 		fmt.Fprintln(os.Stderr, "e2e: the host isn't clean before starting:", left)
+		os.Exit(1)
+	}
+	// The snapshot tests restore VMs from base's template.
+	if err := ensureTemplate(ctx); err != nil {
+		cancel()
+		fmt.Fprintln(os.Stderr, "e2e: no usable template of base:", err)
 		os.Exit(1)
 	}
 	// A VM with a one-minute life, created first so its expiry overlaps the
@@ -59,31 +76,47 @@ func TestMain(m *testing.M) {
 		code = checkReaped(ttlVM.ID, ttlStart)
 	}
 	if code == 0 {
-		if left := leftovers(); len(left) > 0 {
+		// The reaper deletes destroyed VMs' snapshots every 15s.
+		left := leftovers()
+		for deadline := time.Now().Add(gcWait); len(left) > 0 && time.Now().Before(deadline); left = leftovers() {
+			time.Sleep(time.Second)
+		}
+		if len(left) > 0 {
 			fmt.Fprintln(os.Stderr, "e2e: LEAK CHECK FAILED, left on the host:", left)
 			code = 1
 		} else {
-			fmt.Println("e2e: leak check passed: no VMs, namespaces, veths, jails, cgroups or Firecracker processes left")
+			fmt.Println("e2e: leak check passed: no VMs, namespaces, veths, jails, cgroups, Firecracker processes or snapshots left, except templates")
 		}
 	}
 	os.Exit(code)
 }
 
-// checkReaped waits until the TTL VM is destroyed by the reaper.
+// checkReaped waits until the TTL VM is destroyed by the reaper, and checks
+// that it was destroyed in time: by its TTL, plus the reaper's interval and
+// a restart or two. The other tests may well outlast that, so it always
+// looks at least once.
 func checkReaped(id string, created time.Time) int {
-	deadline := created.Add(60*time.Second + 45*time.Second) // TTL, plus the reaper's interval and a restart or two
-	for time.Now().Before(deadline) {
+	const allowed = 60*time.Second + 45*time.Second
+	deadline := time.Now().Add(allowed)
+	for {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		vm, err := tined.GetVM(ctx, id)
 		cancel()
-		if err == nil && vm.State == "destroyed" {
-			fmt.Printf("e2e: TTL VM %s was reaped %v after it was created\n", id, time.Since(created).Round(time.Second))
+		if err == nil && vm.State == "destroyed" && vm.DestroyedAt != nil {
+			took := vm.DestroyedAt.Sub(created)
+			if took > allowed {
+				fmt.Fprintf(os.Stderr, "e2e: TTL VM %s was reaped %v after it was created, later than %v\n", id, took.Round(time.Second), allowed)
+				return 1
+			}
+			fmt.Printf("e2e: TTL VM %s was reaped %v after it was created\n", id, took.Round(time.Second))
 			return 0
+		}
+		if time.Now().After(deadline) {
+			fmt.Fprintf(os.Stderr, "e2e: TTL VM %s isn't reaped: %v %v\n", id, vm.State, err)
+			return 1
 		}
 		time.Sleep(time.Second)
 	}
-	fmt.Fprintf(os.Stderr, "e2e: TTL VM %s wasn't reaped within %v\n", id, time.Since(created).Round(time.Second))
-	return 1
 }
 
 // leftovers lists VM resources on the host, and live VMs tined still knows.
@@ -117,7 +150,62 @@ func leftovers() []string {
 			left = append(left, "live VM "+vm.ID+" ("+vm.State+")")
 		}
 	}
+	// Only ready templates may stay, and the store holds exactly the
+	// snapshots tined has records of.
+	snaps, err := tined.ListSnapshots(ctx, api.SnapshotFilter{})
+	if err != nil {
+		return append(left, "can't list snapshots: "+err.Error())
+	}
+	known := map[string]bool{}
+	for _, s := range snaps {
+		known[s.ID] = true
+		if s.Kind != "template" || s.State != "ready" {
+			left = append(left, fmt.Sprintf("%s snapshot %s (%s, of %s)", s.Kind, s.ID, s.State, s.VMID))
+		}
+	}
+	entries, _ := os.ReadDir(snapshotsDir)
+	for _, e := range entries {
+		if !known[e.Name()] {
+			left = append(left, "snapshot files "+filepath.Join(snapshotsDir, e.Name()))
+		}
+	}
 	return left
+}
+
+// ensureTemplate warms a template of base at the default size, unless
+// there's a usable one.
+func ensureTemplate(ctx context.Context) error {
+	imgs, err := tined.Images(ctx)
+	if err != nil {
+		return err
+	}
+	for _, img := range imgs {
+		for _, t := range img.Templates {
+			if img.Name == "base" && t.VCPUs == 2 && t.MemoryMiB == 1024 && t.Problem == "" {
+				return nil
+			}
+		}
+	}
+	snap, err := tined.WarmTemplate(ctx, "base", api.WarmRequest{})
+	if err == nil {
+		fmt.Println("e2e: warmed template", snap.ID)
+	}
+	return err
+}
+
+// waitIdle waits until tined has no live VMs, as when it's warming a template.
+func waitIdle(ctx context.Context) error {
+	for {
+		vms, err := tined.ListVMs(ctx, false)
+		if err == nil && len(vms) == 0 {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("%w: %d VMs still live", ctx.Err(), len(vms))
+		case <-time.After(time.Second):
+		}
+	}
 }
 
 // requireGone fails unless nothing of the VM is left on the host.

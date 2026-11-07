@@ -63,7 +63,7 @@ func TestLifecycle50(t *testing.T) {
 				t0 = time.Now()
 				out, code, err := run(context.Background(), vm.ID, "sh", "-c", fmt.Sprintf("echo %d $(hostname)", i))
 				record(&execs, time.Since(t0))
-				if err != nil || code != 0 || out != fmt.Sprintf("%d tine\n", i) {
+				if err != nil || code != 0 || out != fmt.Sprintf("%d %s\n", i, vm.ID) { // every VM's hostname is its ID
 					t.Errorf("VM %d (%s): exec = %q, exit %d, %v", i, vm.ID, out, code, err)
 				}
 
