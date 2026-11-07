@@ -1,0 +1,5 @@
+{
+  "name": "csvline",
+  "issue": "parse_line() splits on every comma, so quoted fields such as \"Smith, John\" are broken in two. Quotes inside quoted fields are written doubled (\"\").",
+  "module": "csvline.py"
+}

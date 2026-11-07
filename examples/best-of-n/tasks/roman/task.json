@@ -1,0 +1,5 @@
+{
+  "name": "roman",
+  "issue": "to_roman() gives wrong numerals for numbers like 4, 9, 40 and 90: to_roman(4) returns 'IIII' instead of 'IV'. from_roman() should accept what to_roman() produces.",
+  "module": "roman.py"
+}

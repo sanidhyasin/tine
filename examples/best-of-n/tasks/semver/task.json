@@ -1,0 +1,5 @@
+{
+  "name": "semver",
+  "issue": "compare() orders versions wrongly: 1.10.0 should be newer than 1.9.0, and a pre-release like 1.0.0-alpha is older than 1.0.0.",
+  "module": "semver.py"
+}

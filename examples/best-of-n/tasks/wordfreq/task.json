@@ -1,0 +1,5 @@
+{
+  "name": "wordfreq",
+  "issue": "top_words() should count words case-insensitively, ignore punctuation, and break ties alphabetically, but 'The the THE.' counts three different words.",
+  "module": "wordfreq.py"
+}

@@ -1,0 +1,5 @@
+{
+  "name": "businessdays",
+  "issue": "business_days(start, end) should count Monday-to-Friday days from start up to but not including end, but it counts weekends when the range starts on one.",
+  "module": "businessdays.py"
+}

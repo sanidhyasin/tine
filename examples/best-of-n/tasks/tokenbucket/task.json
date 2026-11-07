@@ -1,0 +1,5 @@
+{
+  "name": "tokenbucket",
+  "issue": "TokenBucket refills too fast: after waiting it allows more than `capacity` requests at once, and the refill rate is per second, not per call.",
+  "module": "tokenbucket.py"
+}

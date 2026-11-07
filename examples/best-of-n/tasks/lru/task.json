@@ -1,0 +1,5 @@
+{
+  "name": "lru",
+  "issue": "LRUCache evicts the wrong key: reading a key with get() should make it the most recently used, so it's evicted last, but it doesn't.",
+  "module": "lru.py"
+}

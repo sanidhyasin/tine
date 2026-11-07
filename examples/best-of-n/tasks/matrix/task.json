@@ -1,0 +1,5 @@
+{
+  "name": "matrix",
+  "issue": "rotate(m) should rotate a matrix 90 degrees clockwise, including non-square ones, but it returns the transpose, and fails on a 2x3 matrix.",
+  "module": "matrix.py"
+}

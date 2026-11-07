@@ -1,0 +1,5 @@
+{
+  "name": "bisect",
+  "issue": "insertion_point(xs, x) should return the leftmost index where x could be inserted in the sorted list xs, keeping it sorted. With duplicates it returns an index in the middle of them, and it's wrong at the ends of the list too.",
+  "module": "search.py"
+}
