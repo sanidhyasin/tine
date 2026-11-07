@@ -118,6 +118,14 @@ func (h *hostOS) setup(ctx context.Context) error {
 	if err := h.cfg.jailerConfig().EnsureCgroupParent(); err != nil {
 		return fmt.Errorf("cgroups: %w", err)
 	}
+	// Snapshots stall VMs on a host that throttles dirty page cache early
+	// (scripts/host-setup.sh explains).
+	if data, err := os.ReadFile("/proc/sys/vm/dirty_ratio"); err == nil {
+		if ratio, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil && ratio < 40 {
+			h.cfg.Log.Warn("vm.dirty_ratio is low: snapshots of big VMs will pause them for long, and stall them after; "+
+				"scripts/host-setup.sh sets 60", "dirty_ratio", ratio)
+		}
+	}
 	if err := os.MkdirAll(h.cfg.ChrootBaseDir, 0o700); err != nil {
 		return err
 	}

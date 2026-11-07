@@ -11,6 +11,9 @@
 #   3. Sets up tine's data volume at /srv/tine: XFS with reflinks, mounted at
 #      boot. Set TINE_DATA_DEVICE to the disk to use; it must be empty or
 #      already XFS, and is never reformatted. dev-server.sh setup sets it.
+#   3b. Lets the kernel hold more dirty page cache before it throttles
+#      writers, so snapshots don't stall VMs (vm.dirty_ratio, in
+#      /etc/sysctl.d/90-tine.conf).
 #   4. Downloads Firecracker into artifacts/bin/.
 #   5. Downloads a guest kernel and an Ubuntu image (a squashfs) from
 #      Firecracker's CI, and keeps the squashfs for `tined image import`. Also
@@ -108,6 +111,23 @@ fi
 
 mkdir -p "$ART/bin"
 cd "$ART"
+
+# --- 3b. Kernel settings ----------------------------------------------------
+# A snapshot's memory file is written through the page cache, and its dirty
+# pages count against the VM's cgroup until they're on disk. With the
+# default vm.dirty_ratio of 20%, a snapshot bigger than about a fifth of
+# that cgroup's room is held to the disk's write speed (a 4 GiB VM paused for
+# 22s on the dev server, against under 1s at 60%), and so is the VM's own
+# disk I/O until the snapshot is written out, which stalled a fork's parent
+# for seconds. Background writeback still starts at dirty_background_ratio.
+say "Kernel settings for snapshots"
+sysctl_conf=/etc/sysctl.d/90-tine.conf
+if ! grep -qs '^vm.dirty_ratio = 60$' "$sysctl_conf"; then
+  printf '%s\n' "# tine: write snapshots of VMs' memory without throttling them (scripts/host-setup.sh says why)." \
+    "vm.dirty_ratio = 60" | sudo tee "$sysctl_conf" >/dev/null
+fi
+sudo sysctl -q -p "$sysctl_conf"
+echo "vm.dirty_ratio = $(cat /proc/sys/vm/dirty_ratio), vm.dirty_background_ratio = $(cat /proc/sys/vm/dirty_background_ratio)"
 
 # --- 4. Firecracker ---------------------------------------------------------
 say "Firecracker $FC_VERSION"
