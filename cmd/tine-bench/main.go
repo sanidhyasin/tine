@@ -58,6 +58,7 @@ func main() {
 		forkMemory     = flag.Int("fork-memory", 256, "the fork parent's memory, in MiB")
 		snapMemory     = flag.String("snapshot-memory", "256,1024,4096", "VM sizes to snapshot, in MiB")
 		dirty          = flag.String("dirty", "0,64,256", "MiB the parent changes before fork-dirty")
+		dirtyMemory    = flag.Int("dirty-memory", 1024, "fork-dirty's parent's memory, in MiB: room for the most --dirty, and its guest")
 		touch          = flag.Int("touch", 128, "MiB the parent fills before fork-touch, which each child then writes")
 		benchImage     = flag.String("image", "bench", "image with tine-touch and tine-dirty, for fork-touch and fork-dirty")
 		drop           = flag.Bool("drop-caches", false, "empty the page cache before each create or fork, as after a reboot")
@@ -154,7 +155,7 @@ func main() {
 		case "fork-dirty":
 			for _, st := range strings.Split(*strategies, ",") {
 				for _, d := range ints(*dirty) {
-					b.fork(ctx, forkOptions{Children: 1, VCPUs: 1, MemoryMiB: *forkMemory, Strategy: st, DirtyMiB: d, Dirty: true, Image: *benchImage}, *forkRuns)
+					b.fork(ctx, forkOptions{Children: 1, VCPUs: 1, MemoryMiB: *dirtyMemory, Strategy: st, DirtyMiB: d, Dirty: true, Image: *benchImage}, *forkRuns)
 				}
 			}
 		case "density":
