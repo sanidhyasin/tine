@@ -106,6 +106,20 @@ bench-all: bench-image ## Every benchmark of step 4 on the dev server, fetched a
 		./scripts/dev-server.sh ssh 'cat /tmp/tine-bench.jsonl' > "$$dir/results.jsonl"; \
 		echo "results in $$dir"; uv run bench/analyze.py "$$dir"
 
+# The python image, and the best-of-N demo, run from here against the dev
+# server through an SSH config of its own (the API key stays on this machine).
+DEMO_ARGS ?=
+
+.PHONY: python-image
+python-image: deploy ## Build the "python" image from images/python/Dockerfile on the dev server (server must be up)
+	./scripts/dev-server.sh ssh 'set -e; cd ~/tine && sudo tined image build python --force -f images/python/Dockerfile \
+		--kernel "$$(ls artifacts/vmlinux-* | sort -V | tail -1)" && tine images'
+
+.PHONY: demo
+demo: ## Run the best-of-N demo against the dev server (server up, python image built; DEMO_ARGS= for run.py)
+	@./scripts/dev-server.sh ssh-config > .tine-ssh-config
+	cd examples/best-of-n && TINE_SSH="ssh -F $(CURDIR)/.tine-ssh-config" uv run run.py --host ssh://tine-dev $(DEMO_ARGS)
+
 .PHONY: deploy
 deploy: build ## Build, copy to the dev server, install the binaries and the tined service, (re)start it
 	./scripts/dev-server.sh sync

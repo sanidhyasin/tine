@@ -14,3 +14,6 @@ guest_key
 guest_key.pub
 
 .DS_Store
+
+# make demo writes the dev server SSH config here.
+.tine-ssh-config
