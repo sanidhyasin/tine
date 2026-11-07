@@ -61,6 +61,8 @@ its own cgroup, outside tined's.`,
 	f.IntVar(&opts.vm.DefaultVCPUs, "default-vcpus", opts.vm.DefaultVCPUs, "vCPUs when a request doesn't say")
 	f.IntVar(&opts.vm.DefaultMemoryMiB, "default-memory-mib", opts.vm.DefaultMemoryMiB, "memory when a request doesn't say")
 	f.DurationVar(&opts.vm.DefaultTTL, "default-ttl", opts.vm.DefaultTTL, "how long VMs live when a request doesn't say")
+	f.DurationVar(&opts.vm.ReaperInterval, "reaper-interval", opts.vm.ReaperInterval, "how often to destroy VMs whose time is up")
+	f.DurationVar(&opts.vm.DestroyedRetention, "keep-destroyed", opts.vm.DestroyedRetention, "how long to keep records of destroyed VMs")
 	return cmd
 }
 
@@ -89,6 +91,13 @@ func serve(ctx context.Context, opts serveOptions) error {
 	if err := manager.Setup(ctx); err != nil {
 		return fmt.Errorf("set up the host: %w", err)
 	}
+	// Before serving: bring the records and the host back in line.
+	report := manager.Reconcile(ctx)
+	log.Info("reconciled", "report", report.String())
+	for _, e := range report.Errors {
+		log.Error("reconcile", "err", e)
+	}
+	go manager.RunReaper(ctx, opts.vm.ReaperInterval)
 
 	ln, err := listenSocket(ctx, opts.socket, opts.socketGroup, log)
 	if err != nil {

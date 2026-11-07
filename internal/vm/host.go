@@ -34,6 +34,17 @@ type host interface {
 	// knowing only its PID.
 	killFirecracker(ctx context.Context, j *jailer.Jail, pid int) error
 	agent(j *jailer.Jail) *agentproto.Client
+
+	// For Reconcile:
+	// inventory lists the VM resources that exist on the host.
+	inventory(ctx context.Context) (inventory, error)
+	// alive reports whether anything runs in the VM's cgroup.
+	alive(ctx context.Context, j *jailer.Jail) (bool, error)
+	// removeOrphan removes everything of a VM known only by its ID: its
+	// processes, jail, cgroup and network namespace.
+	removeOrphan(ctx context.Context, id string) error
+	// removeVeth removes a host veth.
+	removeVeth(name string) error
 }
 
 // process is a running Firecracker.
@@ -205,3 +216,51 @@ func encodeJSON(v any) (json.RawMessage, error) {
 	data, err := json.Marshal(v)
 	return json.RawMessage(data), err
 }
+
+func (h *hostOS) inventory(context.Context) (inventory, error) {
+	seen := map[string]bool{}
+	var inv inventory
+	add := func(ids []string) {
+		for _, id := range ids {
+			if !seen[id] {
+				seen[id] = true
+				inv.ids = append(inv.ids, id)
+			}
+		}
+	}
+	nets, veths, err := netns.List()
+	if err != nil {
+		return inv, fmt.Errorf("network namespaces: %w", err)
+	}
+	add(nets)
+	inv.veths = veths
+	jails, err := h.cfg.jailerConfig().ListIDs()
+	if err != nil {
+		return inv, fmt.Errorf("jails: %w", err)
+	}
+	add(jails)
+	cgroups, err := h.cfg.jailerConfig().CgroupIDs()
+	if err != nil {
+		return inv, fmt.Errorf("cgroups: %w", err)
+	}
+	add(cgroups)
+	return inv, nil
+}
+
+func (h *hostOS) alive(_ context.Context, j *jailer.Jail) (bool, error) { return j.HasProcesses() }
+
+func (h *hostOS) removeOrphan(ctx context.Context, id string) error {
+	j, err := jailer.Existing(h.cfg.jailerConfig(), id)
+	if err != nil {
+		return err
+	}
+	if err := h.killFirecracker(ctx, j, 0); err != nil {
+		return err
+	}
+	if err := j.Cleanup(); err != nil {
+		return err
+	}
+	return netns.DestroyNamespace(id)
+}
+
+func (h *hostOS) removeVeth(name string) error { return netns.DeleteVeth(name) }

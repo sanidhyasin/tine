@@ -32,6 +32,9 @@ type fakeHost struct {
 	agentClient  *agentproto.Client
 	nextPID      int
 	lastProc     *fakeProc
+	// For Reconcile: VMs whose Firecracker isn't running, and what the host holds.
+	dead map[string]bool
+	inv  inventory
 }
 
 func newFakeHost() *fakeHost { return &fakeHost{failAt: map[string]error{}, nextPID: 1000} }
@@ -75,6 +78,23 @@ func (f *fakeHost) killFirecracker(context.Context, *jailer.Jail, int) error {
 	return f.record("killFirecracker")
 }
 func (f *fakeHost) agent(*jailer.Jail) *agentproto.Client { return f.agentClient }
+func (f *fakeHost) inventory(context.Context) (inventory, error) {
+	if err := f.record("inventory"); err != nil {
+		return inventory{}, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.inv, nil
+}
+func (f *fakeHost) alive(_ context.Context, j *jailer.Jail) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return !f.dead[j.ID], nil
+}
+func (f *fakeHost) removeOrphan(_ context.Context, id string) error {
+	return f.record("removeOrphan:" + id)
+}
+func (f *fakeHost) removeVeth(name string) error { return f.record("removeVeth:" + name) }
 
 func (f *fakeHost) startFirecracker(*jailer.Jail) (process, error) {
 	if err := f.record("startFirecracker"); err != nil {

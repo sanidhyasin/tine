@@ -91,6 +91,10 @@ type Config struct {
 	BootArgs string
 	// AgentTimeout is how long a new VM's agent gets to answer.
 	AgentTimeout time.Duration
+	// ReaperInterval is how often expired VMs are looked for.
+	ReaperInterval time.Duration
+	// DestroyedRetention is how long destroyed VMs' records are kept.
+	DestroyedRetention time.Duration
 
 	Log *slog.Logger
 }
@@ -113,8 +117,10 @@ func DefaultConfig() Config {
 		// rw: mount the disk read-write at boot rather than remounting it later.
 		// i8042.*: skip probing for a PS/2 mouse and keyboard extras that a
 		// Firecracker VM doesn't have.
-		BootArgs:     "console=ttyS0 reboot=k panic=1 rw i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd",
-		AgentTimeout: 60 * time.Second,
+		BootArgs:           "console=ttyS0 reboot=k panic=1 rw i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd",
+		AgentTimeout:       60 * time.Second,
+		ReaperInterval:     15 * time.Second,
+		DestroyedRetention: 7 * 24 * time.Hour,
 	}
 }
 
@@ -147,6 +153,12 @@ func (c Config) withDefaults() Config {
 	}
 	if c.AgentTimeout == 0 {
 		c.AgentTimeout = d.AgentTimeout
+	}
+	if c.ReaperInterval == 0 {
+		c.ReaperInterval = d.ReaperInterval
+	}
+	if c.DestroyedRetention == 0 {
+		c.DestroyedRetention = d.DestroyedRetention
 	}
 	if c.Log == nil {
 		c.Log = slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -405,6 +417,11 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (state.VM, erro
 // already destroyed returns it unchanged. A VM still being created is
 // cancelled first, and undoes itself.
 func (m *Manager) Destroy(ctx context.Context, id string) (state.VM, error) {
+	return m.destroy(ctx, id, "destroy requested")
+}
+
+// destroy is Destroy, recording reason as why it happened.
+func (m *Manager) destroy(ctx context.Context, id, reason string) (state.VM, error) {
 	m.mu.Lock()
 	op := m.ops[id]
 	m.mu.Unlock()
@@ -429,7 +446,7 @@ func (m *Manager) Destroy(ctx context.Context, id string) (state.VM, error) {
 	}
 	start := time.Now()
 	if vm.State != state.StateDestroying { // destroying means an earlier destroy was interrupted: carry on
-		if vm, err = m.store.Transition(ctx, id, state.StateDestroying, "destroy requested"); err != nil {
+		if vm, err = m.store.Transition(ctx, id, state.StateDestroying, reason); err != nil {
 			return vm, err
 		}
 	}
@@ -465,10 +482,12 @@ func (m *Manager) teardown(ctx context.Context, vm state.VM) error {
 		if err := m.stopOwned(vm.ID, tr); err != nil {
 			return err
 		}
-	} else if vm.PID != 0 {
-		// Started by an earlier tined: find and stop it by PID.
+	} else {
+		// Not started by this tined (or not recorded yet: a create can stop
+		// before the PID is saved). Stop whatever runs in the VM's cgroup; if
+		// nothing does, this does nothing.
 		if err := m.host.killFirecracker(ctx, j, vm.PID); err != nil {
-			return fmt.Errorf("stop Firecracker (pid %d): %w", vm.PID, err)
+			return fmt.Errorf("stop Firecracker: %w", err)
 		}
 	}
 	// In order, stopping at the first failure: the jail and its cgroup only
