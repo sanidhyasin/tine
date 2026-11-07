@@ -83,11 +83,18 @@ func (m *Manager) Fork(ctx context.Context, parentID string, req ForkRequest) (F
 		unlock()
 		return ForkResult{}, fmt.Errorf("VM %s is %s: %w", parentID, parent.State, ErrNotRunning)
 	}
-	// Check every child's request before pausing the parent.
+	// Check every child's request, and that the host has room for them,
+	// before pausing the parent.
 	if _, err := m.normalize(ctx, CreateRequest{TTL: req.TTL, VCPUs: parent.VCPUs, MemoryMiB: parent.MemoryMiB}); err != nil {
 		unlock()
 		return ForkResult{}, err
 	}
+	res, err := m.admit(ctx, req.Count, parent.MemoryMiB, m.cfg.RestoreUseMiB)
+	if err != nil {
+		unlock()
+		return ForkResult{}, err
+	}
+	defer res.release()
 	snap, err := m.takeSnapshot(ctx, parent, state.SnapshotKindFork)
 	unlock()
 	if err != nil {
@@ -108,7 +115,7 @@ func (m *Manager) Fork(ctx context.Context, parentID string, req ForkRequest) (F
 		go func() {
 			defer wg.Done()
 			for i := range jobs {
-				vm, err := m.Create(ctx, CreateRequest{SnapshotID: snap.ID, TTL: req.TTL, ParentID: parent.ID})
+				vm, err := m.Create(ctx, CreateRequest{SnapshotID: snap.ID, TTL: req.TTL, ParentID: parent.ID, admitted: res})
 				children[i] = ForkChild{VM: vm, Err: err}
 			}
 		}()
@@ -120,16 +127,16 @@ func (m *Manager) Fork(ctx context.Context, parentID string, req ForkRequest) (F
 	wg.Wait()
 	t.mark("children")
 
-	res := ForkResult{Snapshot: snap, Children: children, Timings: t.millis()}
+	out := ForkResult{Snapshot: snap, Children: children, Timings: t.millis()}
 	if meta, err := m.snaps.Load(snap.ID); err == nil {
-		res.Timings["paused"] = meta.TimingsMs["paused"]
+		out.Timings["paused"] = meta.TimingsMs["paused"]
 	}
-	failed := res.Failed()
-	m.cfg.Metrics.Forked(req.Count, failed, res.Timings)
+	failed := out.Failed()
+	m.cfg.Metrics.Forked(req.Count, failed, out.Timings)
 	_ = m.store.Note(ctx, parent.ID, fmt.Sprintf("forked %d children (%d failed) from %s in %.0fms, paused %.0fms",
-		req.Count-failed, failed, snap.ID, res.Timings["total"], res.Timings["paused"]))
-	m.log.InfoContext(ctx, "forked", "vm", parent.ID, "snapshot", snap.ID, "children", req.Count, "failed", failed, "timings_ms", res.Timings)
-	return res, nil
+		req.Count-failed, failed, snap.ID, out.Timings["total"], out.Timings["paused"]))
+	m.log.InfoContext(ctx, "forked", "vm", parent.ID, "snapshot", snap.ID, "children", req.Count, "failed", failed, "timings_ms", out.Timings)
+	return out, nil
 }
 
 // pin keeps garbage collection and deletion away from a snapshot, such as

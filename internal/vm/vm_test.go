@@ -55,6 +55,8 @@ type fakeHost struct {
 	// count how many run at once.
 	loadDelay           time.Duration
 	loading, maxLoading int
+	// mem is what hostMemory reports; zero means 16 GiB, 15 available.
+	mem hostMemory
 }
 
 type hold struct {
@@ -139,6 +141,14 @@ func (f *fakeHost) collectSnapshot(_ *jailer.Jail, b *snapshot.Building) error {
 	return nil
 }
 func (f *fakeHost) flushSnapshot(string) error { return f.record("flushSnapshot") }
+func (f *fakeHost) hostMemory() (hostMemory, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.mem.TotalMiB == 0 {
+		return hostMemory{TotalMiB: 16 << 10, AvailableMiB: 15 << 10}, nil
+	}
+	return f.mem, nil
+}
 func (f *fakeHost) prefetch(path string) error {
 	return f.record("prefetch " + filepath.Base(filepath.Dir(path)))
 }

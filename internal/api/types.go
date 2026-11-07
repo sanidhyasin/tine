@@ -219,6 +219,7 @@ const (
 	CodeInUse            = "in_use"       // e.g. deleting a snapshot that VMs run from
 	CodeIncompatible     = "incompatible" // a snapshot this host can't restore
 	CodeNoSpace          = "no_space"
+	CodeNoMemory         = "no_memory" // admission control: the host is short of memory for more VMs
 	CodeMethodNotAllowed = "method_not_allowed"
 	CodeInternal         = "internal"
 )

@@ -63,6 +63,12 @@ its own cgroup, outside tined's.`,
 	f.IntVar(&opts.vm.MinFreeMiB, "min-free-mib", opts.vm.MinFreeMiB, "disk space, in MiB, that taking a snapshot must leave free")
 	f.StringSliceVar(&opts.vm.WarmImages, "warm-images", opts.vm.WarmImages,
 		"images to keep a template of at the default size, warming it again when it's out of date (empty: none)")
+	f.Float64Var(&opts.vm.OvercommitRatio, "overcommit", opts.vm.OvercommitRatio,
+		"the most guest memory all VMs together may have, as a multiple of the host's memory")
+	f.IntVar(&opts.vm.MinFreeMemoryMiB, "min-free-memory-mib", opts.vm.MinFreeMemoryMiB,
+		"host memory, in MiB, that new VMs must leave available")
+	f.IntVar(&opts.vm.MaxForkChildren, "max-fork-children", opts.vm.MaxForkChildren, "the most children one fork may make")
+	f.IntVar(&opts.vm.ForkParallelism, "fork-parallelism", opts.vm.ForkParallelism, "how many of a fork's children are restored at once")
 	f.BoolVar(&opts.vm.ClockRealtime, "clock-realtime", opts.vm.ClockRealtime,
 		"have Firecracker advance a restored guest's clock (tine-agent sets it either way)")
 	f.StringVar(&opts.vm.JailerBin, "jailer", opts.vm.JailerBin, "jailer binary")

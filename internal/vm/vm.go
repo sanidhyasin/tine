@@ -116,6 +116,14 @@ type Config struct {
 	// MaxSnapshotsPerVM is how many snapshots one VM may have. A fork's
 	// snapshots don't count.
 	MaxSnapshotsPerVM int
+	// OvercommitRatio bounds the guest memory of all VMs together, as a
+	// multiple of the host's memory (see admission.go).
+	OvercommitRatio float64
+	// MinFreeMemoryMiB is the host memory that new VMs must leave available.
+	MinFreeMemoryMiB int
+	// BootUseMiB and RestoreUseMiB are what a new VM is expected to use as it
+	// starts, booted or restored, for admission control.
+	BootUseMiB, RestoreUseMiB int
 	// MaxForkChildren is the most children one fork may make.
 	MaxForkChildren int
 	// ForkParallelism is how many of a fork's children are restored at once.
@@ -161,6 +169,10 @@ func DefaultConfig() Config {
 		DestroyedRetention: 7 * 24 * time.Hour,
 		MaxSnapshotsPerVM:  16,
 		MaxForkChildren:    100,
+		OvercommitRatio:    4,
+		MinFreeMemoryMiB:   1024,
+		BootUseMiB:         192,
+		RestoreUseMiB:      64,
 		ForkParallelism:    runtime.NumCPU(),
 		MinFreeMiB:         2048,
 		WarmImages:         []string{"base"},
@@ -195,6 +207,12 @@ func (c Config) withDefaults() Config {
 	setInt(&c.MaxPIDs, d.MaxPIDs)
 	setInt(&c.MaxSnapshotsPerVM, d.MaxSnapshotsPerVM)
 	setInt(&c.MaxForkChildren, d.MaxForkChildren)
+	setInt(&c.MinFreeMemoryMiB, d.MinFreeMemoryMiB)
+	setInt(&c.BootUseMiB, d.BootUseMiB)
+	setInt(&c.RestoreUseMiB, d.RestoreUseMiB)
+	if c.OvercommitRatio == 0 {
+		c.OvercommitRatio = d.OvercommitRatio
+	}
 	setInt(&c.ForkParallelism, d.ForkParallelism)
 	setInt(&c.MinFreeMiB, d.MinFreeMiB)
 	if c.DefaultTTL == 0 {
@@ -249,6 +267,8 @@ type Manager struct {
 	warmFailed map[string]time.Time
 	// pins are snapshots that mustn't be collected or deleted yet (see pin).
 	pins map[string]int
+	// Memory held for VMs being made, by admission control.
+	reservedCommitMiB, reservedUseMiB int
 }
 
 type tracked struct {
@@ -336,6 +356,8 @@ type CreateRequest struct {
 	Cold bool
 	// ParentID is the VM this one is forked from (Fork sets it).
 	ParentID string
+	// admitted is the room Fork already reserved for this VM.
+	admitted *reservation
 }
 
 func (m *Manager) normalize(ctx context.Context, req CreateRequest) (CreateRequest, error) {
@@ -418,6 +440,15 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (state.VM, erro
 	if err != nil {
 		return state.VM{}, fmt.Errorf("%w: %w", ErrCapacity, err)
 	}
+	res := req.admitted
+	if res == nil {
+		if res, err = m.admit(ctx, 1, req.MemoryMiB, m.expectedUseMiB(req.SnapshotID != "")); err != nil {
+			return state.VM{}, err
+		}
+		defer res.release()
+	}
+	defer res.made()
+
 	// With a SnapshotID, this also claims the snapshot: it can't be deleted
 	// from now on, while the VM lives.
 	record := state.VM{
@@ -437,6 +468,7 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (state.VM, erro
 		m.slots.Release(slot)
 		return state.VM{}, err
 	}
+	res.recorded()
 	if coldBecause != "" {
 		_ = m.store.Note(ctx, vm.ID, "booted, not restored: "+coldBecause)
 	}

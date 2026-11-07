@@ -524,6 +524,7 @@ func TestErrorsMapToStatusCodes(t *testing.T) {
 		{fmt.Errorf("x: %w", state.ErrInUse), http.StatusConflict, CodeInUse},
 		{fmt.Errorf("x: %w", snapshot.ErrIncompatible), http.StatusConflict, CodeIncompatible},
 		{fmt.Errorf("x: %w", vm.ErrNoSpace), http.StatusInsufficientStorage, CodeNoSpace},
+		{fmt.Errorf("x: %w", vm.ErrNoMemory), http.StatusServiceUnavailable, CodeNoMemory},
 		{errors.New("disk on fire"), http.StatusInternalServerError, CodeInternal},
 	}
 	for _, tt := range tests {

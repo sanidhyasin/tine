@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -69,6 +70,8 @@ type host interface {
 	memory(j *jailer.Jail) (Memory, error)
 	// prefetch reads a file into the page cache.
 	prefetch(path string) error
+	// hostMemory reads the host's total and available memory.
+	hostMemory() (hostMemory, error)
 	// describeHost says what a snapshot of the VM would depend on: its
 	// Firecracker version, and this host's CPU and kernel.
 	describeHost(ctx context.Context, j *jailer.Jail) (snapshot.Host, error)
@@ -322,6 +325,34 @@ func (h *hostOS) syncGuest(ctx context.Context, j *jailer.Jail, req agentproto.S
 		return res, fmt.Errorf("the image's tine-agent is too old to sync the guest; import the image again: %w", err)
 	}
 	return res, err
+}
+
+func (h *hostOS) hostMemory() (hostMemory, error) {
+	data, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return hostMemory{}, err
+	}
+	var mem hostMemory
+	for _, line := range strings.Split(string(data), "\n") {
+		f := strings.Fields(line)
+		if len(f) < 2 {
+			continue
+		}
+		kb, err := strconv.Atoi(f[1])
+		if err != nil {
+			continue
+		}
+		switch f[0] {
+		case "MemTotal:":
+			mem.TotalMiB = kb >> 10
+		case "MemAvailable:":
+			mem.AvailableMiB = kb >> 10
+		}
+	}
+	if mem.TotalMiB == 0 {
+		return hostMemory{}, errors.New("no MemTotal in /proc/meminfo")
+	}
+	return mem, nil
 }
 
 func (h *hostOS) prefetch(path string) error {

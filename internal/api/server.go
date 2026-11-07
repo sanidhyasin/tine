@@ -469,6 +469,8 @@ func errorStatus(err error) (int, string) {
 		status, code = http.StatusConflict, CodeIncompatible
 	case errors.Is(err, vm.ErrNoSpace):
 		status, code = http.StatusInsufficientStorage, CodeNoSpace
+	case errors.Is(err, vm.ErrNoMemory):
+		status, code = http.StatusServiceUnavailable, CodeNoMemory
 	case errors.Is(err, state.ErrInvalidTransition), errors.Is(err, state.ErrConflict):
 		status, code = http.StatusConflict, CodeConflict
 	}
