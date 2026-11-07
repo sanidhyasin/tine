@@ -296,6 +296,54 @@ func TestRealRestore(t *testing.T) {
 	requireClean(t, m, "after destroying them all")
 }
 
+// TestRealRollbackToSnapshot breaks a real VM and rolls it back: its files
+// come back, and it keeps its ID, network and identity.
+func TestRealRollbackToSnapshot(t *testing.T) {
+	m := realManager(t, nil)
+	ctx := context.Background()
+	vm, err := m.Create(ctx, CreateRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = m.Destroy(context.Background(), vm.ID) })
+	execOut(t, m, vm.ID, "sh", "-c", "echo v1 > /root/data")
+	machineID := execOut(t, m, vm.ID, "cat", "/etc/machine-id")
+	snap, err := m.Snapshot(ctx, vm.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range 2 {
+		execOut(t, m, vm.ID, "sh", "-c", "rm /root/data; echo oops > /root/other")
+		got, err := m.Rollback(ctx, vm.ID, snap.ID)
+		if err != nil {
+			t.Fatalf("Rollback %d: %v", i+1, err)
+		}
+		t.Logf("rollback %d: %.1fms", i+1, got.Timings["rollback"])
+		if got.ID != vm.ID || got.Slot != vm.Slot || got.State != state.StateRunning {
+			t.Errorf("after rollback %d: %+v", i+1, got)
+		}
+		if out := strings.TrimSpace(execOut(t, m, vm.ID, "cat", "/root/data")); out != "v1" {
+			t.Errorf("rollback %d: /root/data = %q, want v1", i+1, out)
+		}
+		if _, code := execCode(t, m, vm.ID, "test", "-e", "/root/other"); code == 0 {
+			t.Errorf("rollback %d: /root/other, written after the snapshot, is still there", i+1)
+		}
+		if got := strings.TrimSpace(execOut(t, m, vm.ID, "hostname")); got != vm.ID {
+			t.Errorf("rollback %d: hostname = %q", i+1, got)
+		}
+		if got := execOut(t, m, vm.ID, "cat", "/etc/machine-id"); got != machineID {
+			t.Errorf("rollback %d: machine ID changed: %q -> %q", i+1, machineID, got)
+		}
+		if out, code := execCode(t, m, vm.ID, "timeout", "5", "bash", "-c", "echo > /dev/tcp/1.1.1.1/443"); code != 0 {
+			t.Errorf("rollback %d: no internet: exit %d %q", i+1, code, out)
+		}
+	}
+	if _, err := m.Destroy(ctx, vm.ID); err != nil {
+		t.Fatal(err)
+	}
+	requireClean(t, m, "after the test")
+}
+
 // TestRealTemplate warms a real template, and creates VMs from it and cold.
 func TestRealTemplate(t *testing.T) {
 	m := realManager(t, nil)

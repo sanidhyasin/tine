@@ -36,6 +36,7 @@ type Backend interface {
 	Destroy(ctx context.Context, id string) (state.VM, error)
 	Exec(ctx context.Context, id string, req agentproto.ExecRequest, onOutput func(stream string, data []byte)) (agentproto.ExitStatus, error)
 	Snapshot(ctx context.Context, id string) (state.Snapshot, error)
+	Rollback(ctx context.Context, id, snapshotID string) (state.VM, error)
 	Images(ctx context.Context) ([]*image.Image, error)
 	Templates(ctx context.Context) ([]vm.Template, error)
 	WarmTemplate(ctx context.Context, image string, vcpus, memoryMiB int) (state.Snapshot, error)
@@ -82,6 +83,7 @@ func NewServer(backend Backend, version string, log *slog.Logger, opts ...Option
 	s.mux.HandleFunc("/v1/vms/{id}", s.oneVM)
 	s.mux.HandleFunc("/v1/vms/{id}/exec", s.exec)
 	s.mux.HandleFunc("/v1/vms/{id}/snapshots", s.vmSnapshots)
+	s.mux.HandleFunc("/v1/vms/{id}/rollback", s.rollback)
 	s.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, CodeNotFound, "no such endpoint: "+r.Method+" "+r.URL.Path)
 	})
@@ -298,6 +300,27 @@ func (s *Server) vmSnapshots(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, toAPISnapshot(snap, nil))
+}
+
+func (s *Server) rollback(w http.ResponseWriter, r *http.Request) {
+	if !allow(w, r, http.MethodPost) {
+		return
+	}
+	var req RollbackRequest
+	if !decode(w, r, maxJSONBytes, &req) {
+		return
+	}
+	if req.SnapshotID == "" {
+		writeError(w, http.StatusBadRequest, CodeInvalidRequest, "snapshot_id is required")
+		return
+	}
+	ctx := logging.WithVM(r.Context(), r.PathValue("id"))
+	v, err := s.backend.Rollback(ctx, r.PathValue("id"), req.SnapshotID)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, toAPI(v))
 }
 
 // fail answers with the error's status and code.

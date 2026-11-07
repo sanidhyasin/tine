@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -68,4 +69,44 @@ func describeSnapshotTimings(s api.Snapshot) string {
 		}
 	}
 	return fmt.Sprintf("paused %s: %s; total %s", formatMillis(t["paused"]), strings.Join(inside, " · "), formatMillis(t["total"]))
+}
+
+func newRollbackCmd(g *globals) *cobra.Command {
+	var to string
+	cmd := &cobra.Command{
+		Use:   "rollback VM --to SNAPSHOT",
+		Short: "Put a VM back the way it was when a snapshot was taken",
+		Long: `Rollback replaces a running VM's memory, devices and disk with a snapshot's.
+Everything since the snapshot is lost. The VM keeps its ID, its network and
+its hostname.
+
+The snapshot must be one taken of this VM, or the template it started from.`,
+		Example: `  SNAP=$(tine snapshot -q vm-7f3k)
+  tine exec vm-7f3k -- rm -rf /important
+  tine rollback vm-7f3k --to $SNAP`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if to == "" {
+				return errors.New("say which snapshot to roll back to, with --to")
+			}
+			c := g.client()
+			ctx, cancel := context.WithTimeout(cmd.Context(), createTimeout)
+			defer cancel()
+			id, err := resolveID(ctx, c, args[0], false)
+			if err != nil {
+				return err
+			}
+			vm, err := c.Rollback(ctx, id, to)
+			if err != nil {
+				return err
+			}
+			if g.json {
+				return printJSON(cmd.OutOrStdout(), vm)
+			}
+			_, err = fmt.Fprintf(cmd.OutOrStdout(), "rolled back %s to %s (%s)\n", vm.ID, vm.SnapshotID, formatMillis(vm.TimingsMs["rollback"]))
+			return err
+		},
+	}
+	cmd.Flags().StringVar(&to, "to", "", "the snapshot to roll back to")
+	return cmd
 }

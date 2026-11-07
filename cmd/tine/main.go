@@ -77,7 +77,7 @@ VM IDs can be shortened to any unique prefix, like docker's.`,
 	})
 	root.AddCommand(
 		newCreateCmd(g), newListCmd(g), newInspectCmd(g), newExecCmd(g), newDestroyCmd(g),
-		newSnapshotCmd(g), newImagesCmd(g), newImageCmd(g), newVersionCmd(g),
+		newSnapshotCmd(g), newRollbackCmd(g), newImagesCmd(g), newImageCmd(g), newVersionCmd(g),
 	)
 	return root
 }

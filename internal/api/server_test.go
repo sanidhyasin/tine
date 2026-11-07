@@ -63,6 +63,21 @@ func (*fakeBackend) WarmTemplate(_ context.Context, image string, vcpus, memoryM
 	}, nil
 }
 
+func (f *fakeBackend) Rollback(_ context.Context, id, snapID string) (state.VM, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	v, ok := f.vms[id]
+	if !ok {
+		return state.VM{}, fmt.Errorf("VM %s: %w", id, state.ErrNotFound)
+	}
+	if snapID != "snap-0000000001" {
+		return state.VM{}, fmt.Errorf("snapshot %s: %w", snapID, state.ErrNotFound)
+	}
+	v.SnapshotID, v.Timings["rollback"] = snapID, 180.5
+	f.vms[id] = v
+	return v, nil
+}
+
 func (f *fakeBackend) Snapshot(_ context.Context, id string) (state.Snapshot, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -296,6 +311,26 @@ func TestSnapshotAPI(t *testing.T) {
 	var apiErr *Error
 	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusNotFound {
 		t.Errorf("snapshot of a missing VM = %#v, want 404", err)
+	}
+}
+
+func TestRollbackAPI(t *testing.T) {
+	ctx := context.Background()
+	c, sock := serve(t, newFakeBackend())
+	v, err := c.CreateVM(ctx, CreateVMRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := c.Rollback(ctx, v.ID, "snap-0000000001")
+	if err != nil || got.ID != v.ID || got.SnapshotID != "snap-0000000001" || got.TimingsMs["rollback"] != 180.5 {
+		t.Errorf("Rollback = %+v, %v", got, err)
+	}
+	var apiErr *Error
+	if _, err := c.Rollback(ctx, v.ID, "snap-nope"); !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusNotFound {
+		t.Errorf("rollback to a missing snapshot = %#v", err)
+	}
+	if status, _, _ := rawStatus(t, sock, http.MethodPost, "/v1/vms/"+v.ID+"/rollback", `{}`); status != http.StatusBadRequest {
+		t.Errorf("rollback without a snapshot = %d, want 400", status)
 	}
 }
 

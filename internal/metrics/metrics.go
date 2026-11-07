@@ -49,6 +49,7 @@ type Metrics struct {
 	snapshotFailures *prometheus.CounterVec
 	snapshotBytes    prometheus.Histogram
 	snapshotsDeleted *prometheus.CounterVec
+	rollbackStage    *prometheus.HistogramVec
 }
 
 // New returns metrics in a registry of their own, along with the Go runtime
@@ -85,6 +86,9 @@ func New(version string) *Metrics {
 			prometheus.ExponentialBuckets(64<<20, 2, 10)), // 64 MiB to 32 GiB
 		snapshotsDeleted: f.counterVec("snapshots_deleted_total",
 			"Snapshots deleted, by why: requested, or garbage (nothing needed them any more).", "reason"),
+		rollbackStage: f.histogramVec("vm_rollback_stage_seconds",
+			"How long each stage of rolling a VM back to a snapshot took: stop, jail, start, restore, agent, sync, and the total.",
+			operationBuckets, "stage"),
 	}
 	reg.MustRegister(
 		collectors.NewGoCollector(),
@@ -182,6 +186,16 @@ func (m *Metrics) SnapshotDeleted(reason string) {
 		return
 	}
 	m.snapshotsDeleted.WithLabelValues(reason).Inc()
+}
+
+// RolledBack records a rollback and its stage timings, in milliseconds.
+func (m *Metrics) RolledBack(timingsMs map[string]float64) {
+	if m == nil {
+		return
+	}
+	for stage, ms := range timingsMs {
+		m.rollbackStage.WithLabelValues(stage).Observe(ms / 1000)
+	}
 }
 
 // Destroyed records a destroy.

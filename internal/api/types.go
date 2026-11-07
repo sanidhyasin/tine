@@ -15,6 +15,7 @@
 //	DELETE /v1/vms/{id}            VM
 //	POST   /v1/vms/{id}/exec       ExecRequest → a stream of Frames
 //	POST   /v1/vms/{id}/snapshots  Snapshot (201)
+//	POST   /v1/vms/{id}/rollback   RollbackRequest → VM
 package api
 
 import (
@@ -110,6 +111,12 @@ type Template struct {
 	// Problem says why new VMs can't start from it, so they boot instead.
 	// It's empty when they can.
 	Problem string `json:"problem,omitempty"`
+}
+
+// RollbackRequest rolls a VM back to one of its snapshots, or to the
+// template it started from.
+type RollbackRequest struct {
+	SnapshotID string `json:"snapshot_id"`
 }
 
 // WarmRequest asks for a template of an image. Zero values mean tined's

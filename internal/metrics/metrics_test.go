@@ -111,6 +111,7 @@ func TestNilMetricsDoNothing(t *testing.T) {
 	m.SnapshotTaken("vm", map[string]float64{"total": 1}, 1)
 	m.SnapshotFailed("vm", "pause")
 	m.SnapshotFlushed(0)
+	m.RolledBack(map[string]float64{"total": 1})
 	m.SnapshotDeleted("garbage")
 	m.WatchVMStates(nil, nil)
 	rec := httptest.NewRecorder()

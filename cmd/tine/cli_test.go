@@ -158,6 +158,21 @@ func (*backend) WarmTemplate(_ context.Context, image string, vcpus, memoryMiB i
 	}, nil
 }
 
+func (b *backend) Rollback(_ context.Context, id, snapID string) (state.VM, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	i, err := b.find(id)
+	if err != nil {
+		return state.VM{}, err
+	}
+	if !strings.HasPrefix(snapID, "snap-") {
+		return state.VM{}, fmt.Errorf("snapshot %s: %w", snapID, state.ErrNotFound)
+	}
+	b.vms[i].SnapshotID = snapID
+	b.vms[i].Timings["rollback"] = 180.5
+	return b.vms[i], nil
+}
+
 func (b *backend) Snapshot(_ context.Context, id string) (state.Snapshot, error) {
 	v, err := b.Get(context.Background(), id)
 	if err != nil {
@@ -406,6 +421,20 @@ func TestImageWarm(t *testing.T) {
 	}
 	if r := tine(t, sock, "", "image", "warm", "nope"); r.code != 1 || !strings.Contains(r.stderr, "nope") {
 		t.Errorf("warm of a missing image = %d %q", r.code, r.stderr)
+	}
+}
+
+func TestRollback(t *testing.T) {
+	sock, _ := startTined(t)
+	id := strings.TrimSpace(tine(t, sock, "", "create", "-q").stdout)
+	if r := tine(t, sock, "", "rollback", id[3:7], "--to", "snap-abcdefghij"); r.code != 0 || r.stdout != "rolled back "+id+" to snap-abcdefghij (180ms)\n" {
+		t.Errorf("rollback = %d %q %q", r.code, r.stdout, r.stderr)
+	}
+	if r := tine(t, sock, "", "rollback", id); r.code != 1 || !strings.Contains(r.stderr, "--to") {
+		t.Errorf("rollback without --to = %d %q", r.code, r.stderr)
+	}
+	if r := tine(t, sock, "", "rollback", id, "--to", "nope"); r.code != 1 || !strings.Contains(r.stderr, "nope") {
+		t.Errorf("rollback to a missing snapshot = %d %q", r.code, r.stderr)
 	}
 }
 
