@@ -1,0 +1,181 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"os/user"
+	"path/filepath"
+	"strconv"
+	"syscall"
+	"time"
+
+	"github.com/spf13/cobra"
+
+	"github.com/sanidhyasin/tine/internal/api"
+	"github.com/sanidhyasin/tine/internal/state"
+	"github.com/sanidhyasin/tine/internal/version"
+	"github.com/sanidhyasin/tine/internal/vm"
+)
+
+// shutdownGrace is how long tined lets in-flight requests finish on stop.
+const shutdownGrace = 30 * time.Second
+
+type serveOptions struct {
+	socket      string
+	socketGroup string
+	dbPath      string
+	logLevel    string
+	vm          vm.Config
+}
+
+func newServeCmd() *cobra.Command {
+	opts := serveOptions{vm: vm.DefaultConfig()}
+	cmd := &cobra.Command{
+		Use:   "serve",
+		Short: "Run the tine service",
+		Long: `Run the tine service: it owns every VM on this host and serves tine's API on
+a Unix socket. It runs as root, normally under systemd (deploy/tined.service).
+
+VMs keep running when tined stops or restarts: each one's Firecracker lives in
+its own cgroup, outside tined's.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error { return serve(cmd.Context(), opts) },
+	}
+	f := cmd.Flags()
+	f.StringVar(&opts.socket, "socket", api.DefaultSocket, "Unix socket to serve the API on")
+	f.StringVar(&opts.socketGroup, "socket-group", "tine", "group allowed to use the socket (if it exists); everyone else is refused")
+	f.StringVar(&opts.dbPath, "db", state.DefaultPath, "state database")
+	f.StringVar(&opts.logLevel, "log-level", "info", "debug, info, warn or error")
+	f.StringVar(&opts.vm.ImagesDir, "images-dir", opts.vm.ImagesDir, "where images are stored")
+	f.StringVar(&opts.vm.ChrootBaseDir, "jail-dir", opts.vm.ChrootBaseDir, "where VM jails are built (same filesystem as --images-dir)")
+	f.StringVar(&opts.vm.JailerBin, "jailer", opts.vm.JailerBin, "jailer binary")
+	f.StringVar(&opts.vm.FirecrackerBin, "firecracker", opts.vm.FirecrackerBin, "firecracker binary (same release as the jailer)")
+	f.StringVar(&opts.vm.CgroupParent, "cgroup-parent", opts.vm.CgroupParent, "cgroup holding every VM's cgroup")
+	f.IntVar(&opts.vm.MaxVMs, "max-vms", opts.vm.MaxVMs, "most VMs at once")
+	f.IntVar(&opts.vm.DefaultVCPUs, "default-vcpus", opts.vm.DefaultVCPUs, "vCPUs when a request doesn't say")
+	f.IntVar(&opts.vm.DefaultMemoryMiB, "default-memory-mib", opts.vm.DefaultMemoryMiB, "memory when a request doesn't say")
+	f.DurationVar(&opts.vm.DefaultTTL, "default-ttl", opts.vm.DefaultTTL, "how long VMs live when a request doesn't say")
+	return cmd
+}
+
+func serve(ctx context.Context, opts serveOptions) error {
+	log, err := newLogger(opts.logLevel)
+	if err != nil {
+		return err
+	}
+	if os.Geteuid() != 0 {
+		return errors.New("tined serve must run as root: it creates network namespaces, jails and cgroups")
+	}
+	ctx, stop := signal.NotifyContext(ctx, syscall.SIGTERM, os.Interrupt)
+	defer stop()
+
+	store, err := state.Open(ctx, opts.dbPath)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = store.Close() }()
+
+	opts.vm.Log = log
+	manager, err := vm.New(opts.vm, store)
+	if err != nil {
+		return err
+	}
+	if err := manager.Setup(ctx); err != nil {
+		return fmt.Errorf("set up the host: %w", err)
+	}
+
+	ln, err := listenSocket(ctx, opts.socket, opts.socketGroup, log)
+	if err != nil {
+		return err
+	}
+	srv := &http.Server{
+		Handler:           api.NewServer(manager, version.Version, log),
+		ReadHeaderTimeout: 10 * time.Second,
+		ErrorLog:          slog.NewLogLogger(log.Handler(), slog.LevelWarn),
+	}
+	errc := make(chan error, 1)
+	go func() { errc <- srv.Serve(ln) }()
+
+	log.Info("tined ready", "version", version.String(), "socket", opts.socket, "db", opts.dbPath)
+	notifySystemd("READY=1\nSTATUS=serving on " + opts.socket)
+
+	select {
+	case err := <-errc:
+		return fmt.Errorf("serve: %w", err)
+	case <-ctx.Done():
+	}
+	log.Info("stopping: finishing in-flight requests; VMs keep running")
+	notifySystemd("STOPPING=1")
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Warn("some requests didn't finish in time", "err", err)
+	}
+	log.Info("stopped")
+	return nil
+}
+
+// listenSocket listens on a Unix socket that only root and socketGroup may use.
+func listenSocket(ctx context.Context, path, socketGroup string, log *slog.Logger) (net.Listener, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil { //nolint:gosec // the directory must be traversable; the socket's own mode guards it
+		return nil, err
+	}
+	// A socket left by a tined that didn't exit cleanly would block the listen.
+	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSocket != 0 {
+		_ = os.Remove(path)
+	}
+	var lc net.ListenConfig
+	ln, err := lc.Listen(ctx, "unix", path)
+	if err != nil {
+		return nil, err
+	}
+	mode := os.FileMode(0o600)
+	if g, err := user.LookupGroup(socketGroup); err == nil {
+		gid, _ := strconv.Atoi(g.Gid)
+		if err := os.Chown(path, 0, gid); err != nil {
+			_ = ln.Close()
+			return nil, err
+		}
+		mode = 0o660
+	} else {
+		log.Warn("socket group doesn't exist; only root can use the socket", "group", socketGroup)
+	}
+	if err := os.Chmod(path, mode); err != nil {
+		_ = ln.Close()
+		return nil, err
+	}
+	return ln, nil
+}
+
+func newLogger(level string) (*slog.Logger, error) {
+	var l slog.Level
+	if err := l.UnmarshalText([]byte(level)); err != nil {
+		return nil, fmt.Errorf("--log-level %q: %w", level, err)
+	}
+	// JSON on stderr: under systemd it goes to the journal.
+	return slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: l})), nil
+}
+
+// notifySystemd tells systemd about tined's state (sd_notify), when it runs
+// as a Type=notify service. Outside systemd it does nothing.
+func notifySystemd(msg string) {
+	addr := os.Getenv("NOTIFY_SOCKET")
+	if addr == "" {
+		return
+	}
+	if addr[0] == '@' {
+		addr = "\x00" + addr[1:] // an abstract socket
+	}
+	conn, err := net.DialUnix("unixgram", nil, &net.UnixAddr{Name: addr, Net: "unixgram"})
+	if err != nil {
+		return
+	}
+	defer func() { _ = conn.Close() }()
+	_, _ = conn.Write([]byte(msg))
+}

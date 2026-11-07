@@ -1,0 +1,31 @@
+# tine's service. `make deploy` installs it to /etc/systemd/system/.
+[Unit]
+Description=tine: fork running microVMs in milliseconds
+Documentation=https://github.com/sanidhyasin/tine
+After=network-online.target local-fs.target
+Wants=network-online.target
+# Images, jails and snapshots live on the data volume.
+RequiresMountsFor=/srv/tine
+
+[Service]
+# tined tells systemd when it's ready to serve.
+Type=notify
+ExecStart=/usr/local/bin/tined serve
+Restart=on-failure
+RestartSec=2s
+# Let in-flight requests finish (tined allows them 30s).
+TimeoutStopSec=40s
+# SIGTERM to tined, then SIGKILL to anything left in this service's cgroup.
+# VMs aren't in it: the jailer moves each Firecracker into its own cgroup
+# (under /sys/fs/cgroup/tine), so stopping or restarting tined never stops VMs.
+KillMode=mixed
+# One VM uses a handful of file descriptors; leave plenty of room.
+LimitNOFILE=1048576
+# /run/tine for the API socket, /var/lib/tine for the database.
+RuntimeDirectory=tine
+RuntimeDirectoryMode=0755
+StateDirectory=tine
+StateDirectoryMode=0700
+
+[Install]
+WantedBy=multi-user.target

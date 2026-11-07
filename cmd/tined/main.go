@@ -3,7 +3,6 @@
 package main
 
 import (
-	"errors"
 	"fmt"
 	"os"
 
@@ -28,17 +27,6 @@ func newRootCmd() *cobra.Command {
 	}
 	root.AddCommand(newServeCmd(), newImageCmd(), newVersionCmd())
 	return root
-}
-
-func newServeCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:   "serve",
-		Short: "Run the tine service",
-		Args:  cobra.NoArgs,
-		RunE: func(*cobra.Command, []string) error {
-			return errors.New("the service isn't built yet (docs/PLAN.md, task 1.10)")
-		},
-	}
 }
 
 func newVersionCmd() *cobra.Command {
