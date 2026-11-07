@@ -455,6 +455,10 @@ func (b *bench) settle(ctx context.Context, id string) error {
 	if _, err := b.c.Exec(ctx, id, api.ExecRequest{Args: []string{"systemctl", "is-system-running", "--wait"}, TimeoutMs: 120_000}, nil); err != nil {
 		return fmt.Errorf("settle: %w", err)
 	}
+	// systemd reports the boot finished as it starts its last units; a fork
+	// in the next second gives every child that work to do (agent ready in
+	// about 180 ms instead of 50).
+	time.Sleep(2 * time.Second)
 	return nil
 }
 

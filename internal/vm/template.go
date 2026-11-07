@@ -62,6 +62,14 @@ func (m *Manager) WarmTemplate(ctx context.Context, imageName string, vcpus, mem
 	if _, err := m.Exec(ctx, vm.ID, settle, nil); err != nil {
 		return state.Snapshot{}, fmt.Errorf("warm %s: wait for the boot to finish: %w", req.Image, err)
 	}
+	// systemd says the boot is finished as it starts its last units, so the
+	// guest is busy for a moment after: saved then, every restore would
+	// carry on with that work, and take longer to answer.
+	select {
+	case <-time.After(m.cfg.SettleQuiet):
+	case <-ctx.Done():
+		return state.Snapshot{}, ctx.Err()
+	}
 	settled := time.Since(start)
 
 	unlock := m.locks.lock(vm.ID)

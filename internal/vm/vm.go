@@ -136,6 +136,9 @@ type Config struct {
 	// SettleCommand runs in a template's VM before it's saved, and returns
 	// once the guest has finished booting.
 	SettleCommand []string
+	// SettleQuiet is how long the template's VM is then left alone before
+	// it's saved, for the guest to finish what the end of its boot started.
+	SettleQuiet time.Duration
 	// WarmImages are the images to keep a template of, at the default size,
 	// so creates restore instead of booting. A missing or out-of-date
 	// template is warmed in the background. Nil keeps none warm.
@@ -181,6 +184,7 @@ func DefaultConfig() Config {
 		MinFreeMiB:         2048,
 		WarmImages:         []string{"base"},
 		SettleCommand:      []string{"systemctl", "is-system-running", "--wait"},
+		SettleQuiet:        2 * time.Second,
 	}
 }
 
@@ -236,6 +240,9 @@ func (c Config) withDefaults() Config {
 	}
 	if c.Log == nil {
 		c.Log = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
+	if c.SettleQuiet == 0 {
+		c.SettleQuiet = d.SettleQuiet
 	}
 	if len(c.SettleCommand) == 0 {
 		c.SettleCommand = d.SettleCommand
