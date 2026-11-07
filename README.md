@@ -2,7 +2,7 @@
 
 Fork a running microVM into many copies in milliseconds. Built on [Firecracker](https://github.com/firecracker-microvm/firecracker).
 
-> **Status: v0.2.0, step 2 done.** tined runs isolated microVMs, and the `tine` command creates them, runs commands in them, snapshots them, rolls them back and destroys them. New VMs start from pre-booted templates in about a tenth of a second. Forks come in step 3. The step-by-step build plan is in [docs/PLAN.md](docs/PLAN.md), and the reasons behind the project are in [BRIEF.md](BRIEF.md).
+> **Status: v0.3.0, step 3 done.** tined runs isolated microVMs, and the `tine` command creates them, runs commands in them, snapshots them, rolls them back, **forks them into many running copies that share their memory**, and destroys them. New VMs start from pre-booted templates in about a tenth of a second. Step 4 measures and speeds it all up on bare metal. The step-by-step build plan is in [docs/PLAN.md](docs/PLAN.md), and the reasons behind the project are in [BRIEF.md](BRIEF.md).
 
 ## How it works
 
@@ -10,14 +10,18 @@ A service, `tined`, owns every VM on a Linux server. For each one it builds a ja
 
 A snapshot freezes a VM for a moment and saves its memory, devices and disk, read-only. A VM restored from one wakes up exactly where it left off, and tine-agent then gives it the right time, fresh randomness and its own identity. Templates are images booted once and snapshotted, so `tine create` restores instead of booting, and rollback puts a VM back to one of its snapshots.
 
+A fork restores one snapshot of a running VM many times at once. The VM is paused only for the snapshot, and every child starts where it was, programs and all, sharing its memory until it changes a page. Admission control refuses any create or fork the host hasn't the memory or CPUs for.
+
 Measured on the dev server (an m8i.xlarge, through nested virtualization):
 
 | What | Result |
 |---|---|
 | Create from a template, to a VM that runs commands | 111 ms p50, 145 ms p99 |
 | Create by booting | 1.84 s p50, 1.91 s p99 |
+| Fork a VM into 10 running copies | 397 ms p50 for a 256 MiB VM, paused 62 ms; about 870 ms for a 1 GiB VM, paused about 230 ms |
+| Host memory for an idle fork child | 14 MiB (PSS), though its RSS is 100 MiB |
 | Roll a VM back to a snapshot | 127 ms p50 |
-| Snapshot: how long a 1 GiB VM is paused | 341 ms p50 (47 ms at 256 MiB; 22 s at 4 GiB on this disk) |
+| Snapshot: how long a 1 GiB VM is paused | 158 ms p50 (68 ms at 256 MiB; 602 ms at 4 GiB) |
 | Run `true` in a VM, through the API | 1.8 ms p50 |
 | Destroy | 32 ms p50 |
 | Host memory for an idle 1 GiB VM | 127 MiB booted; only 19 MiB of it its own when restored from a template |
@@ -89,12 +93,25 @@ $ tine exec yxr4 -- rm -rf /root   # oops
 $ tine rollback yxr4 --to u3iq     # snapshot IDs take prefixes too
 rolled back vm-yxr4tliv4w to snap-u3iqp7pu3w (127ms)
 
-$ tine ls
-ID             STATE    IMAGE  VCPUS  MEMORY  AGE  EXPIRES IN
-vm-yxr4tliv4w  running  base   2      1 GiB   41s  59m
+$ tine fork yxr4 -n 3              # three running copies
+forked vm-yxr4tliv4w into 3 in 470ms (parent paused 232ms; snapshot 237ms · children 233ms)
+  vm-bspt6ta7eb  running  (190ms)
+  vm-7lkl5qqwiz  running  (178ms)
+  vm-rxy2fbtdpu  running  (127ms)
 
-$ tine destroy yxr4
+$ tine ls --tree
+VM                             STATE    IMAGE  MEMORY  RSS      PSS     AGE
+vm-yxr4tliv4w                  running  base   1 GiB   1 GiB    1 GiB   49s
+└─ snap-5b7nypfznt (3 forked)
+   ├─ vm-bspt6ta7eb            running  base   1 GiB   127 MiB  36 MiB  2s
+   ├─ vm-7lkl5qqwiz            running  base   1 GiB   127 MiB  36 MiB  2s
+   └─ vm-rxy2fbtdpu            running  base   1 GiB   127 MiB  36 MiB  2s
+
+$ tine destroy yxr4 bspt 7lkl rxy2
 destroyed vm-yxr4tliv4w (29ms)
+destroyed vm-bspt6ta7eb (31ms)
+destroyed vm-7lkl5qqwiz (27ms)
+destroyed vm-rxy2fbtdpu (30ms)
 ```
 
 The output is from the dev server, with one VM's IDs throughout; the timings vary from run to run.
@@ -103,6 +120,7 @@ More:
 
 - `tine create --vcpus 4 --memory 2G --ttl 30m`. VMs are destroyed automatically when their time is up, after 1 hour by default. `tine create -q` prints just the ID, for scripts.
 - `tine create --cold` boots instead of restoring. A template is for one size, so other sizes boot unless you warm one: `tine image warm base --vcpus 4 --memory 2G`. `tine images` shows each image's templates. tined keeps `base` warm at the default size by itself, even after an upgrade.
+- `tine fork VM -n N` makes N children; `-q` prints just their IDs, for scripts. `tine ls --tree` shows who was forked from whom, with each VM's RSS and PSS (PSS splits shared pages between the VMs sharing them, so it's what each really costs).
 - `tine snapshot ls` lists snapshots and the VMs running from each, `tine snapshot inspect` shows one, and `tine snapshot rm` deletes them. A snapshot that VMs run from can't be deleted, and a destroyed VM's snapshots go by themselves.
 - `tine exec` takes `-e KEY=VALUE`, `-w DIR`, `--timeout 30s`, and `-i` to pipe stdin in. Output streams as it happens, and Ctrl+C stops the command in the VM too.
 - `tine inspect VM` shows everything, including how the VM started and where each step's time went. `tine version` also shows tined's version.

@@ -22,7 +22,9 @@ The *why* behind the project is in [BRIEF.md](../BRIEF.md). This file is the *ho
 
 ## Where we are
 
-**Step 2 is done, released as v0.2.0.** On top of step 1's isolated microVMs, tined snapshots running VMs, rolls them back, and starts new VMs from pre-booted templates in 111 ms instead of booting them in 1.84 s. How it all works is in [architecture.md](architecture.md). Next is step 3, fork, starting with task 3.1.
+**Step 3 is done, released as v0.3.0.** tined forks a running VM into many children that share its memory. 10 children of a 256 MiB VM take 397 ms, with the parent paused 62 ms, and each idle child costs 14 MiB of PSS. Admission control refuses what the host can't take. How it all works is in [architecture.md](architecture.md). Next is step 4, measuring and optimizing on bare metal, starting with task 4.1.
+
+Step 2 (v0.2.0) added snapshots, rollback, and templates that start new VMs in 111 ms instead of booting them in 1.84 s.
 
 Step 1 (v0.1.0) built the foundations: tined under systemd, and `tine` creating VMs, running commands in them and destroying them.
 
@@ -513,7 +515,7 @@ vm-7f3k2q9d1a  running
 
   *`TestFork10` does all three. It also checks that each child has the parent's running process and its own hostname, reaches the internet, and has a PSS below its RSS. `TestForkPastTheLimitsIsRefused` checks a fork of 100 1 GiB children is 503 `no_memory`, takes no snapshot, and leaves the parent running. The first run found the parent's agent not answering a few seconds after the fork. The fork snapshot's dirty page cache counted against the parent's cgroup, and the kernel's default `vm.dirty_ratio` of 20% then throttled the parent's disk writes, and with them its vsock, which Firecracker handles on the same thread. `host-setup.sh` now sets 60%, which also cut a 4 GiB VM's snapshot pause from 22 s to under 1 s. All 15 e2e tests pass. The fork of 10 took 868 ms with the parent paused 232 ms, and the 10 children had 1,260 MiB of RSS between them but 301 MiB of PSS.*
 - [x] **3.7 Density test:** keep forking until admission control refuses. Nothing crashes, and the leak check is clean afterwards. *`TestDensity` forks a 1-vCPU, 256 MiB VM in batches of 50, 10 and 1 until even one more child is refused. It then checks tined never restarted, no VM failed, every child answers, and the kernel killed nothing for lack of memory. The first runs found a limit of the dev server, not of tine: under EC2's nested virtualization, KVM fails to enter guests once about 60 1-vCPU VMs (or 20 2-vCPU ones) are running, whether booted or restored (`KVM_EXIT_FAIL_ENTRY`, error 7). So admission control has a third rule: all VMs' vCPUs stay within `--cpu-overcommit` (default 8) times the host's CPUs, 32 here (503 `no_cpu`). The test now passes: refused after 30 children, which used 946 MiB of PSS between them (32 MiB each) against 3,141 MiB of RSS, with 14 GiB of host memory still available. Here CPU sets the density, not memory. A parent forked again while its last fork's children run can pause for longer (1.4 s seen for 256 MiB): both forks' snapshots count against its cgroup, and the kernel reclaims the first's pages from its children to make room.*
-- [ ] **3.8 Docs and release:** update `docs/architecture.md`, tag `v0.3.0`.
+- [x] **3.8 Docs and release:** update `docs/architecture.md`, tag `v0.3.0`. *The architecture doc has a new section on forks: forking, sharing memory and PSS, and admission control with the density results. The page-cache and `vm.dirty_ratio` findings are in the snapshot section. Every other section is brought up to date: the code, state, the API, metrics, testing (with the bugs step 3's tests caught), the measured numbers, and the known limits. Snapshot pauses were measured again after the `vm.dirty_ratio` change: 68 ms, 158 ms and 602 ms at 256 MiB, 1 GiB and 4 GiB.*
 
 ### Done when
 
