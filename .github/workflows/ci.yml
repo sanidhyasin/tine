@@ -37,3 +37,21 @@ jobs:
 
       - name: Build
         run: make build
+
+  python-sdk:
+    name: Python SDK
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: sdk/python
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Lint
+        run: uvx ruff check src tests && uvx ruff format --check src tests
+
+      - name: Tests (against a fake tined)
+        run: uv run --group dev pytest -q
