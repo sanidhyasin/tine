@@ -43,7 +43,7 @@ var (
 	// ErrInvalidTransition means the VM can't go from its current state to the
 	// one asked for.
 	ErrInvalidTransition = errors.New("invalid state transition")
-	// ErrInUse means an image can't be removed while VMs use it.
+	// ErrInUse means an image or snapshot can't be removed while VMs use it.
 	ErrInUse = errors.New("in use")
 )
 

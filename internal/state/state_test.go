@@ -55,9 +55,13 @@ func TestOpenMigratesAndReopens(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	ms, err := loadMigrations(migrationFiles)
+	if err != nil {
+		t.Fatal(err)
+	}
 	v, err := s.SchemaVersion(ctx)
-	if err != nil || v != 1 {
-		t.Errorf("schema version = %d, %v; want 1", v, err)
+	if err != nil || v != len(ms) || v < 2 {
+		t.Errorf("schema version = %d, %v; want %d, one per migration", v, err, len(ms))
 	}
 	if _, err := s.CreateVM(ctx, newVM("vm-a", 0)); err != nil {
 		t.Fatal(err)

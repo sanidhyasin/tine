@@ -74,6 +74,9 @@ type VM struct {
 	PID int
 	// Error says why the VM failed.
 	Error string
+	// SnapshotID is the snapshot the VM was restored from and runs from, or
+	// empty for a VM that was booted from scratch.
+	SnapshotID string
 	// Timings is how long each stage of creating it took, in milliseconds.
 	Timings map[string]float64
 
@@ -96,7 +99,9 @@ type Event struct {
 var validVMID = regexp.MustCompile(`^[a-zA-Z0-9-]{1,64}$`)
 
 // CreateVM records a new VM in StateCreating. Its ID, slot and uid must not
-// clash with an existing VM's (ErrConflict).
+// clash with an existing VM's (ErrConflict). If it has a SnapshotID, that
+// snapshot must be ready (ErrNotFound otherwise): checking in the same
+// transaction means it can't be deleted in between.
 func (s *Store) CreateVM(ctx context.Context, vm VM) (VM, error) {
 	if !validVMID.MatchString(vm.ID) {
 		return VM{}, fmt.Errorf("create VM: bad ID %q", vm.ID)
@@ -115,11 +120,16 @@ func (s *Store) CreateVM(ctx context.Context, vm VM) (VM, error) {
 		return VM{}, err
 	}
 	defer func() { _ = tx.Rollback() }()
+	if vm.SnapshotID != "" {
+		if err := requireReadySnapshot(ctx, tx, vm.SnapshotID); err != nil {
+			return VM{}, fmt.Errorf("create VM %s: %w", vm.ID, err)
+		}
+	}
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO vms (id, state, image, vcpus, memory_mib, slot, uid, pid, error, timings, created_at, updated_at, expires_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		INSERT INTO vms (id, state, image, vcpus, memory_mib, slot, uid, pid, error, snapshot_id, timings, created_at, updated_at, expires_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		vm.ID, vm.State, vm.Image, vm.VCPUs, vm.MemoryMiB, vm.Slot, vm.UID,
-		nullInt(vm.PID), nullString(vm.Error), timings,
+		nullInt(vm.PID), nullString(vm.Error), nullString(vm.SnapshotID), timings,
 		formatTime(vm.CreatedAt), formatTime(vm.UpdatedAt), nullTime(vm.ExpiresAt))
 	if err != nil {
 		if isConstraint(err) {
@@ -167,7 +177,8 @@ func (s *Store) ExpiredVMs(ctx context.Context, now time.Time) ([]VM, error) {
 // UpdateVM changes a VM in one write transaction. It loads the VM, lets change
 // edit it, checks that any state change is allowed (ErrInvalidTransition
 // otherwise), saves it, and records an Event with detail if the state
-// changed. If change returns an error, nothing is saved.
+// changed. If change returns an error, nothing is saved. A new SnapshotID
+// must be a ready snapshot (ErrNotFound otherwise).
 //
 // Moving to StateDestroyed sets DestroyedAt, and moving to StateFailed with
 // no Error uses detail as the Error.
@@ -188,6 +199,11 @@ func (s *Store) UpdateVM(ctx context.Context, id, detail string, change func(vm 
 	}
 	if vm.ID != before.ID || vm.CreatedAt != before.CreatedAt {
 		return VM{}, fmt.Errorf("update VM %s: its ID and creation time can't change", id)
+	}
+	if vm.SnapshotID != before.SnapshotID && vm.SnapshotID != "" {
+		if err := requireReadySnapshot(ctx, tx, vm.SnapshotID); err != nil {
+			return VM{}, fmt.Errorf("update VM %s: %w", id, err)
+		}
 	}
 	now := s.now()
 	if vm.State != before.State {
@@ -210,10 +226,10 @@ func (s *Store) UpdateVM(ctx context.Context, id, detail string, change func(vm 
 	}
 	_, err = tx.ExecContext(ctx, `
 		UPDATE vms SET state = ?, image = ?, vcpus = ?, memory_mib = ?, slot = ?, uid = ?, pid = ?,
-			error = ?, timings = ?, updated_at = ?, expires_at = ?, destroyed_at = ?
+			error = ?, snapshot_id = ?, timings = ?, updated_at = ?, expires_at = ?, destroyed_at = ?
 		WHERE id = ?`,
 		vm.State, vm.Image, vm.VCPUs, vm.MemoryMiB, vm.Slot, vm.UID, nullInt(vm.PID),
-		nullString(vm.Error), timings, formatTime(vm.UpdatedAt), nullTime(vm.ExpiresAt), nullTime(vm.DestroyedAt),
+		nullString(vm.Error), nullString(vm.SnapshotID), timings, formatTime(vm.UpdatedAt), nullTime(vm.ExpiresAt), nullTime(vm.DestroyedAt),
 		vm.ID)
 	if err != nil {
 		if isConstraint(err) {
@@ -286,7 +302,7 @@ func (s *Store) PurgeDestroyed(ctx context.Context, cutoff time.Time) (int64, er
 
 // --- row mapping ---
 
-const vmColumns = "id, state, image, vcpus, memory_mib, slot, uid, pid, error, timings, created_at, updated_at, expires_at, destroyed_at"
+const vmColumns = "id, state, image, vcpus, memory_mib, slot, uid, pid, error, snapshot_id, timings, created_at, updated_at, expires_at, destroyed_at"
 
 type querier interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
@@ -325,17 +341,19 @@ func scanVM(row scanner) (VM, error) {
 		vm                 VM
 		pid                sql.NullInt64
 		errText, timings   sql.NullString
+		snapshotID         sql.NullString
 		created, updated   string
 		expires, destroyed sql.NullString
 		state              string
 	)
 	if err := row.Scan(&vm.ID, &state, &vm.Image, &vm.VCPUs, &vm.MemoryMiB, &vm.Slot, &vm.UID,
-		&pid, &errText, &timings, &created, &updated, &expires, &destroyed); err != nil {
+		&pid, &errText, &snapshotID, &timings, &created, &updated, &expires, &destroyed); err != nil {
 		return VM{}, err
 	}
 	vm.State = VMState(state)
 	vm.PID = int(pid.Int64)
 	vm.Error = errText.String
+	vm.SnapshotID = snapshotID.String
 	var err error
 	if timings.Valid && timings.String != "" {
 		if err := json.Unmarshal([]byte(timings.String), &vm.Timings); err != nil {
