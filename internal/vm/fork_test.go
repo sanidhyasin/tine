@@ -192,3 +192,32 @@ func TestMemory(t *testing.T) {
 		t.Errorf("Memory of a destroyed VM = %v, want ErrNotRunning", err)
 	}
 }
+
+// Each child of a fork is made current and unique: its own hostname (its
+// ID), machine ID and entropy, and the host's time.
+func TestForkChildrenHaveTheirOwnIdentity(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, nil)
+	parent := f.running(t)
+	f.host.syncs = nil
+	before := time.Now()
+	res, err := f.m.Fork(ctx, parent.ID, ForkRequest{Count: 8})
+	if err != nil || res.Failed() > 0 {
+		t.Fatalf("Fork: %v", err)
+	}
+	if len(f.host.syncs) != 8 {
+		t.Fatalf("%d syncs, want one per child", len(f.host.syncs))
+	}
+	children := map[string]bool{}
+	for _, c := range res.Children {
+		children[c.VM.ID] = true
+	}
+	hostnames, machineIDs, entropy := map[string]bool{}, map[string]bool{parent.ID: true}, map[string]bool{}
+	for _, s := range f.host.syncs {
+		if !children[s.Hostname] || hostnames[s.Hostname] || machineIDs[s.MachineID] || entropy[string(s.Entropy)] ||
+			time.Unix(0, s.TimeUnixNano).Before(before) {
+			t.Errorf("sync %+v: not a child's own", s)
+		}
+		hostnames[s.Hostname], machineIDs[s.MachineID], entropy[string(s.Entropy)] = true, true, true
+	}
+}

@@ -388,6 +388,15 @@ func TestRealFork(t *testing.T) {
 		}
 		execOut(t, m, child.ID, "sh", "-c", "echo child > /root/who")
 	}
+	// Each child's kernel makes its own random numbers.
+	random := map[string]bool{}
+	for _, c := range res.Children {
+		r := execOut(t, m, c.VM.ID, "sh", "-c", "head -c 16 /dev/urandom | od -An -tx1")
+		if random[r] {
+			t.Errorf("child %s read the same random bytes as another", c.VM.ID)
+		}
+		random[r] = true
+	}
 	// Each child's writes are its own, and the parent is as it was.
 	if got := strings.TrimSpace(execOut(t, m, parent.ID, "cat", "/root/who")); got != "parent" {
 		t.Errorf("the parent's /root/who = %q", got)

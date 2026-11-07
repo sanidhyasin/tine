@@ -47,6 +47,7 @@ type fakeHost struct {
 	// thisHost, if set, is what hostInfo reports instead of fakeSnapshotHost.
 	thisHost *snapshot.Host
 	lastSync agentproto.SyncRequest
+	syncs    []agentproto.SyncRequest
 	// busyUntil makes paused wait until then, like a Firecracker busy writing a snapshot.
 	busyUntil time.Time
 	// failTimes makes the next N calls of an op fail.
@@ -178,6 +179,7 @@ func (f *fakeHost) loadSnapshot(context.Context, *jailer.Jail) error {
 func (f *fakeHost) syncGuest(_ context.Context, _ *jailer.Jail, req agentproto.SyncRequest) (agentproto.SyncResult, error) {
 	f.mu.Lock()
 	f.lastSync = req
+	f.syncs = append(f.syncs, req)
 	f.mu.Unlock()
 	return agentproto.SyncResult{}, f.record("syncGuest")
 }
