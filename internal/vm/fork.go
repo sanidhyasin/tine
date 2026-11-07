@@ -89,7 +89,7 @@ func (m *Manager) Fork(ctx context.Context, parentID string, req ForkRequest) (F
 		unlock()
 		return ForkResult{}, err
 	}
-	res, err := m.admit(ctx, req.Count, parent.MemoryMiB, m.cfg.RestoreUseMiB)
+	res, err := m.admit(ctx, req.Count, parent.VCPUs, parent.MemoryMiB, m.cfg.RestoreUseMiB)
 	if err != nil {
 		unlock()
 		return ForkResult{}, err

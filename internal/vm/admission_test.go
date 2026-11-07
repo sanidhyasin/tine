@@ -14,8 +14,8 @@ func (f *fixture) reservedNothing(t *testing.T) {
 	t.Helper()
 	f.m.mu.Lock()
 	defer f.m.mu.Unlock()
-	if f.m.reservedCommitMiB != 0 || f.m.reservedUseMiB != 0 {
-		t.Errorf("still reserved: %d MiB committed, %d MiB of use", f.m.reservedCommitMiB, f.m.reservedUseMiB)
+	if f.m.reservedCommitMiB != 0 || f.m.reservedUseMiB != 0 || f.m.reservedVCPUs != 0 {
+		t.Errorf("still reserved: %d MiB committed, %d MiB of use, %d vCPUs", f.m.reservedCommitMiB, f.m.reservedUseMiB, f.m.reservedVCPUs)
 	}
 }
 
@@ -117,6 +117,23 @@ func TestFailedCreatesGiveTheirRoomBack(t *testing.T) {
 	f.host.failTimes = map[string]int{"loadSnapshot": 2}
 	if res, err := f.m.Fork(ctx, parent.ID, ForkRequest{Count: 3}); err != nil || res.Failed() != 2 {
 		t.Fatalf("Fork = %v, %d failed", err, res.Failed())
+	}
+	f.reservedNothing(t)
+}
+
+func TestAdmissionLimitsVCPUs(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, func(c *Config) { c.CPUOvercommitRatio = 2 })
+	f.host.mem = hostMemory{TotalMiB: 64 << 10, AvailableMiB: 60 << 10, CPUs: 4} // room for 8 vCPUs
+	parent := f.running(t)                                                       // 2 vCPUs
+	if _, err := f.m.Fork(ctx, parent.ID, ForkRequest{Count: 4}); !errors.Is(err, ErrNoCPU) || !strings.Contains(err.Error(), "limit of 8") {
+		t.Errorf("4 children of 2 vCPUs on top = %v, want ErrNoCPU naming the limit", err)
+	}
+	if res, err := f.m.Fork(ctx, parent.ID, ForkRequest{Count: 3}); err != nil || res.Failed() != 0 {
+		t.Errorf("3 children, filling it: %v", err)
+	}
+	if _, err := f.m.Create(ctx, CreateRequest{VCPUs: 1}); !errors.Is(err, ErrNoCPU) {
+		t.Errorf("one more = %v, want ErrNoCPU", err)
 	}
 	f.reservedNothing(t)
 }

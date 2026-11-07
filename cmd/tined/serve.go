@@ -65,6 +65,8 @@ its own cgroup, outside tined's.`,
 		"images to keep a template of at the default size, warming it again when it's out of date (empty: none)")
 	f.Float64Var(&opts.vm.OvercommitRatio, "overcommit", opts.vm.OvercommitRatio,
 		"the most guest memory all VMs together may have, as a multiple of the host's memory")
+	f.Float64Var(&opts.vm.CPUOvercommitRatio, "cpu-overcommit", opts.vm.CPUOvercommitRatio,
+		"the most vCPUs all VMs together may have, per host CPU")
 	f.IntVar(&opts.vm.MinFreeMemoryMiB, "min-free-memory-mib", opts.vm.MinFreeMemoryMiB,
 		"host memory, in MiB, that new VMs must leave available")
 	f.IntVar(&opts.vm.MaxForkChildren, "max-fork-children", opts.vm.MaxForkChildren, "the most children one fork may make")

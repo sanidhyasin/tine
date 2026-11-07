@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -360,6 +361,7 @@ func (h *hostOS) hostMemory() (hostMemory, error) {
 	if mem.TotalMiB == 0 {
 		return hostMemory{}, errors.New("no MemTotal in /proc/meminfo")
 	}
+	mem.CPUs = runtime.NumCPU()
 	return mem, nil
 }
 

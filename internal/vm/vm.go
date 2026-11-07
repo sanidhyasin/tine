@@ -119,6 +119,9 @@ type Config struct {
 	// OvercommitRatio bounds the guest memory of all VMs together, as a
 	// multiple of the host's memory (see admission.go).
 	OvercommitRatio float64
+	// CPUOvercommitRatio bounds the vCPUs of all VMs together, as a
+	// multiple of the host's CPUs.
+	CPUOvercommitRatio float64
 	// MinFreeMemoryMiB is the host memory that new VMs must leave available.
 	MinFreeMemoryMiB int
 	// BootUseMiB and RestoreUseMiB are what a new VM is expected to use as it
@@ -170,6 +173,7 @@ func DefaultConfig() Config {
 		MaxSnapshotsPerVM:  16,
 		MaxForkChildren:    100,
 		OvercommitRatio:    4,
+		CPUOvercommitRatio: 8,
 		MinFreeMemoryMiB:   1024,
 		BootUseMiB:         192,
 		RestoreUseMiB:      64,
@@ -212,6 +216,9 @@ func (c Config) withDefaults() Config {
 	setInt(&c.RestoreUseMiB, d.RestoreUseMiB)
 	if c.OvercommitRatio == 0 {
 		c.OvercommitRatio = d.OvercommitRatio
+	}
+	if c.CPUOvercommitRatio == 0 {
+		c.CPUOvercommitRatio = d.CPUOvercommitRatio
 	}
 	setInt(&c.ForkParallelism, d.ForkParallelism)
 	setInt(&c.MinFreeMiB, d.MinFreeMiB)
@@ -268,7 +275,7 @@ type Manager struct {
 	// pins are snapshots that mustn't be collected or deleted yet (see pin).
 	pins map[string]int
 	// Memory held for VMs being made, by admission control.
-	reservedCommitMiB, reservedUseMiB int
+	reservedCommitMiB, reservedUseMiB, reservedVCPUs int
 }
 
 type tracked struct {
@@ -442,7 +449,7 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (state.VM, erro
 	}
 	res := req.admitted
 	if res == nil {
-		if res, err = m.admit(ctx, 1, req.MemoryMiB, m.expectedUseMiB(req.SnapshotID != "")); err != nil {
+		if res, err = m.admit(ctx, 1, req.VCPUs, req.MemoryMiB, m.expectedUseMiB(req.SnapshotID != "")); err != nil {
 			return state.VM{}, err
 		}
 		defer res.release()

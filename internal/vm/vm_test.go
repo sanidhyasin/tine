@@ -145,10 +145,14 @@ func (f *fakeHost) flushSnapshot(string) error { return f.record("flushSnapshot"
 func (f *fakeHost) hostMemory() (hostMemory, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.mem.TotalMiB == 0 {
-		return hostMemory{TotalMiB: 16 << 10, AvailableMiB: 15 << 10}, nil
+	mem := f.mem
+	if mem.TotalMiB == 0 {
+		mem = hostMemory{TotalMiB: 16 << 10, AvailableMiB: 15 << 10}
 	}
-	return f.mem, nil
+	if mem.CPUs == 0 {
+		mem.CPUs = 64
+	}
+	return mem, nil
 }
 func (f *fakeHost) prefetch(path string) error {
 	return f.record("prefetch " + filepath.Base(filepath.Dir(path)))

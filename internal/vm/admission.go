@@ -9,12 +9,17 @@ import (
 	"github.com/sanidhyasin/tine/internal/state"
 )
 
-// ErrNoMemory means the host can't take the VMs asked for without risking
-// running out of memory.
-var ErrNoMemory = errors.New("not enough memory")
+var (
+	// ErrNoMemory means the host can't take the VMs asked for without
+	// risking running out of memory.
+	ErrNoMemory = errors.New("not enough memory")
+	// ErrNoCPU means the VMs asked for would give the host more vCPUs than
+	// it's allowed to run.
+	ErrNoCPU = errors.New("not enough CPU")
+)
 
-// Admission control: before a create or a fork touches the host, two rules
-// must hold for the VMs it would add.
+// Admission control: before a create or a fork touches the host, three
+// rules must hold for the VMs it would add.
 //
 //  1. Commitment. Every live VM's guest memory, plus the new ones', must
 //     stay within OvercommitRatio times the host's memory. VMs rarely use
@@ -23,28 +28,33 @@ var ErrNoMemory = errors.New("not enough memory")
 //     every guest filling its memory at once.
 //  2. Headroom. The memory the host has available now, less what the new
 //     VMs are expected to use straight away, must stay above MinFreeMemoryMiB.
+//  3. vCPUs. Every live VM's vCPUs, plus the new ones', must stay within
+//     CPUOvercommitRatio times the host's CPUs. Idle VMs use little CPU, but
+//     a host can only run so many: under EC2's nested virtualization, KVM
+//     starts failing to enter guests beyond about 60 vCPUs on 4 CPUs.
 //
 // Requests in flight hold a reservation, so two at once can't both take the
 // last room. A request's guest memory leaves its reservation once its VM
 // has a record (which the first rule counts), and its expected use once the
 // VM is made (and shows in the host's available memory).
 
-// hostMemory is the host's memory, in MiB, from /proc/meminfo.
+// hostMemory is the host's memory, in MiB, from /proc/meminfo, and its CPUs.
 type hostMemory struct {
 	TotalMiB, AvailableMiB int
+	CPUs                   int
 }
 
 // reservation is admitted room for some VMs, given back as they're made.
 type reservation struct {
-	m                  *Manager
-	commitMiB, useMiB  int // per VM
-	committed, useLeft int // VMs whose room is still held
-	mu                 sync.Mutex
+	m                        *Manager
+	commitMiB, useMiB, vcpus int // per VM
+	committed, useLeft       int // VMs whose room is still held
+	mu                       sync.Mutex
 }
 
-// admit checks that count VMs of memoryMiB each, each expected to use
-// useMiB at first, fit, and holds their room.
-func (m *Manager) admit(ctx context.Context, count, memoryMiB, useMiB int) (*reservation, error) {
+// admit checks that count VMs of vcpus and memoryMiB each, each expected to
+// use useMiB at first, fit, and holds their room.
+func (m *Manager) admit(ctx context.Context, count, vcpus, memoryMiB, useMiB int) (*reservation, error) {
 	host, err := m.host.hostMemory()
 	if err != nil {
 		return nil, fmt.Errorf("admission: %w", err)
@@ -53,9 +63,10 @@ func (m *Manager) admit(ctx context.Context, count, memoryMiB, useMiB int) (*res
 	if err != nil {
 		return nil, err
 	}
-	committed := 0
+	committed, liveVCPUs := 0, 0
 	for _, vm := range live {
 		committed += vm.MemoryMiB
+		liveVCPUs += vm.VCPUs
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -70,9 +81,16 @@ func (m *Manager) admit(ctx context.Context, count, memoryMiB, useMiB int) (*res
 			"(less %d MiB held for VMs being made), which would leave %d MiB, less than the %d MiB kept free",
 			ErrNoMemory, count, count*useMiB, host.AvailableMiB, m.reservedUseMiB, left, m.cfg.MinFreeMemoryMiB)
 	}
+	cpuLimit := int(m.cfg.CPUOvercommitRatio * float64(host.CPUs))
+	if total := liveVCPUs + m.reservedVCPUs + count*vcpus; total > cpuLimit {
+		return nil, fmt.Errorf("%w: %d more VMs of %d vCPUs would make %d vCPUs, more than the limit of %d "+
+			"(%.0f per host CPU, of %d); the VMs there now have %d",
+			ErrNoCPU, count, vcpus, total, cpuLimit, m.cfg.CPUOvercommitRatio, host.CPUs, liveVCPUs+m.reservedVCPUs)
+	}
 	m.reservedCommitMiB += count * memoryMiB
 	m.reservedUseMiB += count * useMiB
-	return &reservation{m: m, commitMiB: memoryMiB, useMiB: useMiB, committed: count, useLeft: count}, nil
+	m.reservedVCPUs += count * vcpus
+	return &reservation{m: m, commitMiB: memoryMiB, useMiB: useMiB, vcpus: vcpus, committed: count, useLeft: count}, nil
 }
 
 // recorded says one of the reservation's VMs has a record now, which the
@@ -84,6 +102,7 @@ func (r *reservation) recorded() {
 		r.committed--
 		r.m.mu.Lock()
 		r.m.reservedCommitMiB -= r.commitMiB
+		r.m.reservedVCPUs -= r.vcpus
 		r.m.mu.Unlock()
 	}
 }
@@ -108,6 +127,7 @@ func (r *reservation) release() {
 	r.m.mu.Lock()
 	defer r.m.mu.Unlock()
 	r.m.reservedCommitMiB -= r.committed * r.commitMiB
+	r.m.reservedVCPUs -= r.committed * r.vcpus
 	r.m.reservedUseMiB -= r.useLeft * r.useMiB
 	r.committed, r.useLeft = 0, 0
 }

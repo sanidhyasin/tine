@@ -220,6 +220,7 @@ const (
 	CodeIncompatible     = "incompatible" // a snapshot this host can't restore
 	CodeNoSpace          = "no_space"
 	CodeNoMemory         = "no_memory" // admission control: the host is short of memory for more VMs
+	CodeNoCPU            = "no_cpu"    // admission control: more vCPUs than the host may run
 	CodeMethodNotAllowed = "method_not_allowed"
 	CodeInternal         = "internal"
 )
