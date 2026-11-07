@@ -502,6 +502,14 @@ func (m *Manager) Exec(ctx context.Context, id string, req agentproto.ExecReques
 	return m.host.agent(j).Exec(ctx, req, onOutput)
 }
 
+// Images lists the installed images.
+func (m *Manager) Images(context.Context) ([]*image.Image, error) {
+	return image.List(m.cfg.ImagesDir)
+}
+
+// Ping checks the manager can reach its database.
+func (m *Manager) Ping(ctx context.Context) error { return m.store.Ping(ctx) }
+
 // --- helpers ---
 
 // resources works out a VM's network and jail from its record. It's

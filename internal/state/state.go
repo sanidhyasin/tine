@@ -211,3 +211,6 @@ func isConstraint(err error) bool {
 	}
 	return false
 }
+
+// Ping checks the database answers.
+func (s *Store) Ping(ctx context.Context) error { return s.db.PingContext(ctx) }

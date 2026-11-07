@@ -181,13 +181,24 @@ func (c *Client) Exec(ctx context.Context, r ExecRequest, onOutput func(stream s
 	if resp.StatusCode != http.StatusOK {
 		return ExitStatus{}, readError(resp)
 	}
+	st, err := ReadFrames(resp.Body, onOutput)
+	if err != nil {
+		return ExitStatus{}, fmt.Errorf("agent exec: %w", err)
+	}
+	return st, nil
+}
 
-	scanner := bufio.NewScanner(resp.Body)
+// ReadFrames reads an exec stream: it passes output frames to onOutput (if
+// not nil) and returns the exit status from the final frame. A stream that
+// ends without one is ErrIncomplete. tined's API streams exec output in the
+// same format, so its client reads it with this too.
+func ReadFrames(r io.Reader, onOutput func(stream string, data []byte)) (ExitStatus, error) {
+	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 64<<10), maxFrameBytes)
 	for scanner.Scan() {
 		var f Frame
 		if err := json.Unmarshal(scanner.Bytes(), &f); err != nil {
-			return ExitStatus{}, fmt.Errorf("agent exec: bad frame: %w", err)
+			return ExitStatus{}, fmt.Errorf("bad frame: %w", err)
 		}
 		if f.Exit != nil {
 			return *f.Exit, nil
@@ -197,9 +208,9 @@ func (c *Client) Exec(ctx context.Context, r ExecRequest, onOutput func(stream s
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return ExitStatus{}, fmt.Errorf("agent exec: %w: %w", ErrIncomplete, err)
+		return ExitStatus{}, fmt.Errorf("%w: %w", ErrIncomplete, err)
 	}
-	return ExitStatus{}, fmt.Errorf("agent exec: %w", ErrIncomplete)
+	return ExitStatus{}, ErrIncomplete
 }
 
 func readError(resp *http.Response) error {
