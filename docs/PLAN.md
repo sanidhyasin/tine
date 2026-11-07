@@ -517,9 +517,9 @@ vm-7f3k2q9d1a  running
 
 ### Done when
 
-- [ ] `tine fork <vm> -n 10` returns 10 running, isolated children, and the parent keeps running.
-- [ ] Children share memory, and PSS shows it.
-- [ ] Forking past the host's limits fails cleanly instead of taking the server down.
+- [x] `tine fork <vm> -n 10` returns 10 running, isolated children, and the parent keeps running. *`TestFork10`.*
+- [x] Children share memory, and PSS shows it. *30 idle children: RSS 100 MiB each, PSS 14 MiB.*
+- [x] Forking past the host's limits fails cleanly instead of taking the server down. *`TestForkPastTheLimitsIsRefused`, `TestDensity`.*
 
 ### Measure
 
@@ -527,6 +527,16 @@ vm-7f3k2q9d1a  running
 - The parent's pause time.
 - RSS vs. PSS per child.
 - Maximum number of idle children per host.
+
+*Measured with `make measure SECTIONS=fork` on the dev server, forking a fresh 1-vCPU, 256 MiB VM:*
+
+| Children | Total (p50) | Parent paused (p50) | Restoring the children (p50) |
+|---|---|---|---|
+| 1 (n=5) | 136 ms | 62 ms | 72 ms |
+| 10 (n=3) | 397 ms | 62 ms | 333 ms |
+| 30 (n=2) | 1.02 s | 64 ms | 961 ms |
+
+*The parent's pause doesn't grow with the number of children, and children are restored at about 32 ms each, four at a time. A fork of 10 of a 1 GiB, 2-vCPU VM took 868 ms with the parent paused 232 ms (`TestFork10`). Each of 30 idle children had an RSS of 100 MiB and a PSS of 14 MiB: most of its memory is the parent's, shared. The most idle children on this host is 30, set by the vCPU limit, which keeps the host below the ~60 vCPUs where EC2's nested virtualization starts failing guests. Memory isn't the limit: 30 children used 946 MiB of PSS and left 14 GiB available. Forks of 50 and 100 need the bare-metal host of step 4.*
 
 ---
 

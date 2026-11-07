@@ -8,6 +8,9 @@
 #   memory    host memory of idle VMs, booted and from the template      IDLE_VMS (5 of each)
 #   rollback  roll a VM back to a snapshot                               ROLLBACKS (20)
 #   snapshot  snapshot pause and total time at 256 MiB, 1 GiB and 4 GiB   SNAPSHOTS (5 per size)
+#   fork      fork a 1-vCPU, 256 MiB VM into 1, 10 and 30, with each        FORKS (5, 3, 2)
+#             child's RSS and PSS; 30 is the most the dev server's
+#             vCPU limit allows
 #
 # Each section first waits for the disk to settle: a snapshot's memory is
 # written to disk in the background afterwards, and that slows down
@@ -21,7 +24,7 @@
 #   scripts/measure.sh [SECTION...]
 set -euo pipefail
 
-all_sections=(cold template exec memory rollback snapshot)
+all_sections=(cold template exec memory rollback snapshot fork)
 sections=("$@")
 if ((${#sections[@]} == 0)); then
 	sections=("${all_sections[@]}")
@@ -217,6 +220,40 @@ section_snapshot() {
 		row "  waited" "$work/snap-$size-wait"
 	done
 	echo "    (total leaves out the wait for the VM's previous snapshot to reach the disk, shown as waited)"
+}
+
+section_fork() {
+	echo "==> Forking a fresh 1-vCPU, 256 MiB VM into 1, 10 and 30 children (paused = how long the parent was frozen)"
+	local n reps i parent res kids
+	for n in 1 10 30; do
+		case $n in 1) reps=${FORKS:-5} ;; 10) reps=${FORKS:-3} ;; *) reps=${FORKS:-2} ;; esac
+		for ((i = 1; i <= reps; i++)); do
+			quiet
+			create_vm --cold --vcpus 1 --memory 256M
+			parent=$vm_id
+			sleep 3
+			res=$(tine --json fork "$parent" -n "$n" --ttl 30m)
+			kids=$(jq -r '.children[].vm.id // empty' <<<"$res")
+			for k in $kids; do live+=("$k"); done
+			jq -r .timings_ms.total <<<"$res" >>"$work/fork-$n-total"
+			jq -r .timings_ms.paused <<<"$res" >>"$work/fork-$n-paused"
+			jq -r .timings_ms.children <<<"$res" >>"$work/fork-$n-children"
+			if [[ $n == 30 ]]; then
+				sleep 10
+				tine --json ls --tree | jq -r --arg p "$parent" '.[] | select(.parent_id == $p) | .memory | "\(.rss_bytes / 1048576) \(.pss_bytes / 1048576)"' >"$work/fork-mem"
+				awk '{ print $1 }' "$work/fork-mem" >>"$work/fork-rss"
+				awk '{ print $2 }' "$work/fork-mem" >>"$work/fork-pss"
+			fi
+			for k in $kids "$parent"; do destroy_vm "$k"; done
+		done
+		echo "    $n children:"
+		row "  total" "$work/fork-$n-total"
+		row "  paused" "$work/fork-$n-paused"
+		row "  children" "$work/fork-$n-children"
+	done
+	echo "    each of 30 idle children, 10s after the fork:"
+	printf "      %-12s %s\n" "RSS" "$(mib "$work/fork-rss")"
+	printf "      %-12s %s\n" "PSS" "$(mib "$work/fork-pss")"
 }
 
 for s in "${sections[@]}"; do
