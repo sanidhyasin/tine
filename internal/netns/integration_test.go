@@ -57,7 +57,8 @@ func TestManyNetworksLeaveNothingBehind(t *testing.T) {
 		// and is set up. Its state stays DOWN ("NO-CARRIER") until Firecracker
 		// attaches, so check the UP flag rather than the state.
 		tap := run1(t, "ip", "-n", n.Namespace, "-d", "link", "show", TapDevice)
-		for _, want := range []string{"tun type tap", "user " + strconv.Itoa(uid), "group " + strconv.Itoa(uid)} {
+		// Every tap0 has the same MAC, so a restored guest's ARP cache stays right.
+		for _, want := range []string{"tun type tap", "user " + strconv.Itoa(uid), "group " + strconv.Itoa(uid), "link/ether " + strings.ToLower(TapMAC)} {
 			if !strings.Contains(tap, want) {
 				t.Errorf("%s: tap0 details lack %q:\n%s", n.Namespace, want, tap)
 			}

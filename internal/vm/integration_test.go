@@ -5,10 +5,12 @@ package vm
 import (
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -109,6 +111,17 @@ func requireClean(t *testing.T, m *Manager, when string) {
 	}
 }
 
+// execCode runs a command in a VM and returns its output and exit code.
+func execCode(t *testing.T, m *Manager, id string, args ...string) (string, int) {
+	t.Helper()
+	var out strings.Builder
+	st, err := m.Exec(context.Background(), id, agentproto.ExecRequest{Args: args, TimeoutMs: 20_000}, func(_ string, d []byte) { out.Write(d) })
+	if err != nil {
+		t.Fatalf("exec %q in %s: %v", args, id, err)
+	}
+	return out.String(), st.Code
+}
+
 func execOut(t *testing.T, m *Manager, id string, args ...string) string {
 	t.Helper()
 	var out strings.Builder
@@ -206,6 +219,132 @@ func TestRealSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	requireClean(t, m, "after Destroy")
+}
+
+// TestRealRestore restores a real VM from a snapshot, twice, while the
+// original keeps running. Each copy has the snapshot's disk and memory (a
+// process started before the snapshot is still running), its own identity,
+// the right time, and a working network.
+func TestRealRestore(t *testing.T) {
+	m := realManager(t, nil)
+	ctx := context.Background()
+	parent, err := m.Create(ctx, CreateRequest{})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	t.Cleanup(func() { _, _ = m.Destroy(context.Background(), parent.ID) })
+	execOut(t, m, parent.ID, "sh", "-c", "echo before > /root/marker; setsid sleep 100000 >/dev/null 2>&1 < /dev/null & echo $! > /root/sleeper")
+	snap, err := m.Snapshot(ctx, parent.ID)
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	execOut(t, m, parent.ID, "sh", "-c", "echo after > /root/marker")
+	parentMachineID := execOut(t, m, parent.ID, "cat", "/etc/machine-id")
+
+	var children []state.VM
+	for i := range 2 {
+		child, err := m.Create(ctx, CreateRequest{SnapshotID: snap.ID})
+		if err != nil {
+			t.Fatalf("restore %d: %v", i+1, err)
+		}
+		t.Cleanup(func() { _, _ = m.Destroy(context.Background(), child.ID) })
+		children = append(children, child)
+		t.Logf("restore %d: %s", i+1, formatTimings(child.Timings))
+
+		if got := strings.TrimSpace(execOut(t, m, child.ID, "cat", "/root/marker")); got != "before" {
+			t.Errorf("restore %d: /root/marker = %q, want the snapshot's \"before\"", i+1, got)
+		}
+		if out, code := execCode(t, m, child.ID, "sh", "-c", "kill -0 $(cat /root/sleeper)"); code != 0 {
+			t.Errorf("restore %d: the process started before the snapshot isn't running: %q", i+1, out)
+		}
+		if got := strings.TrimSpace(execOut(t, m, child.ID, "hostname")); got != child.ID {
+			t.Errorf("restore %d: hostname = %q, want %s", i+1, got, child.ID)
+		}
+		if got := execOut(t, m, child.ID, "cat", "/etc/machine-id"); got == parentMachineID {
+			t.Errorf("restore %d has its parent's machine ID", i+1)
+		}
+		guest, err := strconv.ParseFloat(strings.TrimSpace(execOut(t, m, child.ID, "date", "+%s.%N")), 64)
+		if host := float64(time.Now().UnixNano()) / 1e9; err != nil || math.Abs(host-guest) > 1 {
+			t.Errorf("restore %d: guest clock %f, host %f (%v)", i+1, guest, host, err)
+		}
+		// Straight away, without waiting for the guest's ARP cache to expire.
+		if out, code := execCode(t, m, child.ID, "timeout", "5", "bash", "-c", "echo > /dev/tcp/1.1.1.1/443"); code != 0 {
+			t.Errorf("restore %d can't reach the internet: exit %d %q", i+1, code, out)
+		}
+	}
+	// Two restores of one snapshot don't share random numbers.
+	a := execOut(t, m, children[0].ID, "head", "-c", "16", "/dev/urandom")
+	b := execOut(t, m, children[1].ID, "head", "-c", "16", "/dev/urandom")
+	if a == b {
+		t.Error("two restores read the same random bytes")
+	}
+	// The original still runs, with its own disk.
+	if got := strings.TrimSpace(execOut(t, m, parent.ID, "cat", "/root/marker")); got != "after" {
+		t.Errorf("parent's /root/marker = %q", got)
+	}
+	events, _ := m.store.Events(ctx, children[0].ID)
+	for _, e := range events {
+		if strings.HasPrefix(e.Detail, "guest synced") {
+			t.Logf("restore 1: %s", e.Detail)
+		}
+	}
+	for _, vm := range append(children, parent) {
+		if _, err := m.Destroy(ctx, vm.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	requireClean(t, m, "after destroying them all")
+}
+
+// TestRealRestoreClock compares a restore with and without Firecracker's
+// clock_realtime, 3 seconds after the snapshot: how far behind the guest's
+// clock is before tined sets it, and whether its uptime (monotonic clock)
+// jumped.
+func TestRealRestoreClock(t *testing.T) {
+	for _, realtime := range []bool{false, true} {
+		t.Run(fmt.Sprintf("clock_realtime=%v", realtime), func(t *testing.T) {
+			m := realManager(t, func(c *Config) { c.ClockRealtime = realtime })
+			ctx := context.Background()
+			parent, err := m.Create(ctx, CreateRequest{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			snap, err := m.Snapshot(ctx, parent.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			uptimeAtSnapshot := uptime(t, m, parent.ID)
+			if _, err := m.Destroy(ctx, parent.ID); err != nil {
+				t.Fatal(err)
+			}
+			time.Sleep(3 * time.Second)
+			child, err := m.Create(ctx, CreateRequest{SnapshotID: snap.ID})
+			if err != nil {
+				t.Fatal(err)
+			}
+			jump := uptime(t, m, child.ID) - uptimeAtSnapshot
+			events, _ := m.store.Events(ctx, child.ID)
+			for _, e := range events {
+				if strings.HasPrefix(e.Detail, "guest synced") {
+					t.Logf("%s; uptime moved %.1fs across the 3s gap", e.Detail, jump)
+				}
+			}
+			if _, err := m.Destroy(ctx, child.ID); err != nil {
+				t.Fatal(err)
+			}
+			requireClean(t, m, "after the test")
+		})
+	}
+}
+
+func uptime(t *testing.T, m *Manager, id string) float64 {
+	t.Helper()
+	f := strings.Fields(execOut(t, m, id, "cat", "/proc/uptime"))
+	v, err := strconv.ParseFloat(f[0], 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return v
 }
 
 func TestRealParallelCreates(t *testing.T) {

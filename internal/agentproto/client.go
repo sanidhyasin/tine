@@ -156,6 +156,33 @@ func (c *Client) WaitHealthy(ctx context.Context, interval time.Duration) (Healt
 	}
 }
 
+// Sync makes the guest current and unique: its clock, entropy, hostname
+// and machine ID (see SyncRequest).
+func (c *Client) Sync(ctx context.Context, r SyncRequest) (SyncResult, error) {
+	var res SyncResult
+	body, err := json.Marshal(r)
+	if err != nil {
+		return res, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://agent/sync", bytes.NewReader(body))
+	if err != nil {
+		return res, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return res, fmt.Errorf("agent sync: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return res, readError(resp)
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxErrorBodyBytes)).Decode(&res); err != nil {
+		return res, fmt.Errorf("agent sync: decode: %w", err)
+	}
+	return res, nil
+}
+
 // Exec runs a command in the VM. onOutput, if not nil, receives output as it
 // arrives, on the calling goroutine. Exec returns once the command has
 // finished. Cancelling ctx makes the agent kill the command.

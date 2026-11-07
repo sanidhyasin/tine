@@ -53,6 +53,12 @@ const (
 	// GuestMAC is the guest's MAC address. Firecracker's CI images also derive
 	// their IP from it, and 06:00:AC:10:00:02 means 172.16.0.2.
 	GuestMAC = "06:00:AC:10:00:02"
+	// TapMAC is tap0's MAC address, the guest's gateway: the same in every
+	// namespace. A guest restored from a snapshot still has the gateway's
+	// address in its ARP cache. If the new tap0 had a different one, the
+	// guest would send its traffic to a MAC nothing answers to, until that
+	// cache entry expired.
+	TapMAC = "06:00:AC:10:00:01"
 )
 
 var (

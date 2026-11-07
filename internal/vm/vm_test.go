@@ -44,6 +44,9 @@ type fakeHost struct {
 	isPaused map[string]bool
 	// holds make a step wait, once reached, until released (see holdAt).
 	holds map[string]*hold
+	// thisHost, if set, is what hostInfo reports instead of fakeSnapshotHost.
+	thisHost *snapshot.Host
+	lastSync agentproto.SyncRequest
 }
 
 type hold struct {
@@ -117,6 +120,21 @@ func (f *fakeHost) collectSnapshot(_ *jailer.Jail, b *snapshot.Building) error {
 	return nil
 }
 func (f *fakeHost) flushSnapshot(string) error { return f.record("flushSnapshot") }
+func (f *fakeHost) hostInfo(context.Context) (snapshot.Host, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.thisHost != nil {
+		return *f.thisHost, nil
+	}
+	return fakeSnapshotHost, nil
+}
+func (f *fakeHost) loadSnapshot(context.Context, *jailer.Jail) error { return f.record("loadSnapshot") }
+func (f *fakeHost) syncGuest(_ context.Context, _ *jailer.Jail, req agentproto.SyncRequest) (agentproto.SyncResult, error) {
+	f.mu.Lock()
+	f.lastSync = req
+	f.mu.Unlock()
+	return agentproto.SyncResult{}, f.record("syncGuest")
+}
 func (f *fakeHost) describeHost(context.Context, *jailer.Jail) (snapshot.Host, error) {
 	return fakeSnapshotHost, f.record("describeHost")
 }
@@ -286,6 +304,9 @@ func eventSummary(t *testing.T, s *state.Store, id string) string {
 	}
 	var parts []string
 	for _, e := range events {
+		if e.From != "" && e.From == e.To {
+			continue // a note, not a state change
+		}
 		parts = append(parts, string(e.To))
 	}
 	return strings.Join(parts, " > ")
@@ -310,7 +331,7 @@ func TestCreateRunsEveryStepInOrder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	if got, want := strings.Join(f.host.takeCalls(), ","), "createNetwork,prepareJail,startFirecracker,configureAndBoot,waitAgent"; got != want {
+	if got, want := strings.Join(f.host.takeCalls(), ","), "createNetwork,prepareJail,startFirecracker,configureAndBoot,waitAgent,syncGuest"; got != want {
 		t.Errorf("host calls:\n got %s\nwant %s", got, want)
 	}
 	if vm.State != state.StateRunning || vm.PID == 0 || vm.Image != "base" || vm.VCPUs != 2 || vm.MemoryMiB != 1024 {
@@ -345,6 +366,7 @@ func TestCreateUndoesWhenAStepFails(t *testing.T) {
 		{"startFirecracker", "createNetwork,prepareJail,startFirecracker,cleanupJail,destroyNetwork"},
 		{"configureAndBoot", "createNetwork,prepareJail,startFirecracker,configureAndBoot,kill,cleanupJail,destroyNetwork"},
 		{"waitAgent", "createNetwork,prepareJail,startFirecracker,configureAndBoot,waitAgent,kill,cleanupJail,destroyNetwork"},
+		{"syncGuest", "createNetwork,prepareJail,startFirecracker,configureAndBoot,waitAgent,syncGuest,kill,cleanupJail,destroyNetwork"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.failAt, func(t *testing.T) {

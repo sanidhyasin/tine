@@ -19,8 +19,8 @@ const (
 	// Port is the vsock port tine-agent listens on.
 	Port = 1024
 	// Version is the protocol version. It changes when either side would
-	// misunderstand the other.
-	Version = 1
+	// misunderstand the other. Version 2 added /sync.
+	Version = 2
 
 	// StreamStdout and StreamStderr name a Frame's output stream.
 	StreamStdout = "stdout"
@@ -99,12 +99,42 @@ type ErrorDetail struct {
 	Message string `json:"message"`
 }
 
+// SyncRequest makes a guest current and unique after it's restored from a
+// snapshot, or booted (POST /sync). A restored guest's clock is stuck at the
+// moment of the snapshot, and its identity and kernel random state are the
+// snapshot's. Every field is optional.
+type SyncRequest struct {
+	// TimeUnixNano is the host's wall-clock time as it sent the request. The
+	// guest's clock is set to it.
+	TimeUnixNano int64 `json:"time_unix_nano,omitempty"`
+	// Entropy is random bytes from the host. They're added to the guest
+	// kernel's entropy pool, and the kernel's generator is reseeded, so two
+	// guests restored from one snapshot don't produce the same numbers.
+	Entropy []byte `json:"entropy,omitempty"`
+	// Hostname becomes the guest's hostname: in the kernel, /etc/hostname and
+	// /etc/hosts.
+	Hostname string `json:"hostname,omitempty"`
+	// MachineID becomes /etc/machine-id: 32 lowercase hexadecimal characters.
+	MachineID string `json:"machine_id,omitempty"`
+}
+
+// SyncResult says what /sync did.
+type SyncResult struct {
+	// ClockOffsetMs is how far the guest's clock was from the host's before
+	// it was set: negative means it was behind.
+	ClockOffsetMs float64 `json:"clock_offset_ms"`
+	// DurationMs is how long the agent took, as measured inside the guest.
+	DurationMs float64 `json:"duration_ms"`
+}
+
 // Error codes.
 const (
 	// CodeBadRequest: the request was malformed, e.g. no Args.
 	CodeBadRequest = "bad_request"
 	// CodeStartFailed: the command couldn't start, e.g. it doesn't exist.
 	CodeStartFailed = "start_failed"
+	// CodeSyncFailed: /sync couldn't change something it was asked to.
+	CodeSyncFailed = "sync_failed"
 	// CodeNotFound and CodeMethodNotAllowed: unknown path or method.
 	CodeNotFound         = "not_found"
 	CodeMethodNotAllowed = "method_not_allowed"

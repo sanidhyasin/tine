@@ -103,6 +103,11 @@ type Config struct {
 	BootArgs string
 	// AgentTimeout is how long a new VM's agent gets to answer.
 	AgentTimeout time.Duration
+	// ClockRealtime has Firecracker advance a restored guest's clock by the
+	// time since its snapshot (KVM_CLOCK_REALTIME). The agent sets the clock
+	// either way; this also moves the guest's monotonic clock, which
+	// Firecracker warns can surprise programs in the guest.
+	ClockRealtime bool
 	// ReaperInterval is how often expired VMs are looked for.
 	ReaperInterval time.Duration
 	// DestroyedRetention is how long destroyed VMs' records are kept.
@@ -295,9 +300,24 @@ type CreateRequest struct {
 	MemoryMiB int
 	// TTL is how long the VM lives before the reaper destroys it.
 	TTL time.Duration
+	// SnapshotID, if set, restores the VM from that snapshot instead of
+	// booting it. The VM has the snapshot's image and size.
+	SnapshotID string
 }
 
-func (m *Manager) normalize(req CreateRequest) (CreateRequest, error) {
+func (m *Manager) normalize(ctx context.Context, req CreateRequest) (CreateRequest, error) {
+	if req.SnapshotID != "" {
+		snap, err := m.store.GetSnapshot(ctx, req.SnapshotID)
+		if err != nil {
+			return req, err
+		}
+		if (req.Image != "" && req.Image != snap.Image) || (req.VCPUs != 0 && req.VCPUs != snap.VCPUs) ||
+			(req.MemoryMiB != 0 && req.MemoryMiB != snap.MemoryMiB) {
+			return req, fmt.Errorf("%w: a VM restored from %s has its image and size (%s, %d vCPUs, %d MiB)",
+				ErrInvalidRequest, snap.ID, snap.Image, snap.VCPUs, snap.MemoryMiB)
+		}
+		req.Image, req.VCPUs, req.MemoryMiB = snap.Image, snap.VCPUs, snap.MemoryMiB
+	}
 	if req.Image == "" {
 		req.Image = "base"
 	}
@@ -321,16 +341,23 @@ func (m *Manager) normalize(req CreateRequest) (CreateRequest, error) {
 	return req, nil
 }
 
-// Create starts a VM and waits until its agent answers. On failure it
-// undoes everything it did (see the package doc) and returns the error.
+// Create starts a VM, by booting it or restoring it from a snapshot, waits
+// until its agent answers, and syncs the guest (clock, entropy, hostname,
+// machine ID). On failure it undoes everything it did (see the package doc)
+// and returns the error.
 func (m *Manager) Create(ctx context.Context, req CreateRequest) (state.VM, error) {
 	t := newTimer()
-	req, err := m.normalize(req)
+	req, err := m.normalize(ctx, req)
 	if err != nil {
 		return state.VM{}, err
 	}
 	if _, err := image.Open(m.cfg.ImagesDir, req.Image); err != nil {
 		return state.VM{}, fmt.Errorf("%w: %s: %w", ErrImageNotFound, req.Image, err)
+	}
+	if req.SnapshotID != "" {
+		if err := m.checkRestorable(ctx, req.SnapshotID); err != nil {
+			return state.VM{}, err
+		}
 	}
 	live, err := m.store.ListVMs(ctx, state.ListOptions{})
 	if err != nil {
@@ -343,9 +370,11 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (state.VM, erro
 	if err != nil {
 		return state.VM{}, fmt.Errorf("%w: %w", ErrCapacity, err)
 	}
+	// With a SnapshotID, this also claims the snapshot: it can't be deleted
+	// from now on, while the VM lives.
 	vm, err := m.store.CreateVM(ctx, state.VM{
 		ID: newID(), Image: req.Image, VCPUs: req.VCPUs, MemoryMiB: req.MemoryMiB,
-		Slot: slot, UID: m.cfg.UIDBase + slot, ExpiresAt: time.Now().Add(req.TTL),
+		Slot: slot, UID: m.cfg.UIDBase + slot, ExpiresAt: time.Now().Add(req.TTL), SnapshotID: req.SnapshotID,
 	})
 	if err != nil {
 		m.slots.Release(slot)
@@ -422,10 +451,17 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (state.VM, erro
 	undo = append(undo, func() error { return m.stopOwned(vm.ID, tr) })
 	t.mark("start")
 
-	if err := m.host.configureAndBoot(ctx, j, m.bootSpec(vm)); err != nil {
-		return fail("boot", err)
+	if vm.SnapshotID != "" {
+		if err := m.host.loadSnapshot(ctx, j); err != nil {
+			return fail("restore", err)
+		}
+		t.mark("restore")
+	} else {
+		if err := m.host.configureAndBoot(ctx, j, m.bootSpec(vm)); err != nil {
+			return fail("boot", err)
+		}
+		t.mark("configure")
 	}
-	t.mark("configure")
 
 	agentCtx, agentCancel := context.WithTimeout(ctx, m.cfg.AgentTimeout)
 	err = m.host.waitAgent(agentCtx, j)
@@ -434,6 +470,11 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (state.VM, erro
 		return fail("agent", err)
 	}
 	t.mark("agent")
+
+	if err := m.sync(ctx, vm, j); err != nil {
+		return fail("sync", err)
+	}
+	t.mark("sync")
 
 	vm, err = m.store.UpdateVM(ctx, vm.ID, "agent is ready", func(v *state.VM) error {
 		v.State = state.StateRunning
@@ -444,8 +485,8 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (state.VM, erro
 	if err != nil {
 		return fail("record", err)
 	}
-	log.InfoContext(ctx, "created", "timings_ms", vm.Timings)
-	m.cfg.Metrics.CreateSucceeded(vm.Timings)
+	log.InfoContext(ctx, "created", "from", createSource(vm), "timings_ms", vm.Timings)
+	m.cfg.Metrics.CreateSucceeded(createSource(vm), vm.Timings)
 	return vm, nil
 }
 
@@ -591,16 +632,27 @@ func (m *Manager) resources(vm state.VM) (netns.Network, *jailer.Jail, error) {
 		return netns.Network{}, nil, err
 	}
 	imgDir := filepath.Join(m.cfg.ImagesDir, vm.Image)
+	files := []jailer.File{
+		{Source: filepath.Join(imgDir, image.KernelFile), Target: kernelPath, Mode: jailer.Link},
+		{Source: filepath.Join(imgDir, image.RootfsFile), Target: rootfsPath, Mode: jailer.Clone},
+	}
+	if vm.SnapshotID != "" {
+		// The snapshot's state and memory, which the VM reads but never
+		// changes, and its own copy of the snapshot's disk, at the path the
+		// snapshotted VM had it. The kernel is in the memory already.
+		files = []jailer.File{
+			{Source: m.snaps.Path(vm.SnapshotID, snapshot.StateFile), Target: restoreStatePath, Mode: jailer.Link},
+			{Source: m.snaps.Path(vm.SnapshotID, snapshot.MemoryFile), Target: restoreMemPath, Mode: jailer.Link},
+			{Source: m.snaps.Path(vm.SnapshotID, snapshot.DiskFile), Target: rootfsPath, Mode: jailer.Clone},
+		}
+	}
 	j, err := jailer.New(m.cfg.jailerConfig(), jailer.Spec{
-		ID:     vm.ID,
-		UID:    vm.UID,
-		GID:    vm.UID,
-		NetNS:  n.NamespacePath(),
-		Limits: jailer.Limits{VCPUs: vm.VCPUs, MemoryBytes: memoryLimit(vm.MemoryMiB, m.cfg.MemoryOverheadMiB), MaxPIDs: m.cfg.MaxPIDs},
-		Files: []jailer.File{
-			{Source: filepath.Join(imgDir, image.KernelFile), Target: kernelPath, Mode: jailer.Link},
-			{Source: filepath.Join(imgDir, image.RootfsFile), Target: rootfsPath, Mode: jailer.Clone},
-		},
+		ID:              vm.ID,
+		UID:             vm.UID,
+		GID:             vm.UID,
+		NetNS:           n.NamespacePath(),
+		Limits:          jailer.Limits{VCPUs: vm.VCPUs, MemoryBytes: memoryLimit(vm.MemoryMiB, m.cfg.MemoryOverheadMiB), MaxPIDs: m.cfg.MaxPIDs},
+		Files:           files,
 		FirecrackerArgs: []string{"--enable-pci"},
 	})
 	return n, j, err

@@ -7,10 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/sanidhyasin/tine/internal/agentproto"
@@ -54,6 +56,14 @@ type host interface {
 	// flushSnapshot writes a snapshot file that's still in the page cache
 	// out to disk.
 	flushSnapshot(path string) error
+	// hostInfo says what this host can restore: the Firecracker that new VMs
+	// run, and this host's CPU and kernel.
+	hostInfo(ctx context.Context) (snapshot.Host, error)
+	// loadSnapshot has a new Firecracker load the snapshot in the VM's jail
+	// (restoreStatePath, restoreMemPath) and resume it.
+	loadSnapshot(ctx context.Context, j *jailer.Jail) error
+	// syncGuest makes the guest current and unique, through its agent.
+	syncGuest(ctx context.Context, j *jailer.Jail, req agentproto.SyncRequest) (agentproto.SyncResult, error)
 	// describeHost says what a snapshot of the VM would depend on: its
 	// Firecracker version, and this host's CPU and kernel.
 	describeHost(ctx context.Context, j *jailer.Jail) (snapshot.Host, error)
@@ -88,7 +98,13 @@ type bootSpec struct {
 }
 
 // hostOS is the real host.
-type hostOS struct{ cfg Config }
+type hostOS struct {
+	cfg Config
+
+	mu      sync.Mutex
+	fcInfo  snapshot.Host // what hostInfo found last time
+	fcStamp string        // the Firecracker binary's size and mtime then
+}
 
 func (h *hostOS) setup(ctx context.Context) error {
 	if err := h.cfg.jailerConfig().EnsureCgroupParent(); err != nil {
@@ -234,6 +250,73 @@ func (h *hostOS) flushSnapshot(path string) error {
 		err = closeErr
 	}
 	return err
+}
+
+func (h *hostOS) hostInfo(ctx context.Context) (snapshot.Host, error) {
+	fi, err := os.Stat(h.cfg.FirecrackerBin)
+	if err != nil {
+		return snapshot.Host{}, err
+	}
+	// Asking the binary takes a few milliseconds; do it again only if it changed.
+	stamp := fmt.Sprintf("%d %d", fi.Size(), fi.ModTime().UnixNano())
+	h.mu.Lock()
+	if h.fcStamp == stamp {
+		info := h.fcInfo
+		h.mu.Unlock()
+		return info, nil
+	}
+	h.mu.Unlock()
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, h.cfg.FirecrackerBin, "--version").Output() //nolint:gosec // tined's configured Firecracker
+	if err != nil {
+		return snapshot.Host{}, fmt.Errorf("%s --version: %w", h.cfg.FirecrackerBin, err)
+	}
+	// The first line is "Firecracker v1.17.0"; GET /version says "1.17.0".
+	first, _, _ := strings.Cut(string(out), "\n")
+	version := strings.TrimPrefix(strings.TrimSpace(strings.TrimPrefix(first, "Firecracker")), "v")
+	if version == "" {
+		return snapshot.Host{}, fmt.Errorf("%s --version: no version in %q", h.cfg.FirecrackerBin, first)
+	}
+	info, err := snapshot.ThisHost(version)
+	if err != nil {
+		return snapshot.Host{}, err
+	}
+	h.mu.Lock()
+	h.fcInfo, h.fcStamp = info, stamp
+	h.mu.Unlock()
+	return info, nil
+}
+
+func (h *hostOS) loadSnapshot(ctx context.Context, j *jailer.Jail) error {
+	c := h.firecracker(j)
+	readyCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if err := c.WaitReady(readyCtx, 2*time.Millisecond); err != nil {
+		return err
+	}
+	// Only the logger and metrics may be set up before a load.
+	if err := c.PutLogger(ctx, firecracker.Logger{LogPath: firecrackerLogPath, Level: firecracker.LogLevelInfo}); err != nil {
+		return fmt.Errorf("logger: %w", err)
+	}
+	if err := c.LoadSnapshot(ctx, firecracker.SnapshotLoad{
+		SnapshotPath:  restoreStatePath,
+		MemBackend:    firecracker.MemoryBackend{BackendType: firecracker.MemoryBackendFile, BackendPath: restoreMemPath},
+		ResumeVM:      true,
+		ClockRealtime: h.cfg.ClockRealtime,
+	}); err != nil {
+		return fmt.Errorf("load: %w", err)
+	}
+	return nil
+}
+
+func (h *hostOS) syncGuest(ctx context.Context, j *jailer.Jail, req agentproto.SyncRequest) (agentproto.SyncResult, error) {
+	res, err := h.agent(j).Sync(ctx, req)
+	var ae *agentproto.Error
+	if errors.As(err, &ae) && ae.StatusCode == http.StatusNotFound {
+		return res, fmt.Errorf("the image's tine-agent is too old to sync the guest; import the image again: %w", err)
+	}
+	return res, err
 }
 
 func (h *hostOS) describeHost(ctx context.Context, j *jailer.Jail) (snapshot.Host, error) {

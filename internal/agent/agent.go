@@ -64,6 +64,8 @@ type Config struct {
 	// Logger receives one line per command (its name, never its arguments,
 	// which can hold secrets) and any serving errors. Default: discard.
 	Logger *slog.Logger
+	// System changes the guest for /sync. Default: the real one (Linux only).
+	System System
 }
 
 // Server serves the agent protocol.
@@ -85,6 +87,9 @@ func New(cfg Config) *Server {
 	if log == nil {
 		log = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
+	if cfg.System == nil {
+		cfg.System = OSSystem{Root: "/"}
+	}
 	return &Server{cfg: cfg, log: log, started: time.Now()}
 }
 
@@ -102,6 +107,11 @@ func (s *Server) Handler() http.Handler {
 				return
 			}
 			s.handleExec(w, r)
+		case "/sync":
+			if !allowMethod(w, r, http.MethodPost) {
+				return
+			}
+			s.handleSync(w, r)
 		default:
 			writeError(w, http.StatusNotFound, agentproto.CodeNotFound, "no such endpoint: "+r.URL.Path)
 		}

@@ -105,6 +105,9 @@ func Create(ctx context.Context, n Network, owner Owner) (err error) {
 		if err := netlink.LinkAdd(tap); err != nil {
 			return fmt.Errorf("tap %s: %w", TapDevice, err)
 		}
+		if err := setMAC(TapDevice, TapMAC); err != nil {
+			return fmt.Errorf("tap %s: %w", TapDevice, err)
+		}
 		if err := configureLink(TapDevice, netip.PrefixFrom(GatewayIP, 30)); err != nil {
 			return fmt.Errorf("tap %s: %w", TapDevice, err)
 		}
@@ -208,6 +211,19 @@ func DeleteVeth(name string) error {
 		return err
 	}
 	return netlink.LinkDel(link)
+}
+
+// setMAC gives a link a fixed MAC address.
+func setMAC(name, mac string) error {
+	addr, err := net.ParseMAC(mac)
+	if err != nil {
+		return err
+	}
+	link, err := netlink.LinkByName(name)
+	if err != nil {
+		return err
+	}
+	return netlink.LinkSetHardwareAddr(link, addr)
 }
 
 // configureLink adds addr to the named link (unless addr is the zero

@@ -26,6 +26,14 @@ const (
 	snapshotMemPath   = snapshotDir + "/" + snapshot.MemoryFile
 )
 
+// Where a VM restored from a snapshot finds the snapshot's state and memory,
+// inside its jail: hard links to the files in the snapshot store.
+const (
+	restoreDir       = "/restore"
+	restoreStatePath = restoreDir + "/" + snapshot.StateFile
+	restoreMemPath   = restoreDir + "/" + snapshot.MemoryFile
+)
+
 // snapshotTimeout bounds a whole snapshot. Writing a large VM's memory is
 // the slow part.
 const snapshotTimeout = 5 * time.Minute

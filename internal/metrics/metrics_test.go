@@ -16,7 +16,8 @@ import (
 
 func TestRecordsAndExposition(t *testing.T) {
 	m := New("v-test")
-	m.CreateSucceeded(map[string]float64{"network": 5.1, "agent": 1800, "total": 1850})
+	m.CreateSucceeded("cold", map[string]float64{"network": 5.1, "agent": 1800, "total": 1850})
+	m.CreateSucceeded("snapshot", map[string]float64{"restore": 9.5, "agent": 2, "total": 40})
 	m.CreateFailed("agent")
 	m.Destroyed(30*time.Millisecond, nil)
 	m.Destroyed(time.Second, errors.New("busy"))
@@ -32,7 +33,7 @@ func TestRecordsAndExposition(t *testing.T) {
 	})
 
 	checks := map[string]float64{
-		`tine_vm_creates_total{result="ok"}`:                                1,
+		`tine_vm_creates_total{result="ok"}`:                                2,
 		`tine_vm_creates_total{result="failed"}`:                            1,
 		`tine_vm_create_failures_total{stage="agent"}`:                      1,
 		`tine_vm_destroys_total{result="failed"}`:                           1,
@@ -49,8 +50,10 @@ func TestRecordsAndExposition(t *testing.T) {
 		}
 	}
 	for _, want := range []string{
-		`tine_vm_create_stage_seconds_count{stage="boot"} 1`, // "agent" is shown as "boot"
-		`tine_vm_create_stage_seconds_count{stage="network"} 1`,
+		`tine_vm_create_stage_seconds_count{source="cold",stage="boot"} 1`, // "agent" is shown as "boot"
+		`tine_vm_create_stage_seconds_count{source="cold",stage="network"} 1`,
+		`tine_vm_create_stage_seconds_count{source="snapshot",stage="agent"} 1`, // but not after a restore
+		`tine_vm_create_stage_seconds_count{source="snapshot",stage="restore"} 1`,
 		`tine_vm_destroy_seconds_count 1`, // only successful destroys are timed
 		`tine_vms{state="running"} 3`,
 		`tine_vms{state="failed"} 0`, // every state appears, even at 0
@@ -68,16 +71,16 @@ func TestRecordsAndExposition(t *testing.T) {
 
 func TestStageTimingsLandInTheRightBuckets(t *testing.T) {
 	m := New("v")
-	m.CreateSucceeded(map[string]float64{"total": 1850})
+	m.CreateSucceeded("cold", map[string]float64{"total": 1850})
 	if got := testutil.CollectAndCount(m.createStage); got != 1 {
 		t.Fatalf("%d series, want 1", got)
 	}
 	body := scrape(t, m)
 	// 1.85s is above the 0.95s bucket and within the 2.4s one.
 	for _, want := range []string{
-		`tine_vm_create_stage_seconds_bucket{stage="total",le="0.95367431640625"} 0`,
-		`tine_vm_create_stage_seconds_bucket{stage="total",le="2.384185791015625"} 1`,
-		`tine_vm_create_stage_seconds_sum{stage="total"} 1.85`,
+		`tine_vm_create_stage_seconds_bucket{source="cold",stage="total",le="0.95367431640625"} 0`,
+		`tine_vm_create_stage_seconds_bucket{source="cold",stage="total",le="2.384185791015625"} 1`,
+		`tine_vm_create_stage_seconds_sum{source="cold",stage="total"} 1.85`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("exposition lacks %q", want)
@@ -97,7 +100,7 @@ func TestVMStateErrorsShowInTheScrape(t *testing.T) {
 
 func TestNilMetricsDoNothing(t *testing.T) {
 	var m *Metrics
-	m.CreateSucceeded(map[string]float64{"total": 1})
+	m.CreateSucceeded("cold", map[string]float64{"total": 1})
 	m.CreateFailed("x")
 	m.Destroyed(0, nil)
 	m.Exec(0, nil)

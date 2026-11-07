@@ -59,8 +59,8 @@ func New(version string) *Metrics {
 	m := &Metrics{
 		registry: reg,
 		createStage: f.histogramVec("vm_create_stage_seconds",
-			"How long each stage of creating a VM took: allocate, network, jail, start, configure, boot, and the total.",
-			operationBuckets, "stage"),
+			"How long each stage of creating a VM took, by how it started: cold (booted) or snapshot (restored).",
+			operationBuckets, "source", "stage"),
 		creates:        f.counterVec("vm_creates_total", "VM creates, by result (ok or failed).", "result"),
 		createFailures: f.counterVec("vm_create_failures_total", "Failed VM creates, by the stage that failed.", "stage"),
 		destroySeconds: f.histogram("vm_destroy_seconds", "How long destroying a VM took.", operationBuckets),
@@ -122,16 +122,17 @@ func (m *Metrics) WatchVMStates(states []string, count func() (map[string]int, e
 }
 
 // CreateSucceeded records a create and its stage timings, in milliseconds.
-func (m *Metrics) CreateSucceeded(timingsMs map[string]float64) {
+// source is how the VM started: "cold" (booted) or "snapshot" (restored).
+func (m *Metrics) CreateSucceeded(source string, timingsMs map[string]float64) {
 	if m == nil {
 		return
 	}
 	m.creates.WithLabelValues("ok").Inc()
 	for stage, ms := range timingsMs {
-		if stage == "agent" {
-			stage = "boot" // waiting for the agent is the guest booting
+		if stage == "agent" && source == "cold" {
+			stage = "boot" // after a cold start, waiting for the agent is the guest booting
 		}
-		m.createStage.WithLabelValues(stage).Observe(ms / 1000)
+		m.createStage.WithLabelValues(source, stage).Observe(ms / 1000)
 	}
 }
 
