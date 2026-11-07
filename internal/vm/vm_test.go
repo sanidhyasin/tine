@@ -22,6 +22,7 @@ import (
 	"github.com/sanidhyasin/tine/internal/jailer"
 	"github.com/sanidhyasin/tine/internal/metrics"
 	"github.com/sanidhyasin/tine/internal/netns"
+	"github.com/sanidhyasin/tine/internal/snapshot"
 	"github.com/sanidhyasin/tine/internal/state"
 )
 
@@ -39,15 +40,99 @@ type fakeHost struct {
 	// For Reconcile: VMs whose Firecracker isn't running, and what the host holds.
 	dead map[string]bool
 	inv  inventory
+	// isPaused is which VMs' Firecrackers have them paused.
+	isPaused map[string]bool
+	// holds make a step wait, once reached, until released (see holdAt).
+	holds map[string]*hold
 }
 
-func newFakeHost() *fakeHost { return &fakeHost{failAt: map[string]error{}, nextPID: 1000} }
+type hold struct {
+	reached, release chan struct{}
+	once             sync.Once
+}
+
+// holdAt makes the next call to op wait until release is called. reached
+// is closed once op has been called.
+func (f *fakeHost) holdAt(op string) (reached <-chan struct{}, release func()) {
+	h := &hold{reached: make(chan struct{}), release: make(chan struct{})}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.holds == nil {
+		f.holds = map[string]*hold{}
+	}
+	f.holds[op] = h
+	var once sync.Once
+	return h.reached, func() { once.Do(func() { close(h.release) }) }
+}
+
+func newFakeHost() *fakeHost {
+	return &fakeHost{failAt: map[string]error{}, nextPID: 1000, isPaused: map[string]bool{}}
+}
+
+// fakeSnapshotHost is what describeHost reports.
+var fakeSnapshotHost = snapshot.Host{Firecracker: "1.17.0", CPU: "Fake CPU", Kernel: "6.8.0-test"}
+
+func (f *fakeHost) prepareSnapshot(*jailer.Jail) error { return f.record("prepareSnapshot") }
+func (f *fakeHost) pause(_ context.Context, j *jailer.Jail) error {
+	if err := f.record("pause"); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.isPaused[j.ID] = true
+	return nil
+}
+func (f *fakeHost) resume(_ context.Context, j *jailer.Jail) error {
+	if err := f.record("resume"); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.isPaused, j.ID)
+	return nil
+}
+func (f *fakeHost) paused(_ context.Context, j *jailer.Jail) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.isPaused[j.ID], nil
+}
+func (f *fakeHost) writeSnapshot(context.Context, *jailer.Jail) error {
+	return f.record("writeSnapshot")
+}
+func (f *fakeHost) cloneDisk(_ *jailer.Jail, dst string) error {
+	if err := f.record("cloneDisk"); err != nil {
+		return err
+	}
+	return os.WriteFile(dst, []byte("disk"), 0o600)
+}
+func (f *fakeHost) collectSnapshot(_ *jailer.Jail, b *snapshot.Building) error {
+	if err := f.record("collectSnapshot"); err != nil {
+		return err
+	}
+	for _, file := range []string{snapshot.StateFile, snapshot.MemoryFile} {
+		if err := os.WriteFile(b.Path(file), []byte(file), 0o600); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+func (f *fakeHost) flushSnapshot(string) error { return f.record("flushSnapshot") }
+func (f *fakeHost) describeHost(context.Context, *jailer.Jail) (snapshot.Host, error) {
+	return fakeSnapshotHost, f.record("describeHost")
+}
 
 func (f *fakeHost) record(op string) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.calls = append(f.calls, op)
-	return f.failAt[op]
+	err := f.failAt[op]
+	h := f.holds[op]
+	delete(f.holds, op)
+	f.mu.Unlock()
+	if h != nil {
+		h.once.Do(func() { close(h.reached) })
+		<-h.release
+	}
+	return err
 }
 
 func (f *fakeHost) fail(op string, err error) {
@@ -163,7 +248,10 @@ func newFixture(t *testing.T, change func(*Config)) *fixture {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
-	cfg := Config{ImagesDir: images, ChrootBaseDir: filepath.Join(dir, "jail"), AgentTimeout: 5 * time.Second}
+	cfg := Config{
+		ImagesDir: images, ChrootBaseDir: filepath.Join(dir, "jail"), SnapshotsDir: filepath.Join(dir, "snapshots"),
+		AgentTimeout: 5 * time.Second, MinFreeMiB: 1,
+	}
 	if change != nil {
 		change(&cfg)
 	}

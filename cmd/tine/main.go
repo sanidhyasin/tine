@@ -59,6 +59,7 @@ tined, the tine service on this host.
 VM IDs can be shortened to any unique prefix, like docker's.`,
 		Example: `  tine create
   tine exec vm-7f3k -- uname -r
+  tine snapshot vm-7f3k
   tine ls
   tine destroy vm-7f3k`,
 		Version:       version.String(),
@@ -76,7 +77,7 @@ VM IDs can be shortened to any unique prefix, like docker's.`,
 	})
 	root.AddCommand(
 		newCreateCmd(g), newListCmd(g), newInspectCmd(g), newExecCmd(g), newDestroyCmd(g),
-		newImagesCmd(g), newVersionCmd(g),
+		newSnapshotCmd(g), newImagesCmd(g), newVersionCmd(g),
 	)
 	return root
 }

@@ -20,6 +20,7 @@ import (
 	"github.com/sanidhyasin/tine/internal/image"
 	"github.com/sanidhyasin/tine/internal/logging"
 	"github.com/sanidhyasin/tine/internal/metrics"
+	"github.com/sanidhyasin/tine/internal/snapshot"
 	"github.com/sanidhyasin/tine/internal/state"
 	"github.com/sanidhyasin/tine/internal/vm"
 )
@@ -37,6 +38,23 @@ type fakeBackend struct {
 }
 
 func newFakeBackend() *fakeBackend { return &fakeBackend{vms: map[string]state.VM{}} }
+
+func (f *fakeBackend) Snapshot(_ context.Context, id string) (state.Snapshot, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return state.Snapshot{}, f.err
+	}
+	v, ok := f.vms[id]
+	if !ok {
+		return state.Snapshot{}, fmt.Errorf("VM %s: %w", id, state.ErrNotFound)
+	}
+	return state.Snapshot{
+		ID: "snap-0000000001", Kind: state.SnapshotKindVM, State: state.SnapshotReady, VMID: id, Image: v.Image,
+		VCPUs: v.VCPUs, MemoryMiB: v.MemoryMiB, SizeBytes: 1 << 30, CreatedAt: time.Now(),
+		Metadata: json.RawMessage(`{"host":{"firecracker_version":"1.17.0"},"timings_ms":{"paused":120.5,"total":150}}`),
+	}, nil
+}
 
 func (f *fakeBackend) Create(_ context.Context, req vm.CreateRequest) (state.VM, error) {
 	f.mu.Lock()
@@ -235,6 +253,28 @@ func TestExecThroughTheAPI(t *testing.T) {
 	}
 }
 
+func TestSnapshotAPI(t *testing.T) {
+	ctx := context.Background()
+	c, _ := serve(t, newFakeBackend())
+	v, err := c.CreateVM(ctx, CreateVMRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap, err := c.CreateSnapshot(ctx, v.ID)
+	if err != nil {
+		t.Fatalf("CreateSnapshot: %v", err)
+	}
+	if snap.ID != "snap-0000000001" || snap.VMID != v.ID || snap.Kind != "vm" || snap.State != "ready" ||
+		snap.SizeBytes != 1<<30 || snap.FirecrackerVersion != "1.17.0" || snap.TimingsMs["paused"] != 120.5 {
+		t.Errorf("snapshot = %+v", snap)
+	}
+	_, err = c.CreateSnapshot(ctx, "vm-nope")
+	var apiErr *Error
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusNotFound {
+		t.Errorf("snapshot of a missing VM = %#v, want 404", err)
+	}
+}
+
 func TestErrorsMapToStatusCodes(t *testing.T) {
 	tests := []struct {
 		err    error
@@ -245,6 +285,10 @@ func TestErrorsMapToStatusCodes(t *testing.T) {
 		{fmt.Errorf("x: %w", vm.ErrImageNotFound), http.StatusNotFound, CodeImageNotFound},
 		{fmt.Errorf("x: %w", vm.ErrCapacity), http.StatusServiceUnavailable, CodeCapacity},
 		{fmt.Errorf("x: %w", state.ErrInvalidTransition), http.StatusConflict, CodeConflict},
+		{fmt.Errorf("x: %w", vm.ErrBusy), http.StatusConflict, CodeBusy},
+		{fmt.Errorf("x: %w", state.ErrInUse), http.StatusConflict, CodeInUse},
+		{fmt.Errorf("x: %w", snapshot.ErrIncompatible), http.StatusConflict, CodeIncompatible},
+		{fmt.Errorf("x: %w", vm.ErrNoSpace), http.StatusInsufficientStorage, CodeNoSpace},
 		{errors.New("disk on fire"), http.StatusInternalServerError, CodeInternal},
 	}
 	for _, tt := range tests {

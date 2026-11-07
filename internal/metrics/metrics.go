@@ -1,6 +1,6 @@
 // Package metrics is tined's Prometheus metrics: how long each stage of
-// creating a VM takes, destroys, execs, Firecracker API calls, API requests,
-// the reaper and reconcile, and how many VMs are in each state.
+// creating a VM takes, snapshots, destroys, execs, Firecracker API calls,
+// API requests, the reaper and reconcile, and how many VMs are in each state.
 //
 // Every method works on a nil *Metrics and does nothing, so code and tests
 // that don't want metrics don't need any.
@@ -43,6 +43,12 @@ type Metrics struct {
 	apiSeconds     *prometheus.HistogramVec
 	reaped         prometheus.Counter
 	reconciled     *prometheus.CounterVec
+
+	snapshotStage    *prometheus.HistogramVec
+	snapshots        *prometheus.CounterVec
+	snapshotFailures *prometheus.CounterVec
+	snapshotBytes    prometheus.Histogram
+	snapshotsDeleted *prometheus.CounterVec
 }
 
 // New returns metrics in a registry of their own, along with the Go runtime
@@ -69,6 +75,16 @@ func New(version string) *Metrics {
 			"How long tined took to answer API requests, by method and route.", operationBuckets, "method", "route"),
 		reaped:     f.counter("reaper_destroyed_total", "VMs the reaper destroyed because their time to live ran out."),
 		reconciled: f.counterVec("reconcile_actions_total", "What reconciling at startup did, by action: kept, finished, cleaned, orphan.", "action"),
+
+		snapshotStage: f.histogramVec("snapshot_stage_seconds",
+			"How long each stage of taking a snapshot took, including paused (the time the VM was frozen) and the total.",
+			operationBuckets, "stage"),
+		snapshots:        f.counterVec("snapshots_total", "Snapshots taken, by kind (vm or template) and result (ok or failed).", "kind", "result"),
+		snapshotFailures: f.counterVec("snapshot_failures_total", "Failed snapshots, by the stage that failed.", "stage"),
+		snapshotBytes: f.histogram("snapshot_bytes", "Disk space each new snapshot takes.",
+			prometheus.ExponentialBuckets(64<<20, 2, 10)), // 64 MiB to 32 GiB
+		snapshotsDeleted: f.counterVec("snapshots_deleted_total",
+			"Snapshots deleted, by why: requested, or garbage (nothing needed them any more).", "reason"),
 	}
 	reg.MustRegister(
 		collectors.NewGoCollector(),
@@ -126,6 +142,45 @@ func (m *Metrics) CreateFailed(stage string) {
 	}
 	m.creates.WithLabelValues("failed").Inc()
 	m.createFailures.WithLabelValues(stage).Inc()
+}
+
+// SnapshotTaken records a snapshot of kind ("vm" or "template"), its stage
+// timings in milliseconds, and the disk space it takes.
+func (m *Metrics) SnapshotTaken(kind string, timingsMs map[string]float64, bytes int64) {
+	if m == nil {
+		return
+	}
+	m.snapshots.WithLabelValues(kind, "ok").Inc()
+	for stage, ms := range timingsMs {
+		m.snapshotStage.WithLabelValues(stage).Observe(ms / 1000)
+	}
+	m.snapshotBytes.Observe(float64(bytes))
+}
+
+// SnapshotFlushed records how long a new snapshot's memory took to reach the
+// disk, after the VM carried on, as the snapshot stage "flush".
+func (m *Metrics) SnapshotFlushed(d time.Duration) {
+	if m == nil {
+		return
+	}
+	m.snapshotStage.WithLabelValues("flush").Observe(d.Seconds())
+}
+
+// SnapshotFailed records a snapshot of kind that failed at stage.
+func (m *Metrics) SnapshotFailed(kind, stage string) {
+	if m == nil {
+		return
+	}
+	m.snapshots.WithLabelValues(kind, "failed").Inc()
+	m.snapshotFailures.WithLabelValues(stage).Inc()
+}
+
+// SnapshotDeleted records a deleted snapshot, and why: "requested" or "garbage".
+func (m *Metrics) SnapshotDeleted(reason string) {
+	if m == nil {
+		return
+	}
+	m.snapshotsDeleted.WithLabelValues(reason).Inc()
 }
 
 // Destroyed records a destroy.

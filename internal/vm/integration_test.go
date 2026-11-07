@@ -11,12 +11,14 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/sanidhyasin/tine/internal/agentproto"
 	"github.com/sanidhyasin/tine/internal/image"
 	"github.com/sanidhyasin/tine/internal/netns"
+	"github.com/sanidhyasin/tine/internal/snapshot"
 	"github.com/sanidhyasin/tine/internal/state"
 	"github.com/sanidhyasin/tine/internal/testenv"
 )
@@ -48,6 +50,7 @@ func realManager(t *testing.T, change func(*Config)) *Manager {
 		FirecrackerBin: a.Firecracker,
 		ChrootBaseDir:  filepath.Join(dir, "jail"),
 		ImagesDir:      images,
+		SnapshotsDir:   filepath.Join(dir, "snapshots"),
 		CgroupParent:   "tine-test",
 		UIDBase:        290_000,
 	}
@@ -89,8 +92,17 @@ func requireClean(t *testing.T, m *Manager, when string) {
 			left = append(left, "cgroup "+c.Name())
 		}
 	}
-	if out, err := exec.CommandContext(context.Background(), "pgrep", "-x", "firecracker").Output(); err == nil && len(out) > 0 {
-		left = append(left, "firecracker pids "+strings.Join(strings.Fields(string(out)), ","))
+	// A killed Firecracker that this test process started lingers as a zombie
+	// until its watcher goroutine reaps it, so give that a moment.
+	var pids string
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(50 * time.Millisecond) {
+		out, err := exec.CommandContext(context.Background(), "pgrep", "-x", "firecracker").Output()
+		if pids = strings.Join(strings.Fields(string(out)), ","); err != nil || pids == "" || time.Now().After(deadline) {
+			break
+		}
+	}
+	if pids != "" {
+		left = append(left, "firecracker pids "+pids)
 	}
 	if len(left) > 0 {
 		t.Fatalf("leftovers %s: %v", when, left)
@@ -140,6 +152,60 @@ func TestRealCreateExecDestroy(t *testing.T) {
 	}
 	requireClean(t, m, "after Destroy")
 	t.Logf("create timings (ms): %s", formatTimings(vm.Timings))
+}
+
+// TestRealSnapshot snapshots a real, running VM twice, and checks the VM
+// carries on (its agent answers again after the vsock reset) and the
+// snapshot's files are complete, read-only and owned by root.
+func TestRealSnapshot(t *testing.T) {
+	m := realManager(t, nil)
+	ctx := context.Background()
+	vm, err := m.Create(ctx, CreateRequest{})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	t.Cleanup(func() { _, _ = m.Destroy(context.Background(), vm.ID) })
+	execOut(t, m, vm.ID, "sh", "-c", "echo before > /root/marker")
+
+	for i := range 2 {
+		snap, err := m.Snapshot(ctx, vm.ID)
+		if err != nil {
+			t.Fatalf("Snapshot %d: %v", i+1, err)
+		}
+		meta, err := m.snaps.Load(snap.ID)
+		if err != nil {
+			t.Fatalf("snapshot %s's files: %v", snap.ID, err)
+		}
+		t.Logf("snapshot %d of a %d MiB VM: %d MiB on disk; timings (ms): %s", i+1, vm.MemoryMiB, snap.SizeBytes>>20, formatTimings(meta.TimingsMs))
+		if meta.Host.Firecracker == "" || meta.Host.CPU == "" || meta.Host.Kernel == "" {
+			t.Errorf("host = %+v", meta.Host)
+		}
+		for file, mode := range map[string]os.FileMode{snapshot.StateFile: 0o444, snapshot.MemoryFile: 0o444, snapshot.DiskFile: 0o400} {
+			fi, err := os.Stat(m.snaps.Path(snap.ID, file))
+			if err != nil {
+				t.Fatal(err)
+			}
+			st := fi.Sys().(*syscall.Stat_t)
+			if fi.Mode().Perm() != mode || st.Uid != 0 {
+				t.Errorf("%s: mode %v, owner %d; want %v, root", file, fi.Mode().Perm(), st.Uid, mode)
+			}
+		}
+		if mem, _ := os.Stat(m.snaps.Path(snap.ID, snapshot.MemoryFile)); mem.Size() != int64(vm.MemoryMiB)<<20 {
+			t.Errorf("memory file is %d bytes, want the VM's %d MiB", mem.Size(), vm.MemoryMiB)
+		}
+		// The VM carries on, and its agent answers again straight away.
+		if got := strings.TrimSpace(execOut(t, m, vm.ID, "cat", "/root/marker")); got != "before" {
+			t.Errorf("after snapshot %d, /root/marker = %q", i+1, got)
+		}
+	}
+	_, j, _ := m.resources(vm)
+	if left, _ := os.ReadDir(j.HostPath(snapshotDir)); len(left) != 0 {
+		t.Errorf("files left in the jail's snapshot directory: %v", left)
+	}
+	if _, err := m.Destroy(ctx, vm.ID); err != nil {
+		t.Fatal(err)
+	}
+	requireClean(t, m, "after Destroy")
 }
 
 func TestRealParallelCreates(t *testing.T) {
@@ -289,13 +355,28 @@ func TestRealRollback(t *testing.T) {
 	t.Logf("failed as planned: %v", err)
 }
 
+// formatTimings lists stage timings in the order the stages happen, and any
+// it doesn't know after them.
 func formatTimings(t map[string]float64) string {
-	order := []string{"allocate", "network", "jail", "start", "configure", "agent", "total", "destroy"}
+	order := []string{"allocate", "network", "jail", "start", "configure", "restore", "prepare", "pause", "memory", "disk",
+		"resume", "paused", "collect", "agent", "sync", "total", "destroy"}
 	var parts []string
+	seen := map[string]bool{}
 	for _, k := range order {
 		if v, ok := t[k]; ok {
 			parts = append(parts, fmt.Sprintf("%s %.1f", k, v))
+			seen[k] = true
 		}
+	}
+	var rest []string
+	for k := range t {
+		if !seen[k] {
+			rest = append(rest, k)
+		}
+	}
+	sort.Strings(rest)
+	for _, k := range rest {
+		parts = append(parts, fmt.Sprintf("%s %.1f", k, t[k]))
 	}
 	return strings.Join(parts, " · ")
 }

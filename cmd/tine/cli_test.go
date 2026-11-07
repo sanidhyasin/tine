@@ -128,6 +128,21 @@ func (b *backend) Images(context.Context) ([]*image.Image, error) {
 
 func (b *backend) Ping(context.Context) error { return nil }
 
+func (b *backend) Snapshot(_ context.Context, id string) (state.Snapshot, error) {
+	v, err := b.Get(context.Background(), id)
+	if err != nil {
+		return state.Snapshot{}, err
+	}
+	if v.State != state.StateRunning {
+		return state.Snapshot{}, fmt.Errorf("VM %s is %s: %w", id, v.State, vm.ErrNotRunning)
+	}
+	return state.Snapshot{
+		ID: "snap-abcdefghij", Kind: state.SnapshotKindVM, State: state.SnapshotReady, VMID: id, Image: v.Image,
+		VCPUs: v.VCPUs, MemoryMiB: v.MemoryMiB, SizeBytes: 1 << 30, CreatedAt: time.Now(),
+		Metadata: json.RawMessage(`{"timings_ms":{"prepare":0.1,"pause":0.4,"memory":510.2,"disk":2.3,"resume":0.3,"paused":513.4,"total":520.9}}`),
+	}, nil
+}
+
 // startTined serves the API over a fake backend and returns its socket.
 func startTined(t *testing.T) (string, *backend) {
 	t.Helper()
@@ -316,6 +331,27 @@ func TestDestroy(t *testing.T) {
 	}
 	if !strings.Contains(r.stderr, "vm-nopenopeno: VM vm-nopenopeno: not found") {
 		t.Errorf("destroy stderr = %q", r.stderr)
+	}
+}
+
+func TestSnapshot(t *testing.T) {
+	sock, _ := startTined(t)
+	id := strings.TrimSpace(tine(t, sock, "", "create", "-q").stdout)
+	r := tine(t, sock, "", "snapshot", id[3:7])
+	if r.code != 0 || r.stdout != "snap-abcdefghij  of "+id+"  1 GiB  (paused 513ms: memory 510ms · disk 2.3ms; total 521ms)\n" {
+		t.Errorf("snapshot = %d %q %q", r.code, r.stdout, r.stderr)
+	}
+	if r := tine(t, sock, "", "snapshot", "-q", id); r.stdout != "snap-abcdefghij\n" {
+		t.Errorf("snapshot -q = %q", r.stdout)
+	}
+	var snap api.Snapshot
+	r = tine(t, sock, "", "--json", "snapshot", id)
+	if err := json.Unmarshal([]byte(r.stdout), &snap); err != nil || snap.VMID != id || snap.TimingsMs["paused"] != 513.4 {
+		t.Errorf("snapshot --json = %q (%v)", r.stdout, err)
+	}
+	tine(t, sock, "", "destroy", id)
+	if r := tine(t, sock, "", "snapshot", id); r.code != 1 || !strings.Contains(r.stderr, "destroyed") {
+		t.Errorf("snapshot of a destroyed VM = %d %q", r.code, r.stderr)
 	}
 }
 

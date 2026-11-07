@@ -81,6 +81,12 @@ func (c *Client) GetVM(ctx context.Context, id string) (VM, error) {
 	return v, c.do(ctx, http.MethodGet, "/v1/vms/"+url.PathEscape(id), nil, http.StatusOK, &v)
 }
 
+// CreateSnapshot snapshots a running VM.
+func (c *Client) CreateSnapshot(ctx context.Context, vmID string) (Snapshot, error) {
+	var snap Snapshot
+	return snap, c.do(ctx, http.MethodPost, "/v1/vms/"+url.PathEscape(vmID)+"/snapshots", struct{}{}, http.StatusCreated, &snap)
+}
+
 // DestroyVM destroys a VM and returns its final record.
 func (c *Client) DestroyVM(ctx context.Context, id string) (VM, error) {
 	var v VM

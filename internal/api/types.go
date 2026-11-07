@@ -13,6 +13,7 @@
 //	GET    /v1/vms/{id}            VM
 //	DELETE /v1/vms/{id}            VM
 //	POST   /v1/vms/{id}/exec       ExecRequest → a stream of Frames
+//	POST   /v1/vms/{id}/snapshots  Snapshot (201)
 package api
 
 import (
@@ -36,7 +37,36 @@ type VM struct {
 	DestroyedAt *time.Time `json:"destroyed_at,omitempty"`
 	// Error says why the VM failed, if it did.
 	Error string `json:"error,omitempty"`
+	// SnapshotID is the snapshot the VM was restored from, and runs from. It's
+	// empty for a VM that was booted from scratch.
+	SnapshotID string `json:"snapshot_id,omitempty"`
 	// TimingsMs is how long each step of creating (and destroying) it took.
+	TimingsMs map[string]float64 `json:"timings_ms,omitempty"`
+}
+
+// Snapshot is a saved state of a VM, which VMs can be restored from.
+type Snapshot struct {
+	ID string `json:"id"`
+	// Kind is "vm", a save point of a VM, or "template", an image booted
+	// and saved so new VMs can start from it.
+	Kind string `json:"kind"`
+	// State is "creating", "ready" or "deleting".
+	State string `json:"state"`
+	// VMID is the VM it was taken from.
+	VMID  string `json:"vm_id,omitempty"`
+	Image string `json:"image"`
+	// VCPUs and MemoryMiB are the size of every VM restored from it.
+	VCPUs     int `json:"vcpus"`
+	MemoryMiB int `json:"memory_mib"`
+	// SizeBytes is the disk space its files take.
+	SizeBytes int64     `json:"size_bytes"`
+	CreatedAt time.Time `json:"created_at"`
+	// UsedBy lists the VMs that run from it. It can't be deleted while any do.
+	UsedBy []string `json:"used_by,omitempty"`
+	// FirecrackerVersion is what it was taken with, and needs to be restored.
+	FirecrackerVersion string `json:"firecracker_version,omitempty"`
+	// TimingsMs is how long each step of taking it took. "paused" is how long
+	// the VM was frozen.
 	TimingsMs map[string]float64 `json:"timings_ms,omitempty"`
 }
 
@@ -103,6 +133,10 @@ const (
 	CodeCapacity         = "capacity"
 	CodeNotRunning       = "not_running"
 	CodeConflict         = "conflict"
+	CodeBusy             = "busy"         // e.g. a snapshot while commands run in the VM
+	CodeInUse            = "in_use"       // e.g. deleting a snapshot that VMs run from
+	CodeIncompatible     = "incompatible" // a snapshot this host can't restore
+	CodeNoSpace          = "no_space"
 	CodeMethodNotAllowed = "method_not_allowed"
 	CodeInternal         = "internal"
 )

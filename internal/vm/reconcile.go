@@ -15,10 +15,14 @@ type Report struct {
 	// Kept: running VMs whose Firecracker is alive, and failed VMs, which
 	// stay (with their console logs) until someone destroys them or they expire.
 	Kept []string
-	// Finished: destroys that a restart interrupted, now done.
+	// Finished: destroys, and snapshot deletes, that a restart interrupted, now done.
 	Finished []string
+	// Resumed: running VMs found paused, because tined stopped in the middle
+	// of snapshotting them, now running again.
+	Resumed []string
 	// Cleaned: VMs found half-created, or whose Firecracker had died, now
-	// destroyed. Their records keep the reason.
+	// destroyed (their records keep the reason), and snapshots that were
+	// half-taken, now removed.
 	Cleaned []string
 	// Orphans: resources on the host that no live VM owns, now removed.
 	Orphans []string
@@ -34,7 +38,7 @@ func (r Report) String() string {
 		return fmt.Sprintf("%s %d (%s)", name, len(items), strings.Join(items, ", "))
 	}
 	return strings.Join([]string{
-		part("kept", r.Kept), part("finished", r.Finished), part("cleaned", r.Cleaned),
+		part("kept", r.Kept), part("resumed", r.Resumed), part("finished", r.Finished), part("cleaned", r.Cleaned),
 		part("orphans removed", r.Orphans), part("errors", r.Errors),
 	}, "; ")
 }
@@ -52,14 +56,18 @@ type inventory struct {
 //
 //   - creating:   tined stopped mid-create; what exists is undone
 //   - destroying: tined stopped mid-destroy; the destroy is finished
-//   - running:    kept if its Firecracker is alive, else cleaned up as failed
+//   - running:    kept if its Firecracker is alive (and resumed, if a snapshot
+//     left it paused), else cleaned up as failed
 //   - failed:     kept for inspection
 //
-// Then anything on the host that no live VM owns (a namespace, jail, cgroup
-// with its processes, or veth) is removed.
+// Snapshots that were being taken are removed, and deletes of snapshots are
+// finished. Then anything on the host that no live VM or snapshot owns (a
+// namespace, jail, cgroup with its processes, veth, or snapshot directory) is
+// removed.
 func (m *Manager) Reconcile(ctx context.Context) (r Report) {
 	defer func() {
 		m.cfg.Metrics.Reconciled("kept", len(r.Kept))
+		m.cfg.Metrics.Reconciled("resumed", len(r.Resumed))
 		m.cfg.Metrics.Reconciled("finished", len(r.Finished))
 		m.cfg.Metrics.Reconciled("cleaned", len(r.Cleaned))
 		m.cfg.Metrics.Reconciled("orphan", len(r.Orphans))
@@ -98,6 +106,16 @@ func (m *Manager) Reconcile(ctx context.Context) (r Report) {
 				continue
 			}
 			if alive {
+				// tined may have stopped in the middle of a snapshot, with the VM paused.
+				if paused, err := m.host.paused(ctx, j); err != nil {
+					errorf("%s: check whether it's paused: %v", vm.ID, err)
+				} else if paused {
+					if err := m.host.resume(ctx, j); err != nil {
+						errorf("%s: resume: %v", vm.ID, err)
+					} else {
+						r.Resumed = append(r.Resumed, vm.ID)
+					}
+				}
 				r.Kept = append(r.Kept, vm.ID)
 				continue
 			}
@@ -111,6 +129,8 @@ func (m *Manager) Reconcile(ctx context.Context) (r Report) {
 			r.Kept = append(r.Kept, vm.ID)
 		}
 	}
+
+	m.reconcileSnapshots(ctx, &r, errorf)
 
 	// Orphans: compare the host with the VMs that are still live now.
 	live, err = m.store.ListVMs(ctx, state.ListOptions{})
@@ -149,6 +169,50 @@ func (m *Manager) Reconcile(ctx context.Context) (r Report) {
 		}
 	}
 	return r
+}
+
+// reconcileSnapshots removes snapshots that were being taken, finishes
+// deletes that were interrupted, and removes snapshot directories that no
+// record owns.
+func (m *Manager) reconcileSnapshots(ctx context.Context, r *Report, errorf func(string, ...any)) {
+	snaps, err := m.store.ListSnapshots(ctx, state.SnapshotFilter{})
+	if err != nil {
+		errorf("list snapshots: %v", err)
+		return
+	}
+	known := map[string]bool{}
+	for _, s := range snaps {
+		switch s.State {
+		case state.SnapshotCreating:
+			// Nothing waits for it any more; its VM, if paused, was resumed above.
+			m.forgetSnapshot(ctx, s.ID)
+			r.Cleaned = append(r.Cleaned, s.ID)
+		case state.SnapshotDeleting:
+			if err := m.removeSnapshot(ctx, s.ID); err != nil {
+				errorf("%s: %v", s.ID, err)
+				known[s.ID] = true
+			} else {
+				r.Finished = append(r.Finished, s.ID)
+			}
+		default:
+			known[s.ID] = true
+		}
+	}
+	ids, building, err := m.snaps.List()
+	if err != nil {
+		errorf("list the snapshot store: %v", err)
+		return
+	}
+	for _, id := range append(ids, building...) {
+		if known[id] {
+			continue
+		}
+		if err := m.snaps.Remove(id); err != nil {
+			errorf("orphan snapshot %s: %v", id, err)
+		} else {
+			r.Orphans = append(r.Orphans, "snapshot "+id)
+		}
+	}
 }
 
 // RunReaper destroys VMs whose time to live has run out, every interval,

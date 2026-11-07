@@ -17,6 +17,8 @@ import (
 	"github.com/sanidhyasin/tine/internal/firecracker"
 	"github.com/sanidhyasin/tine/internal/jailer"
 	"github.com/sanidhyasin/tine/internal/netns"
+	"github.com/sanidhyasin/tine/internal/snapshot"
+	"github.com/sanidhyasin/tine/internal/storage"
 )
 
 // host is everything the manager does to the machine. Production uses
@@ -34,6 +36,27 @@ type host interface {
 	// knowing only its PID.
 	killFirecracker(ctx context.Context, j *jailer.Jail, pid int) error
 	agent(j *jailer.Jail) *agentproto.Client
+
+	// For snapshots:
+	// prepareSnapshot gives the jail an empty directory for a snapshot.
+	prepareSnapshot(j *jailer.Jail) error
+	pause(ctx context.Context, j *jailer.Jail) error
+	resume(ctx context.Context, j *jailer.Jail) error
+	// paused reports whether the VM's Firecracker has it paused.
+	paused(ctx context.Context, j *jailer.Jail) (bool, error)
+	// writeSnapshot has Firecracker write the paused VM's state and memory
+	// into that directory.
+	writeSnapshot(ctx context.Context, j *jailer.Jail) error
+	// cloneDisk makes dst a reflink copy of the VM's disk.
+	cloneDisk(j *jailer.Jail, dst string) error
+	// collectSnapshot moves the state and memory Firecracker wrote into b.
+	collectSnapshot(j *jailer.Jail, b *snapshot.Building) error
+	// flushSnapshot writes a snapshot file that's still in the page cache
+	// out to disk.
+	flushSnapshot(path string) error
+	// describeHost says what a snapshot of the VM would depend on: its
+	// Firecracker version, and this host's CPU and kernel.
+	describeHost(ctx context.Context, j *jailer.Jail) (snapshot.Host, error)
 
 	// For Reconcile:
 	// inventory lists the VM resources that exist on the host.
@@ -113,10 +136,15 @@ func (h *hostOS) startFirecracker(j *jailer.Jail) (process, error) {
 	return p, nil
 }
 
-func (h *hostOS) configureAndBoot(ctx context.Context, j *jailer.Jail, boot bootSpec) error {
-	c := firecracker.New(j.APISocket(), firecracker.WithObserver(func(ci firecracker.CallInfo) {
+// firecracker returns a client for the VM's Firecracker that records every call in the metrics.
+func (h *hostOS) firecracker(j *jailer.Jail) *firecracker.Client {
+	return firecracker.New(j.APISocket(), firecracker.WithObserver(func(ci firecracker.CallInfo) {
 		h.cfg.Metrics.FirecrackerCall(ci.Endpoint, ci.Duration, ci.Err)
 	}))
+}
+
+func (h *hostOS) configureAndBoot(ctx context.Context, j *jailer.Jail, boot bootSpec) error {
+	c := h.firecracker(j)
 	readyCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	if err := c.WaitReady(readyCtx, 2*time.Millisecond); err != nil {
@@ -151,6 +179,69 @@ func (h *hostOS) configureAndBoot(ctx context.Context, j *jailer.Jail, boot boot
 		}
 	}
 	return nil
+}
+
+func (h *hostOS) prepareSnapshot(j *jailer.Jail) error {
+	// Anything left from a snapshot that didn't finish goes first.
+	if err := os.RemoveAll(j.HostPath(snapshotDir)); err != nil {
+		return err
+	}
+	return j.MkdirAll(snapshotDir)
+}
+
+func (h *hostOS) pause(ctx context.Context, j *jailer.Jail) error { return h.firecracker(j).Pause(ctx) }
+func (h *hostOS) resume(ctx context.Context, j *jailer.Jail) error {
+	return h.firecracker(j).Resume(ctx)
+}
+
+func (h *hostOS) paused(ctx context.Context, j *jailer.Jail) (bool, error) {
+	info, err := h.firecracker(j).DescribeInstance(ctx)
+	return info.State == firecracker.StatePaused, err
+}
+
+func (h *hostOS) writeSnapshot(ctx context.Context, j *jailer.Jail) error {
+	return h.firecracker(j).CreateSnapshot(ctx, firecracker.SnapshotCreate{
+		SnapshotPath: snapshotStatePath,
+		MemFilePath:  snapshotMemPath,
+		SnapshotType: firecracker.SnapshotFull,
+		// Snapshots needn't survive the host crashing, and waiting for the
+		// disk would keep the VM paused for longer.
+		SyncSnapshotFiles: firecracker.Bool(false),
+	})
+}
+
+func (h *hostOS) cloneDisk(j *jailer.Jail, dst string) error {
+	return storage.Clone(j.HostPath(rootfsPath), dst, 0o600)
+}
+
+func (h *hostOS) collectSnapshot(j *jailer.Jail, b *snapshot.Building) error {
+	// The jail and the store are on the same filesystem, so these are renames.
+	for from, to := range map[string]string{snapshotStatePath: snapshot.StateFile, snapshotMemPath: snapshot.MemoryFile} {
+		if err := os.Rename(j.HostPath(from), b.Path(to)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (h *hostOS) flushSnapshot(path string) error {
+	f, err := os.Open(path) //nolint:gosec // a path in tined's own snapshot store
+	if err != nil {
+		return err
+	}
+	err = f.Sync()
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	return err
+}
+
+func (h *hostOS) describeHost(ctx context.Context, j *jailer.Jail) (snapshot.Host, error) {
+	version, err := h.firecracker(j).Version(ctx)
+	if err != nil {
+		return snapshot.Host{}, err
+	}
+	return snapshot.ThisHost(version)
 }
 
 func (h *hostOS) waitAgent(ctx context.Context, j *jailer.Jail) error {

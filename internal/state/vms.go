@@ -262,7 +262,25 @@ func (s *Store) Transition(ctx context.Context, id string, to VMState, detail st
 	})
 }
 
-// Events returns a VM's state changes, oldest first.
+// Note records something that happened to a VM without changing its state,
+// such as a snapshot being taken, as an Event from its state to itself.
+func (s *Store) Note(ctx context.Context, id, detail string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	vm, err := getVM(ctx, tx, id)
+	if err != nil {
+		return err
+	}
+	if err := insertEvent(ctx, tx, id, s.now(), vm.State, vm.State, detail); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// Events returns a VM's state changes, and the notes about it, oldest first.
 func (s *Store) Events(ctx context.Context, vmID string) ([]Event, error) {
 	rows, err := s.db.QueryContext(ctx,
 		"SELECT id, vm_id, at, from_state, to_state, detail FROM vm_events WHERE vm_id = ? ORDER BY id", vmID)

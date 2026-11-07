@@ -17,6 +17,7 @@ import (
 	"github.com/sanidhyasin/tine/internal/image"
 	"github.com/sanidhyasin/tine/internal/logging"
 	"github.com/sanidhyasin/tine/internal/metrics"
+	"github.com/sanidhyasin/tine/internal/snapshot"
 	"github.com/sanidhyasin/tine/internal/state"
 	"github.com/sanidhyasin/tine/internal/vm"
 )
@@ -34,6 +35,7 @@ type Backend interface {
 	List(ctx context.Context, includeDestroyed bool) ([]state.VM, error)
 	Destroy(ctx context.Context, id string) (state.VM, error)
 	Exec(ctx context.Context, id string, req agentproto.ExecRequest, onOutput func(stream string, data []byte)) (agentproto.ExitStatus, error)
+	Snapshot(ctx context.Context, id string) (state.Snapshot, error)
 	Images(ctx context.Context) ([]*image.Image, error)
 	Ping(ctx context.Context) error
 }
@@ -76,6 +78,7 @@ func NewServer(backend Backend, version string, log *slog.Logger, opts ...Option
 	s.mux.HandleFunc("/v1/vms", s.vms)
 	s.mux.HandleFunc("/v1/vms/{id}", s.oneVM)
 	s.mux.HandleFunc("/v1/vms/{id}/exec", s.exec)
+	s.mux.HandleFunc("/v1/vms/{id}/snapshots", s.vmSnapshots)
 	s.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, CodeNotFound, "no such endpoint: "+r.Method+" "+r.URL.Path)
 	})
@@ -253,6 +256,19 @@ func (s *Server) exec(w http.ResponseWriter, r *http.Request) {
 	out.write(Frame{Exit: &st})
 }
 
+func (s *Server) vmSnapshots(w http.ResponseWriter, r *http.Request) {
+	if !allow(w, r, http.MethodPost) {
+		return
+	}
+	ctx := logging.WithVM(r.Context(), r.PathValue("id"))
+	snap, err := s.backend.Snapshot(ctx, r.PathValue("id"))
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, toAPISnapshot(snap, nil))
+}
+
 // fail answers with the error's status and code.
 func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
 	status, code := http.StatusInternalServerError, CodeInternal
@@ -270,6 +286,14 @@ func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
 		status, code = http.StatusServiceUnavailable, CodeCapacity
 	case errors.Is(err, vm.ErrNotRunning):
 		status, code = http.StatusConflict, CodeNotRunning
+	case errors.Is(err, vm.ErrBusy):
+		status, code = http.StatusConflict, CodeBusy
+	case errors.Is(err, state.ErrInUse):
+		status, code = http.StatusConflict, CodeInUse
+	case errors.Is(err, snapshot.ErrIncompatible):
+		status, code = http.StatusConflict, CodeIncompatible
+	case errors.Is(err, vm.ErrNoSpace):
+		status, code = http.StatusInsufficientStorage, CodeNoSpace
 	case errors.Is(err, state.ErrInvalidTransition), errors.Is(err, state.ErrConflict):
 		status, code = http.StatusConflict, CodeConflict
 	}
@@ -282,7 +306,7 @@ func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
 func toAPI(v state.VM) VM {
 	out := VM{
 		ID: v.ID, State: string(v.State), Image: v.Image, VCPUs: v.VCPUs, MemoryMiB: v.MemoryMiB,
-		CreatedAt: v.CreatedAt, Error: v.Error, TimingsMs: v.Timings,
+		CreatedAt: v.CreatedAt, Error: v.Error, SnapshotID: v.SnapshotID, TimingsMs: v.Timings,
 	}
 	if !v.ExpiresAt.IsZero() {
 		t := v.ExpiresAt
@@ -291,6 +315,19 @@ func toAPI(v state.VM) VM {
 	if !v.DestroyedAt.IsZero() {
 		t := v.DestroyedAt
 		out.DestroyedAt = &t
+	}
+	return out
+}
+
+// toAPISnapshot shows a snapshot, with the VMs that run from it, if known.
+func toAPISnapshot(s state.Snapshot, usedBy []string) Snapshot {
+	out := Snapshot{
+		ID: s.ID, Kind: string(s.Kind), State: string(s.State), VMID: s.VMID, Image: s.Image,
+		VCPUs: s.VCPUs, MemoryMiB: s.MemoryMiB, SizeBytes: s.SizeBytes, CreatedAt: s.CreatedAt, UsedBy: usedBy,
+	}
+	var meta snapshot.Metadata
+	if len(s.Metadata) > 0 && json.Unmarshal(s.Metadata, &meta) == nil {
+		out.FirecrackerVersion, out.TimingsMs = meta.Host.Firecracker, meta.TimingsMs
 	}
 	return out
 }

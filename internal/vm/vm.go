@@ -40,6 +40,7 @@ import (
 	"github.com/sanidhyasin/tine/internal/logging"
 	"github.com/sanidhyasin/tine/internal/metrics"
 	"github.com/sanidhyasin/tine/internal/netns"
+	"github.com/sanidhyasin/tine/internal/snapshot"
 	"github.com/sanidhyasin/tine/internal/state"
 )
 
@@ -63,6 +64,11 @@ var (
 	ErrImageNotFound = errors.New("image not found")
 	// ErrCapacity means the host can't take another VM right now.
 	ErrCapacity = errors.New("at capacity")
+	// ErrBusy means the VM is doing something that can't overlap with what
+	// was asked, such as a snapshot while commands run in it.
+	ErrBusy = errors.New("busy")
+	// ErrNoSpace means the disk is short of room, for example for a snapshot.
+	ErrNoSpace = errors.New("not enough disk space")
 )
 
 // Config is how the manager runs VMs. Zero values get the defaults in
@@ -70,10 +76,12 @@ var (
 type Config struct {
 	JailerBin      string
 	FirecrackerBin string
-	// ChrootBaseDir holds the jails, and ImagesDir the images. Both must be on
-	// the same filesystem (the XFS data volume).
+	// ChrootBaseDir holds the jails, ImagesDir the images, and SnapshotsDir
+	// the snapshots. All three must be on the same filesystem (the XFS data
+	// volume), for hard links and reflinks between them.
 	ChrootBaseDir string
 	ImagesDir     string
+	SnapshotsDir  string
 	// CgroupParent holds every VM's cgroup.
 	CgroupParent string
 	// UIDBase: a VM in network slot N runs as uid and gid UIDBase+N.
@@ -85,7 +93,9 @@ type Config struct {
 	// MaxVMs is how many VMs may exist at once.
 	MaxVMs int
 	// MemoryOverheadMiB is added to a VM's memory for its cgroup limit, to
-	// cover Firecracker itself and the host page cache it uses.
+	// cover Firecracker itself and the host page cache it uses. The limit
+	// also has room for one snapshot's memory file in the page cache (the
+	// VM's memory again): writing a snapshot charges that cache to the VM.
 	MemoryOverheadMiB int
 	// MaxPIDs caps the threads of each VM's Firecracker process.
 	MaxPIDs int
@@ -97,6 +107,10 @@ type Config struct {
 	ReaperInterval time.Duration
 	// DestroyedRetention is how long destroyed VMs' records are kept.
 	DestroyedRetention time.Duration
+	// MaxSnapshotsPerVM is how many snapshots one VM may have.
+	MaxSnapshotsPerVM int
+	// MinFreeMiB is the disk space a snapshot must leave free.
+	MinFreeMiB int
 
 	// Metrics, if set, records how operations went. Nil records nothing.
 	Metrics *metrics.Metrics
@@ -111,6 +125,7 @@ func DefaultConfig() Config {
 		FirecrackerBin:    "/usr/local/bin/firecracker",
 		ChrootBaseDir:     "/srv/tine/jail",
 		ImagesDir:         image.DefaultImagesDir,
+		SnapshotsDir:      snapshot.DefaultDir,
 		CgroupParent:      "tine",
 		UIDBase:           200_000,
 		DefaultVCPUs:      2,
@@ -126,6 +141,8 @@ func DefaultConfig() Config {
 		AgentTimeout:       60 * time.Second,
 		ReaperInterval:     15 * time.Second,
 		DestroyedRetention: 7 * 24 * time.Hour,
+		MaxSnapshotsPerVM:  16,
+		MinFreeMiB:         2048,
 	}
 }
 
@@ -145,6 +162,7 @@ func (c Config) withDefaults() Config {
 	set(&c.FirecrackerBin, d.FirecrackerBin)
 	set(&c.ChrootBaseDir, d.ChrootBaseDir)
 	set(&c.ImagesDir, d.ImagesDir)
+	set(&c.SnapshotsDir, d.SnapshotsDir)
 	set(&c.CgroupParent, d.CgroupParent)
 	set(&c.BootArgs, d.BootArgs)
 	setInt(&c.UIDBase, d.UIDBase)
@@ -153,6 +171,8 @@ func (c Config) withDefaults() Config {
 	setInt(&c.MaxVMs, d.MaxVMs)
 	setInt(&c.MemoryOverheadMiB, d.MemoryOverheadMiB)
 	setInt(&c.MaxPIDs, d.MaxPIDs)
+	setInt(&c.MaxSnapshotsPerVM, d.MaxSnapshotsPerVM)
+	setInt(&c.MinFreeMiB, d.MinFreeMiB)
 	if c.DefaultTTL == 0 {
 		c.DefaultTTL = d.DefaultTTL
 	}
@@ -187,11 +207,15 @@ type Manager struct {
 	host  host
 	log   *slog.Logger
 	slots *idalloc.Range
+	snaps *snapshot.Store
+	gate  *gate
 
 	mu    sync.Mutex
 	procs map[string]*tracked // Firecracker processes this manager started
 	ops   map[string]*createOp
 	locks keyedMutex
+	// flushes are closed when the VM's last snapshot is on disk.
+	flushes map[string]chan struct{}
 }
 
 type tracked struct {
@@ -216,9 +240,13 @@ func newManager(cfg Config, store *state.Store, h host) (*Manager, error) {
 	if err != nil {
 		return nil, err
 	}
+	snaps, err := snapshot.NewStore(cfg.SnapshotsDir)
+	if err != nil {
+		return nil, err
+	}
 	m := &Manager{
-		cfg: cfg, store: store, host: h, log: cfg.Log, slots: slots,
-		procs: map[string]*tracked{}, ops: map[string]*createOp{},
+		cfg: cfg, store: store, host: h, log: cfg.Log, slots: slots, snaps: snaps, gate: newGate(),
+		procs: map[string]*tracked{}, ops: map[string]*createOp{}, flushes: map[string]chan struct{}{},
 	}
 	// Slots held by VMs from before a restart stay theirs.
 	live, err := store.ListVMs(context.Background(), state.ListOptions{})
@@ -520,8 +548,14 @@ func (m *Manager) List(ctx context.Context, includeDestroyed bool) ([]state.VM, 
 	return m.store.ListVMs(ctx, state.ListOptions{IncludeDestroyed: includeDestroyed})
 }
 
-// Exec runs a command in a running VM through its agent.
+// Exec runs a command in a running VM through its agent. If the VM is being
+// snapshotted or rolled back, it waits for that to finish first.
 func (m *Manager) Exec(ctx context.Context, id string, req agentproto.ExecRequest, onOutput func(stream string, data []byte)) (agentproto.ExitStatus, error) {
+	leave, err := m.gate.enterExec(ctx, id)
+	if err != nil {
+		return agentproto.ExitStatus{}, err
+	}
+	defer leave()
 	vm, err := m.store.GetVM(ctx, id)
 	if err != nil {
 		return agentproto.ExitStatus{}, err
@@ -562,7 +596,7 @@ func (m *Manager) resources(vm state.VM) (netns.Network, *jailer.Jail, error) {
 		UID:    vm.UID,
 		GID:    vm.UID,
 		NetNS:  n.NamespacePath(),
-		Limits: jailer.Limits{VCPUs: vm.VCPUs, MemoryBytes: int64(vm.MemoryMiB+m.cfg.MemoryOverheadMiB) << 20, MaxPIDs: m.cfg.MaxPIDs},
+		Limits: jailer.Limits{VCPUs: vm.VCPUs, MemoryBytes: memoryLimit(vm.MemoryMiB, m.cfg.MemoryOverheadMiB), MaxPIDs: m.cfg.MaxPIDs},
 		Files: []jailer.File{
 			{Source: filepath.Join(imgDir, image.KernelFile), Target: kernelPath, Mode: jailer.Link},
 			{Source: filepath.Join(imgDir, image.RootfsFile), Target: rootfsPath, Mode: jailer.Clone},
@@ -570,6 +604,18 @@ func (m *Manager) resources(vm state.VM) (netns.Network, *jailer.Jail, error) {
 		FirecrackerArgs: []string{"--enable-pci"},
 	})
 	return n, j, err
+}
+
+// memoryLimit is a VM's cgroup memory limit: its memory, Firecracker's
+// overhead, and room for one snapshot's memory file in the page cache.
+//
+// Firecracker writes snapshots through the page cache, which the kernel
+// charges to the VM's cgroup. Without the room, a snapshot of a VM whose
+// limit is already full of cache makes the kernel write the old pages out
+// first, while the VM is paused, or kill Firecracker if it can't do so in
+// time.
+func memoryLimit(memoryMiB, overheadMiB int) int64 {
+	return int64(2*memoryMiB+overheadMiB) << 20
 }
 
 func (m *Manager) bootSpec(vm state.VM) bootSpec {
