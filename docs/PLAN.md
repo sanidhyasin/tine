@@ -22,7 +22,9 @@ The *why* behind the project is in [BRIEF.md](../BRIEF.md). This file is the *ho
 
 ## Where we are
 
-**Step 0 is done.** You booted a microVM by hand on the dev server, logged in over SSH, watched memory being handed out lazily, and paused and resumed a running VM.
+**Step 1 is done, released as v0.1.0.** tined runs isolated microVMs under systemd, and `tine` creates them, runs commands in them and destroys them. How it all works is in [architecture.md](architecture.md). Next is step 2, starting with task 2.1.
+
+Step 0 was booting a microVM by hand on the dev server: logging in over SSH, watching memory being handed out lazily, and pausing and resuming a running VM.
 
 | Step | What you'll have at the end | Release |
 |---|---|---|
@@ -149,6 +151,7 @@ The Mac builds everything. The server only runs it.
 | `make check` | Formatting, vet, lint and unit tests |
 | `make deploy` | Builds, syncs to the server, installs, and restarts `tined` |
 | `make e2e` | Runs the end-to-end tests on the server, including the leak check |
+| `make measure` | Measures create, exec and memory per VM on the server |
 
 CI (GitHub Actions) runs `make check` and `make build` on every push. The end-to-end tests run on the dev server.
 
@@ -290,20 +293,33 @@ Errors come back as `{"error": {"code": "...", "message": "..."}}` with proper H
 - [x] **1.12 Recovery:** on startup, reconcile SQLite with the real processes, namespaces and jails. Add the TTL reaper. *Before serving, tined finishes interrupted destroys, cleans up VMs that were half-created or whose Firecracker died while it was down (their records say why), keeps live and failed VMs, and removes host resources no live VM owns. The reaper runs every 15 s and purges records destroyed over 7 days ago. Checked through systemd on the dev server: with tined stopped, one VM's Firecracker killed and an orphan namespace and jail planted, the restart reported "kept 1; cleaned 1; orphans removed 2; errors 0", and the surviving VM still had its data. A VM with `--ttl 1m` was gone 80 s later.*
 - [x] **1.13 Metrics and logs:** Prometheus histograms per stage, and structured logs with the VM ID on every line. *`internal/metrics` adds histograms for each create stage, destroys, execs, Firecracker API calls and API requests (labelled by route pattern, never by VM ID), plus counters and `tine_vms{state}`. They're served at `/metrics` on the socket, and on `127.0.0.1:9101` for Prometheus. `internal/logging` carries the request ID (also returned as `X-Request-Id`) and the VM ID in the context, so lines written anywhere in a request carry them. On the dev server the histograms averaged a 1.86 s create: network 6 ms, jail 2 ms, configure 46 ms, boot 1.80 s.*
 - [x] **1.14 E2e suite:** create, exec and destroy 50 times; destroy during create; kill `tined` mid-operation and restart it; then the leak check. *`make e2e` drives the real tined under systemd through its API: 50 VMs (5 at a time), 20 execs at once in one VM, destroy during create, SIGKILL mid-create and with VMs running, a VM killed while tined is down, and a TTL VM that must be reaped while the rest runs. It ends with a strict leak check. It passed twice in a row in about 75 s. With 5 at once: create p50 2.8 s and p99 3.1 s, exec p50 27 ms, destroy p50 37 ms. tined was back 2.2 s after being killed.*
-- [ ] **1.15 Docs and release:** `docs/architecture.md`, README update, tag `v0.1.0`.
+- [x] **1.15 Docs and release:** `docs/architecture.md`, README update, tag `v0.1.0`. *Before the release, an e2e test was added for the one "done when" check that hadn't been tested at that scale: 10 VMs at once, each reaching the internet while its connections to the metadata service, the host and another VM's network time out (dropped, not refused). `make measure` (`scripts/measure.sh`) records the step's numbers, below.*
 
 ### Done when
 
-- [ ] `tine create`, `tine exec <id> -- uname -r` and `tine destroy` work, and `exec` passes through exit codes and streams output live.
-- [ ] 10 VMs run at once, each with internet access. They can't reach each other or `169.254.169.254`.
-- [ ] Restarting `tined`, even while VMs are running, loses nothing and leaks nothing.
-- [ ] The leak check is clean after the e2e suite.
+- [x] `tine create`, `tine exec <id> -- uname -r` and `tine destroy` work, and `exec` passes through exit codes and streams output live. *CLI tests against the real API server, and used on the dev server.*
+- [x] 10 VMs run at once, each with internet access. They can't reach each other or `169.254.169.254`. *`TestTenVMsAtOnceAreIsolated` in `make e2e`.*
+- [x] Restarting `tined`, even while VMs are running, loses nothing and leaks nothing. *`TestRunningVMsSurviveATinedCrash` and `TestTinedKilledMidCreate`, with SIGKILL.*
+- [x] The leak check is clean after the e2e suite.
 
 ### Measure
 
 - Cold-boot `create` latency, p50 and p99 over 100 runs, with the stage breakdown.
 - `exec` round-trip time for `true`.
 - Host memory per idle VM (RSS).
+
+*Measured with `make measure` on the dev server (m8i.xlarge, nested virtualization), VMs at 2 vCPUs and 1 GiB:*
+
+| What | p50 | p99 |
+|---|---|---|
+| Create, one at a time (n=100) | 1.83 s | 1.89 s |
+| … allocate · network · jail · start · configure | 0.30 · 5.2 · 0.32 · 0.20 · 21 ms | 3.1 · 7.3 · 3.3 · 3.6 · 27 ms |
+| … boot until the agent answers | 1.81 s | 1.86 s |
+| Destroy (n=100) | 32 ms | 42 ms |
+| Exec `true` through the API (n=200) | 1.7 ms | 3.3 ms |
+| … of which inside the guest | 0.96 ms | 1.2 ms |
+
+*An idle VM's Firecracker uses 127 MiB of host memory (124 MiB of it guest memory, out of 1 GiB), and its cgroup is charged 168 MiB including page cache. tine's own work in a create is about 27 ms; the other 1.8 s is the guest booting, which step 2's templates remove.*
 
 ---
 
