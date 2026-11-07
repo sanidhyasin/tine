@@ -215,3 +215,18 @@ func sizeOf(n int64) string {
 		return fmt.Sprintf("%.2f GiB", float64(n)/(1<<30))
 	}
 }
+
+func newDialStdioCmd(g *globals) *cobra.Command {
+	return &cobra.Command{
+		Use:   "dial-stdio",
+		Short: "Join standard input and output to tined's socket (for --host ssh://)",
+		Long: `Join standard input and output to tined's socket, until either side closes.
+It's what "tine --host ssh://HOST" runs on HOST, through ssh, for every
+connection to tined: you don't run it yourself.`,
+		Args:   cobra.NoArgs,
+		Hidden: true,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return api.DialStdio(cmd.Context(), g.socket, cmd.InOrStdin(), cmd.OutOrStdout())
+		},
+	}
+}

@@ -43,10 +43,18 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 // globals are the flags every command shares.
 type globals struct {
 	socket string
+	host   string
 	json   bool
+	// remote is the client for --host, made before any command runs.
+	remote *api.Client
 }
 
-func (g *globals) client() *api.Client { return api.NewUnixClient(g.socket) }
+func (g *globals) client() *api.Client {
+	if g.remote != nil {
+		return g.remote
+	}
+	return api.NewUnixClient(g.socket)
+}
 
 func newRootCmd() *cobra.Command {
 	g := &globals{}
@@ -72,12 +80,22 @@ VM IDs can be shortened to any unique prefix, like docker's.`,
 		socket = api.DefaultSocket
 	}
 	root.PersistentFlags().StringVar(&g.socket, "socket", socket, "tined's API socket (or set TINE_SOCKET)")
+	root.PersistentFlags().StringVarP(&g.host, "host", "H", os.Getenv("TINE_HOST"),
+		"tined on another machine, through SSH: ssh://[user@]host[:port] (or set TINE_HOST)")
+	root.PersistentPreRunE = func(*cobra.Command, []string) error {
+		if g.host == "" {
+			return nil
+		}
+		c, err := api.NewSSHClient(g.host)
+		g.remote = c
+		return err
+	}
 	root.PersistentFlags().BoolVar(&g.json, "json", false, "print JSON, for scripts")
 	root.SetFlagErrorFunc(func(cmd *cobra.Command, err error) error {
 		return fmt.Errorf("%w (see 'tine %s --help')", err, cmd.Name())
 	})
 	root.AddCommand(
-		newCreateCmd(g), newListCmd(g), newInspectCmd(g), newExecCmd(g), newCpCmd(g), newDestroyCmd(g),
+		newCreateCmd(g), newListCmd(g), newInspectCmd(g), newExecCmd(g), newCpCmd(g), newDestroyCmd(g), newDialStdioCmd(g),
 		newSnapshotCmd(g), newRollbackCmd(g), newForkCmd(g), newImagesCmd(g), newImageCmd(g), newVersionCmd(g),
 	)
 	return root
