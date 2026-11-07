@@ -471,9 +471,12 @@ func (m *Manager) teardown(ctx context.Context, vm state.VM) error {
 			return fmt.Errorf("stop Firecracker (pid %d): %w", vm.PID, err)
 		}
 	}
-	// The jail and its cgroup go once Firecracker has exited; the network
-	// after that, since the namespace lives on while Firecracker is in it.
-	return errors.Join(m.host.cleanupJail(j), m.host.destroyNetwork(n))
+	// In order, stopping at the first failure: the jail and its cgroup only
+	// go once Firecracker has exited, and the network only after that.
+	if err := m.host.cleanupJail(j); err != nil {
+		return err
+	}
+	return m.host.destroyNetwork(n)
 }
 
 // Get returns a VM's record.

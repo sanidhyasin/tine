@@ -9,8 +9,8 @@ import (
 	"io/fs"
 	"os"
 	"os/exec"
-	"strconv"
-	"syscall"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/sanidhyasin/tine/internal/agentproto"
@@ -149,27 +149,37 @@ func (h *hostOS) agent(j *jailer.Jail) *agentproto.Client {
 	return agentproto.NewVsockClient(j.HostPath(vsockPath))
 }
 
-// killFirecracker kills pid, but only after checking it really is this
-// jail's Firecracker: PIDs get reused, and the wrong process must never be
-// killed.
-func (h *hostOS) killFirecracker(ctx context.Context, j *jailer.Jail, pid int) error {
-	cmdline, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/cmdline")
-	if errors.Is(err, fs.ErrNotExist) {
-		return nil // already gone
+// killFirecracker stops a VM's Firecracker that this tined didn't start.
+//
+// It doesn't trust the recorded PID, which the kernel may have given to
+// another process since. It kills whatever is in the VM's own cgroup
+// instead: the jailer put Firecracker there, and nothing else ever goes in
+// it, so everything there is that VM's and nothing else is touched.
+func (h *hostOS) killFirecracker(ctx context.Context, j *jailer.Jail, _ int) error {
+	procsFile := filepath.Join(j.CgroupDir(), "cgroup.procs")
+	procs := func() ([]byte, error) {
+		data, err := os.ReadFile(procsFile) //nolint:gosec // a cgroup path built from a validated VM ID
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, nil // no cgroup: nothing of the VM's is running
+		}
+		return bytes.TrimSpace(data), err
 	}
-	if err != nil {
+	left, err := procs()
+	if err != nil || len(left) == 0 {
 		return err
 	}
-	if !bytes.Contains(cmdline, []byte("--id="+j.ID+"\x00")) {
-		return nil // the PID now belongs to something else: ours is gone
-	}
-	if err := syscall.Kill(pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
-		return err
+	// cgroup.kill (Linux 5.14+) SIGKILLs every process in the cgroup at once.
+	if err := os.WriteFile(filepath.Join(j.CgroupDir(), "cgroup.kill"), []byte("1"), 0o600); err != nil {
+		return fmt.Errorf("kill the processes in %s: %w", j.CgroupDir(), err)
 	}
 	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		if _, err := os.Stat("/proc/" + strconv.Itoa(pid)); errors.Is(err, fs.ErrNotExist) {
-			return nil
+	for {
+		left, err := procs()
+		if err != nil || len(left) == 0 {
+			return err
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("processes %s in %s survived SIGKILL for 10s", strings.Join(strings.Fields(string(left)), ","), j.CgroupDir())
 		}
 		select {
 		case <-ctx.Done():
@@ -177,7 +187,6 @@ func (h *hostOS) killFirecracker(ctx context.Context, j *jailer.Jail, pid int) e
 		case <-time.After(20 * time.Millisecond):
 		}
 	}
-	return fmt.Errorf("pid %d didn't exit within 10s of SIGKILL", pid)
 }
 
 // osProcess is a Firecracker started by this tined.

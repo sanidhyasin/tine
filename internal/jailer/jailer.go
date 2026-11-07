@@ -404,16 +404,15 @@ func (j *Jail) PID() (int, error) {
 // Cleanup removes the jail's cgroup and directory. Firecracker must have
 // exited first: a cgroup can't be removed while a process is in it. Cleaning
 // up a jail that's already gone is fine.
+//
+// If the cgroup can't be removed, something may still run in it, so the
+// jail's files are left alone and Cleanup returns the error.
 func (j *Jail) Cleanup() error {
-	var errs []error
 	if err := removeCgroup(j.CgroupDir()); err != nil {
-		errs = append(errs, err)
+		return fmt.Errorf("clean up jail %s (its files are kept while the cgroup remains): %w", j.ID, err)
 	}
 	if err := os.RemoveAll(j.Dir); err != nil {
-		errs = append(errs, fmt.Errorf("remove %s: %w", j.Dir, err))
-	}
-	if err := errors.Join(errs...); err != nil {
-		return fmt.Errorf("clean up jail %s: %w", j.ID, err)
+		return fmt.Errorf("clean up jail %s: remove %s: %w", j.ID, j.Dir, err)
 	}
 	return nil
 }

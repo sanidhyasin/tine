@@ -515,3 +515,18 @@ func startAgent(t *testing.T) *agentproto.Client {
 		return d.DialContext(ctx, "unix", sock)
 	})
 }
+
+func TestDestroyKeepsTheNetworkIfTheJailCantBeCleaned(t *testing.T) {
+	f := newFixture(t, nil)
+	ctx := context.Background()
+	vm, _ := f.m.Create(ctx, CreateRequest{})
+	f.host.takeCalls()
+	f.host.fail("cleanupJail", errors.New("cgroup busy"))
+	if _, err := f.m.Destroy(ctx, vm.ID); err == nil {
+		t.Fatal("Destroy: want an error")
+	}
+	// The VM may still be running, so its network must stay.
+	if got, want := strings.Join(f.host.takeCalls(), ","), "kill,cleanupJail"; got != want {
+		t.Errorf("host calls:\n got %s\nwant %s", got, want)
+	}
+}

@@ -366,3 +366,21 @@ func TestCreateFile(t *testing.T) {
 		t.Error("CreateFile with a relative path: want an error")
 	}
 }
+
+func TestCleanupKeepsTheJailWhileItsCgroupRemains(t *testing.T) {
+	cfg := testConfig(t)
+	j, _ := New(cfg, testSpec())
+	if err := j.Prepare(); err != nil {
+		t.Fatal(err)
+	}
+	// A cgroup that can't be removed, as when a process is still in it.
+	if err := os.MkdirAll(filepath.Join(j.CgroupDir(), "busy"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Cleanup(); err == nil {
+		t.Fatal("Cleanup with a cgroup that can't be removed: want an error")
+	}
+	if _, err := os.Stat(j.Root); err != nil {
+		t.Errorf("the jail's files were removed although its cgroup remains: %v", err)
+	}
+}

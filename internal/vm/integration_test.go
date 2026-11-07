@@ -218,6 +218,31 @@ func TestRealParallelCreates(t *testing.T) {
 	t.Logf("one VM's timings (ms): %s", formatTimings(vms[0].Timings))
 }
 
+// TestRealDestroyAfterRestart destroys a VM with a manager that didn't
+// start it, as happens after tined restarts: it has to find and stop that
+// VM's Firecracker by its cgroup.
+func TestRealDestroyAfterRestart(t *testing.T) {
+	m := realManager(t, nil)
+	ctx := context.Background()
+	vm, err := m.Create(ctx, CreateRequest{})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	restarted, err := New(m.cfg, m.store) // a new manager owns no processes
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(execOut(t, restarted, vm.ID, "echo", "still here")); got != "still here" {
+		t.Errorf("exec after the restart = %q", got)
+	}
+	gone, err := restarted.Destroy(ctx, vm.ID)
+	if err != nil || gone.State != state.StateDestroyed {
+		t.Fatalf("Destroy after restart = %s, %v", gone.State, err)
+	}
+	requireClean(t, m, "after destroying it from the restarted manager")
+}
+
 // TestRealRollback makes a real create fail late (the agent gets too little
 // time to start) and checks the undo leaves the host clean.
 func TestRealRollback(t *testing.T) {
