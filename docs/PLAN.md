@@ -22,7 +22,9 @@ The *why* behind the project is in [BRIEF.md](../BRIEF.md). This file is the *ho
 
 ## Where we are
 
-**Step 1 is done, released as v0.1.0.** tined runs isolated microVMs under systemd, and `tine` creates them, runs commands in them and destroys them. How it all works is in [architecture.md](architecture.md). Next is step 2, starting with task 2.1.
+**Step 2 is done, released as v0.2.0.** On top of step 1's isolated microVMs, tined snapshots running VMs, rolls them back, and starts new VMs from pre-booted templates in 111 ms instead of booting them in 1.84 s. How it all works is in [architecture.md](architecture.md). Next is step 3, fork, starting with task 3.1.
+
+Step 1 (v0.1.0) built the foundations: tined under systemd, and `tine` creating VMs, running commands in them and destroying them.
 
 Step 0 was booting a microVM by hand on the dev server: logging in over SSH, watching memory being handed out lazily, and pausing and resuming a running VM.
 
@@ -415,7 +417,7 @@ The time between steps 1 and 4 is the VM's **pause time**, which we report separ
   - Leak check.
 
   *Also: a template in use can't be deleted, and a destroyed VM's snapshot is collected; a snapshot is refused while a command runs; and tined is SIGKILLed while snapshotting a 4 GiB VM. The leak check now requires that only ready templates are left, and that the store holds exactly the snapshots tined has records of. The kill test found that a restart can meet a Firecracker still writing a big snapshot, whose API won't answer until it's done; reconcile now resumes such a VM in the background, with commands for it waiting, and clears the interrupted snapshot's files from its jail. All 13 e2e tests pass. `make measure` gained sections for templates, rollbacks and snapshots, with numbers under Measure below.*
-- [ ] **2.9 Docs and release:** update `docs/architecture.md`, tag `v0.2.0`.
+- [x] **2.9 Docs and release:** update `docs/architecture.md`, tag `v0.2.0`. *The architecture doc has a new section on snapshots, templates, restores, `/sync`, rollback and garbage collection, and every other section is brought up to date: isolation, networking, state and recovery, the API, metrics, testing (with the bugs step 2's tests caught), the measured numbers, and the known limits.*
 
 ### Done when
 
@@ -696,7 +698,7 @@ with Sandbox.create(image="python") as sb:            # destroyed automatically 
 |---|---|
 | Nested virtualization behaves or performs differently from bare metal (userfaultfd, dirty-page tracking, timing) | Label nested numbers. Do the final runs on bare metal. |
 | Diff snapshots are a developer preview in Firecracker | Keep them behind a flag, with full snapshots (rung 3) as the safe default |
-| The guest kernel might not reseed randomness on VMGenID | Check early in step 2. The agent's entropy mixing covers it either way. |
+| The guest kernel might not reseed randomness on VMGenID | Checked in step 2: it does (it logs "crng reseeded due to virtual machine fork"), and the agent mixes in host entropy too. |
 | vsock connections reset on every snapshot | `tined` reconnects with retries, and snapshots refuse while an exec is running |
 | Hard links and reflinks need everything on one filesystem | Everything lives under `/srv/tine` on the XFS volume |
 | Snapshots only restore on the same Firecracker version and CPU | Check metadata, and re-warm templates after upgrades or on new hosts |

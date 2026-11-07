@@ -2,20 +2,25 @@
 
 Fork a running microVM into many copies in milliseconds. Built on [Firecracker](https://github.com/firecracker-microvm/firecracker).
 
-> **Status: v0.1.0, step 1 done.** tined runs isolated microVMs, and the `tine` command creates them, runs commands in them and destroys them. Snapshots and forks come in steps 2 and 3. The step-by-step build plan is in [docs/PLAN.md](docs/PLAN.md), and the reasons behind the project are in [BRIEF.md](BRIEF.md).
+> **Status: v0.2.0, step 2 done.** tined runs isolated microVMs, and the `tine` command creates them, runs commands in them, snapshots them, rolls them back and destroys them. New VMs start from pre-booted templates in about a tenth of a second. Forks come in step 3. The step-by-step build plan is in [docs/PLAN.md](docs/PLAN.md), and the reasons behind the project are in [BRIEF.md](BRIEF.md).
 
 ## How it works
 
 A service, `tined`, owns every VM on a Linux server. For each one it builds a jail (its own files, user, cgroup and network namespace, behind nftables rules) and starts Firecracker in it. Inside each guest, `tine-agent` runs commands for tined over vsock. Each VM's Firecracker lives in its own cgroup, so VMs keep running when tined restarts, and tined's records in SQLite let it reconcile with what's really on the host when it comes back.
 
+A snapshot freezes a VM for a moment and saves its memory, devices and disk, read-only. A VM restored from one wakes up exactly where it left off, and tine-agent then gives it the right time, fresh randomness and its own identity. Templates are images booted once and snapshotted, so `tine create` restores instead of booting, and rollback puts a VM back to one of its snapshots.
+
 Measured on the dev server (an m8i.xlarge, through nested virtualization):
 
 | What | Result |
 |---|---|
-| Create, from nothing to a VM that runs commands | 1.83 s p50, 1.89 s p99, almost all of it the guest booting |
-| Run `true` in a VM, through the API | 1.7 ms p50 |
+| Create from a template, to a VM that runs commands | 111 ms p50, 145 ms p99 |
+| Create by booting | 1.84 s p50, 1.91 s p99 |
+| Roll a VM back to a snapshot | 127 ms p50 |
+| Snapshot: how long a 1 GiB VM is paused | 341 ms p50 (47 ms at 256 MiB; 22 s at 4 GiB on this disk) |
+| Run `true` in a VM, through the API | 1.8 ms p50 |
 | Destroy | 32 ms p50 |
-| Host memory for an idle 1 GiB VM | 127 MiB |
+| Host memory for an idle 1 GiB VM | 127 MiB booted; only 19 MiB of it its own when restored from a template |
 
 The full design, with the numbers and the known limits, is in [docs/architecture.md](docs/architecture.md).
 
@@ -25,7 +30,7 @@ The full design, with the numbers and the known limits, is in [docs/architecture
 |---|---|
 | `BRIEF.md` | Project brief: goals, design, build order, reading list |
 | `docs/PLAN.md` | The build plan: every step, its design, tasks, and "done when" checks |
-| `docs/architecture.md` | How tine works: every part, the isolation, recovery, tests and measured numbers |
+| `docs/architecture.md` | How tine works: every part, snapshots and templates, the isolation, recovery, tests and measured numbers |
 | `docs/` | Also the step-by-step walkthroughs |
 | `cmd/`, `internal/` | The Go code: `tine` (CLI), `tined` (service), `tine-agent` (runs in each VM) |
 | `deploy/` | `tined.service`, the systemd unit `make deploy` installs |
@@ -33,7 +38,7 @@ The full design, with the numbers and the known limits, is in [docs/architecture
 | `Makefile` | `make build`, `make check`, `make deploy`, `make e2e`, `make measure`. Run `make` to list them all. |
 | `scripts/dev-server.sh` | Create, start, stop and SSH into the AWS dev server. Runs on your Mac. |
 | `scripts/host-setup.sh` | Prepares the server: KVM, the `/srv/tine` data volume, Firecracker, a guest kernel and disk image |
-| `scripts/measure.sh` | Measures create, exec and memory per VM against the running tined (`make measure`) |
+| `scripts/measure.sh` | Measures creates, execs, memory, snapshots and rollbacks against the running tined (`make measure`) |
 | `artifacts/` | Downloaded binaries and images. Created on the server, never committed. |
 
 ## Quick start
@@ -50,7 +55,7 @@ Copy the repo over and prepare the server. It's safe to re-run.
 ./scripts/dev-server.sh setup
 ```
 
-Build tine, install it on the server (tined runs under systemd), and build the `base` image VMs boot from (Ubuntu with `tine-agent` inside):
+Build tine, install it on the server (tined runs under systemd), and build the `base` image VMs start from (Ubuntu with `tine-agent` inside), along with its template:
 
 ```bash
 make base-image
@@ -67,29 +72,40 @@ Then log in:
 On the server, `tine` talks to tined. No `sudo` is needed: `host-setup.sh` adds you to the `tine` group.
 
 ```
-$ tine create
-vm-rea7pcrcpb  running  (created in 1.95s: allocate 0.4ms · network 9.8ms · jail 11ms · start 1.8ms · configure 121ms · boot 1.80s)
+$ tine create                      # restored from base's template
+vm-yxr4tliv4w  running  (restored from template snap-wuh3tqanur in 130ms: allocate 1.3ms · network 6.9ms · jail 0.4ms · start 2.2ms · restore 16ms · agent 64ms · sync 39ms)
 
-$ tine exec rea7 uname -r          # any unique prefix of an ID works
+$ tine exec yxr4 uname -r          # any unique prefix of an ID works
 6.18.56+
 
-$ tine exec rea7 -- sh -c 'echo hi; exit 5'; echo "exit $?"
+$ tine exec yxr4 -- sh -c 'echo hi; exit 5'; echo "exit $?"
 hi
 exit 5                             # tine exits with the command's own code
 
+$ tine snapshot yxr4               # a save point; the VM is paused for a moment
+snap-u3iqp7pu3w  of vm-yxr4tliv4w  1.3 GiB  (paused 341ms: memory 340ms · disk 0.3ms; total 343ms)
+
+$ tine exec yxr4 -- rm -rf /root   # oops
+$ tine rollback yxr4 --to u3iq     # snapshot IDs take prefixes too
+rolled back vm-yxr4tliv4w to snap-u3iqp7pu3w (127ms)
+
 $ tine ls
 ID             STATE    IMAGE  VCPUS  MEMORY  AGE  EXPIRES IN
-vm-rea7pcrcpb  running  base   2      1 GiB   3s   59m
+vm-yxr4tliv4w  running  base   2      1 GiB   41s  59m
 
-$ tine destroy rea7
-destroyed vm-rea7pcrcpb (29ms)
+$ tine destroy yxr4
+destroyed vm-yxr4tliv4w (29ms)
 ```
+
+The output is from the dev server, with one VM's IDs throughout; the timings vary from run to run.
 
 More:
 
 - `tine create --vcpus 4 --memory 2G --ttl 30m`. VMs are destroyed automatically when their time is up, after 1 hour by default. `tine create -q` prints just the ID, for scripts.
+- `tine create --cold` boots instead of restoring. A template is for one size, so other sizes boot unless you warm one: `tine image warm base --vcpus 4 --memory 2G`. `tine images` shows each image's templates. tined keeps `base` warm at the default size by itself, even after an upgrade.
+- `tine snapshot ls` lists snapshots and the VMs running from each, `tine snapshot inspect` shows one, and `tine snapshot rm` deletes them. A snapshot that VMs run from can't be deleted, and a destroyed VM's snapshots go by themselves.
 - `tine exec` takes `-e KEY=VALUE`, `-w DIR`, `--timeout 30s`, and `-i` to pipe stdin in. Output streams as it happens, and Ctrl+C stops the command in the VM too.
-- `tine inspect VM` shows everything, including where each step's time went. `tine images` and `tine version` (which also shows tined's version) round it out.
+- `tine inspect VM` shows everything, including how the VM started and where each step's time went. `tine version` also shows tined's version.
 - Every command takes `--json`.
 
 tined's API is plain HTTP on `/run/tine/tine.sock` (see `internal/api`), so `curl --unix-socket /run/tine/tine.sock http://tined/v1/vms` works too.

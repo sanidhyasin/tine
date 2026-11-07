@@ -1,14 +1,15 @@
 # tine architecture
 
-This is how tine works as of **v0.1.0**, the end of step 1: one service on a Linux server that creates microVMs, runs commands in them and destroys them, safely and without leaking anything.
+This is how tine works as of **v0.2.0**, the end of step 2: one service on a Linux server that creates microVMs, runs commands in them, snapshots them, rolls them back, starts new ones from pre-booted templates in about a tenth of a second, and destroys them, safely and without leaking anything.
 
-Each section starts in plain words and then gives the detail. The *why* of the project is in [BRIEF.md](../BRIEF.md), and the step-by-step plan, including what comes after v0.1.0, is in [PLAN.md](PLAN.md).
+Each section starts in plain words and then gives the detail. The *why* of the project is in [BRIEF.md](../BRIEF.md), and the step-by-step plan, including what comes after v0.2.0, is in [PLAN.md](PLAN.md).
 
 ## Contents
 
 - [The big picture](#the-big-picture)
 - [The code](#the-code)
 - [Life of a VM](#life-of-a-vm)
+- [Snapshots, templates and rollback](#snapshots-templates-and-rollback)
 - [Isolation: what keeps a VM in](#isolation-what-keeps-a-vm-in)
 - [Networking](#networking)
 - [Talking to the guest: vsock and tine-agent](#talking-to-the-guest-vsock-and-tine-agent)
@@ -23,18 +24,19 @@ Each section starts in plain words and then gives the detail. The *why* of the p
 
 ## The big picture
 
-**In plain words:** a program called `tined` runs on the server and owns every VM. You ask it for things with the `tine` command. For each VM, tined builds a locked box (its own files, its own user, its own slice of CPU and memory, its own network) and starts Firecracker inside it. Firecracker runs the guest: a real Linux kernel on virtual hardware. Inside every guest, a small program called `tine-agent` runs commands for tined. tined talks to it over vsock, a direct pipe between host and guest, so no SSH or guest network is involved.
+**In plain words:** a program called `tined` runs on the server and owns every VM. You ask it for things with the `tine` command. For each VM, tined builds a locked box (its own files, its own user, its own slice of CPU and memory, its own network) and starts Firecracker inside it. Firecracker runs the guest: a real Linux kernel on virtual hardware. Inside every guest, a small program called `tine-agent` runs commands for tined. tined talks to it over vsock, a direct pipe between host and guest, so no SSH or guest network is involved. tined can also freeze a VM and save it as a snapshot, then start new VMs from it, or put the VM back to it.
 
 ```
  you
-  │  tine create / exec / ls / destroy
+  │  tine create / exec / snapshot / rollback / ls / destroy
   ▼
  tine (CLI) ──── HTTP over /run/tine/tine.sock ────┐
                                                    ▼
 ┌─────────────────────────────── tined ─────────────────────────────────────┐
 │ api      HTTP routes, errors, request IDs, /metrics                       │
-│ vm       create (with undo) · destroy · exec · reconcile · reaper         │
-│ state    SQLite: VMs, images, every state change                          │
+│ vm       create: boot or restore (with undo) · snapshot · rollback ·      │
+│          destroy · exec · templates · reconcile · reaper and snapshot GC  │
+│ state    SQLite: VMs, images, snapshots, every state change               │
 └──────┬──────────────────┬─────────────────────┬───────────────────────────┘
        │ netns            │ jailer               │ firecracker + agentproto
        ▼                  ▼                      ▼
@@ -44,13 +46,16 @@ Each section starts in plain words and then gives the detail. The *why* of the p
  │   firecracker ── KVM ── guest Linux                                    │
  │                           └─ tine-agent (vsock port 1024)              │
  └────────────────────────────────────────────────────────────────────────┘
+ /srv/tine/snapshots/<snap-id>/   vmstate, memory, rootfs.ext4: read-only,
+                                  hard-linked into the jails of VMs restored from it
 ```
 
 Some properties that hold throughout:
 
 - **tined is the only thing that changes VMs.** The CLI is a thin client of tined's HTTP API, the same split as `docker` and `dockerd`.
 - **VMs don't depend on tined staying up.** Each Firecracker runs in its own cgroup, outside tined's, so restarting or even killing tined leaves VMs running. When tined starts, it reconciles its records with what's actually on the host.
-- **Every operation is timed.** Each create returns a `timings_ms` breakdown, and the same numbers feed Prometheus.
+- **A snapshot never changes.** Its files are read-only, and every VM restored from it maps the same memory file, so the host's page cache holds it once.
+- **Every operation is timed.** Each create, snapshot and rollback reports a `timings_ms` breakdown, and the same numbers feed Prometheus.
 
 ## The code
 
@@ -59,15 +64,15 @@ Three binaries, all Go, built on the Mac (or in CI) for linux/amd64 and run on t
 | Binary | What it is |
 |---|---|
 | `cmd/tined` | The service. `tined serve` runs under systemd; `tined image import` builds images. |
-| `cmd/tine` | The CLI: `create`, `ls`, `inspect`, `exec`, `destroy`, `images`, `version`. |
-| `cmd/tine-agent` | Runs inside every guest and serves `/health` and `/exec` over vsock. |
+| `cmd/tine` | The CLI: `create`, `ls`, `inspect`, `exec`, `snapshot` (and `snapshot ls`, `inspect`, `rm`), `rollback`, `destroy`, `images`, `image warm`, `version`. |
+| `cmd/tine-agent` | Runs inside every guest and serves `/health`, `/exec` and `/sync` over vsock. |
 
 The packages under `internal/`:
 
 | Package | Job | Imports from tine |
 |---|---|---|
 | `api` | HTTP server and Go client for tined's API | `vm`, `state`, `image`, `agentproto`, `metrics`, `logging` |
-| `vm` | The VM manager: lifecycle, rollback, reconcile, reaper | everything below |
+| `vm` | The VM manager: lifecycle with undo, snapshots, restores, templates, rollback, reconcile, reaper and snapshot GC | everything below |
 | `state` | SQLite store, migrations and the VM state machine | none |
 | `jailer` | Builds a VM's jail and the jailer command line | `storage` |
 | `netns` | A VM's network namespace, devices and firewall rules | none |
@@ -75,6 +80,7 @@ The packages under `internal/`:
 | `agentproto` | The host ↔ guest protocol, and the host's client for it | none |
 | `agent` | The server inside the guest | `agentproto` |
 | `image` | Builds and reads images | none |
+| `snapshot` | The snapshot store: files, metadata, compatibility checks | none |
 | `storage` | Reflink copies and hard links | none |
 | `idalloc` | Allocates network slots | none |
 | `metrics`, `logging` | Prometheus metrics; structured logs with request and VM IDs | none |
@@ -84,7 +90,7 @@ The packages under `internal/`:
 
 ## Life of a VM
 
-**In plain words:** a VM is a row in a database that moves through a few states. tined builds the VM one stage at a time, and if any stage fails it undoes the earlier ones in reverse order, so a failed create leaves nothing behind.
+**In plain words:** a VM is a row in a database that moves through a few states. tined builds the VM one stage at a time, and if any stage fails it undoes the earlier ones in reverse order, so a failed create leaves nothing behind. A VM starts in one of three ways, which its record keeps as its `source`: booted (`cold`), restored from its image's `template`, or restored from another `snapshot`.
 
 ### States
 
@@ -101,19 +107,20 @@ The store enforces this table, not the callers. Every change is recorded in `vm_
 
 ### Create
 
-`POST /v1/vms` runs these stages in order. The times are from 100 creates, one at a time, on the dev server ([measured numbers](#measured-numbers)).
+`POST /v1/vms` restores the VM from its image's template if there's a usable one (see [Restoring](#restoring)), and otherwise boots it. Booting runs these stages in order. The times are from 100 cold creates, one at a time, on the dev server ([measured numbers](#measured-numbers)).
 
 | Stage | What happens | p50 |
 |---|---|---|
-| allocate | Check the image and the VM limit. Pick an ID (`vm-` plus 10 base32 characters), a network slot and a uid. Record the VM as `creating`. | 0.30 ms |
+| allocate | Check the image and the VM limit. Pick an ID (`vm-` plus 10 base32 characters), a network slot and a uid. Record the VM as `creating`. | 0.32 ms |
 | network | Create the namespace `tine-<id>` with `tap0`, the veth pair, routes, NAT and firewall rules. | 5.2 ms |
 | jail | Create the chroot, hard-link the kernel, and reflink-copy the 4 GiB disk. | 0.32 ms |
 | start | Run the jailer, which sets up the cgroup and namespace and becomes Firecracker. | 0.20 ms |
 | configure | Over Firecracker's API: logger, machine config, kernel and boot arguments, root drive, network interface, vsock, entropy device, then `InstanceStart`. | 21 ms |
 | agent | The guest kernel and systemd boot until `tine-agent` answers `/health` over vsock. | 1.81 s |
-| **total** | | **1.83 s** (p99 1.89 s) |
+| sync | The agent's `/sync` sets the clock, entropy, hostname and machine ID (see [Restoring](#restoring)). | 5.3 ms |
+| **total** | | **1.84 s** (p99 1.91 s) |
 
-Almost all of a create is the guest booting. Step 2 replaces this cold boot with a restore from a ready snapshot.
+Almost all of a cold create is the guest booting, which is why templates exist: a create from one takes 111 ms.
 
 **Undo.** Each stage that creates something pushes its undo onto a stack. If a later stage fails:
 
@@ -149,7 +156,107 @@ tine ──HTTP──► tined ──vsock──► tine-agent ──► the com
 3. The last line is always the exit status: `{"exit":{"code":0,"duration_ms":0.96}}`. It also records a killing signal, a timeout, or that output passed the cap (10 MiB by default) and was cut.
 4. A timeout, or the client hanging up (Ctrl+C on `tine exec`), kills the whole process group. A background process the command leaves running doesn't keep the exec waiting.
 
-`tine exec` exits with the command's own code, 128+n for a signal, and 124 for a timeout. Running `true` takes **1.7 ms** round trip through the API, of which about 1 ms is inside the guest.
+`tine exec` exits with the command's own code, 128+n for a signal, and 124 for a timeout. Running `true` takes **1.8 ms** round trip through the API, of which about 1 ms is inside the guest. An exec that arrives while the VM is being snapshotted or rolled back waits for that to finish.
+
+## Snapshots, templates and rollback
+
+**In plain words:** a snapshot is a save point. tined freezes a VM for a moment, writes its memory and devices to files, copies its disk (instantly, as a reflink), and lets it carry on. A VM can then be started from a snapshot instead of booting, which is called a *restore*. It wakes up exactly where the snapshot left it, programs and all. Templates use this for speed: each image is booted once and saved once it's ready, and new VMs start from that save point in about a tenth of a second. Rollback puts a VM back to one of its save points.
+
+### Taking a snapshot
+
+`POST /v1/vms/{id}/snapshots`, or `tine snapshot VM`, runs these stages. The times are for a 1 GiB VM.
+
+| Stage | What happens | p50 |
+|---|---|---|
+| wait | The VM's previous snapshot must be on disk first (see below) | 0 to 8 s |
+| prepare | Give the jail an empty `/snapshot` directory for Firecracker to write into | under 0.1 ms |
+| pause | `PATCH /vm {"state": "Paused"}`: the vCPUs stop | 0.3 ms |
+| memory | `PUT /snapshot/create`: Firecracker writes `vmstate` and `memory`, without waiting for the disk (`sync_snapshot_files: false`) | about 340 ms |
+| disk | Reflink the VM's disk into the snapshot | 0.3 ms |
+| resume | `PATCH /vm {"state": "Resumed"}` | 0.5 ms |
+| collect | Move the two files into the store (renames: one filesystem) | under 0.1 ms |
+| agent | Taking a snapshot resets the guest's vsock connections, so check that its agent answers again | 1 to 5 ms |
+
+`paused`, the time from pause to resume, is reported on its own, because it's the part a VM's user notices.
+
+The manager runs each step itself through small host calls, so unit tests can fail each step in turn. Whatever fails after the pause, the VM is resumed, and a VM that can't be resumed is marked `failed`. Once the VM is paused, the snapshot runs to the end even if the client hangs up.
+
+A snapshot is refused (409 `busy`) while commands run in the VM, because the vsock reset would cut them off. A command that arrives during a snapshot waits for it. A VM may have 16 snapshots, and a snapshot must leave 2 GiB of disk free (507 `no_space`).
+
+**Snapshots and the page cache.** Firecracker writes the memory file through the page cache, and Linux charges those pages to the writer's cgroup, which is the VM's. With the step 1 limit (memory plus 256 MiB), a second snapshot made the kernel write the first one's dirty pages to disk while the VM was paused, which took 11.7 s, or kill Firecracker for running out of memory. The real-VM test found this. Now:
+
+1. Each VM's `memory.max` has room for one snapshot's memory file: twice its memory, plus 256 MiB.
+2. Once the VM is running again, tined flushes the new memory file to disk in the background, so its cached pages become clean and the kernel can drop them at no cost.
+3. The VM's next snapshot waits for that flush before pausing it (the `wait` stage).
+
+On this EBS volume a flush takes about 8 s per GiB, so back-to-back snapshots of one VM go at the disk's speed. That wait comes before the pause, not during it.
+
+### The snapshot store
+
+```
+/srv/tine/snapshots/<snap-id>/        root, 0700
+├── vmstate        Firecracker's device and CPU state     0444
+├── memory         guest memory: never changes again        0444
+├── rootfs.ext4    reflink copy of the disk at that moment  0400
+└── snapshot.json  metadata                                 0444
+```
+
+- **Atomic.** A snapshot is gathered in `.new-<id>` and renamed into place when it's complete, so a directory named after a snapshot always holds a whole one.
+- **Read-only, owned by root.** Restored VMs get hard links to `vmstate` and `memory`, which they can read but not write. Firecracker requires the memory file to stay unchanged while any VM runs from it.
+- **Compatibility.** `snapshot.json` records the Firecracker version, CPU model and host kernel. Firecracker only restores a snapshot on the same software and hardware it was taken on, so all three must match (409 `incompatible`). It also records which build of the image the VM ran, with the size, the bytes of each file and the stage timings.
+- **Records.** The `snapshots` table holds each snapshot's kind (`vm` or `template`) and state (`creating`, `ready`, `deleting`). Each VM's `snapshot_id` names the snapshot it runs from. "In use" is a query, the live VMs with that `snapshot_id`, rather than a counter that could drift. Claiming a snapshot for a restore and marking it for deletion are each one transaction, so they can't race; a test runs them against each other 20 times.
+
+### Restoring
+
+A create from a snapshot runs the same first stages as a boot, then loads instead of booting:
+
+| Stage | What happens | p50 |
+|---|---|---|
+| allocate | As for a boot, and the record claims the snapshot | 0.5 ms |
+| network | As for a boot | 4.4 ms |
+| jail | Hard links to `vmstate` and `memory` under `/restore/`, and a reflink of the snapshot's disk at `/rootfs.ext4` | 0.3 ms |
+| start | As for a boot | 0.2 ms |
+| restore | Over Firecracker's API: the logger, then `PUT /snapshot/load` from the memory file, resuming the VM | 13 ms |
+| agent | Until the guest's agent answers | 61 ms |
+| sync | `/sync` (below) | 32 ms |
+| **total** | from the template, one at a time (n=100) | **111 ms** (p99 145 ms) |
+
+- **The same paths as the original.** A restore needs every device at the path the snapshotted VM had it. Every jail has `/rootfs.ext4` and `/vsock.sock`, and every namespace has `tap0`, so nothing in the guest needs changing.
+- **Out of the way of new snapshots.** The restored files sit under `/restore`, apart from `/snapshot` where Firecracker writes new ones, so a snapshot can never be written over the files a VM runs from. Being read-only, they couldn't be anyway.
+- **Most of the time is first touches of memory.** Restored memory is mapped from the file and loaded page by page as the guest touches it. Each first touch is a page fault, which nested virtualization makes expensive. Bare metal and prefaulting are for step 4.
+
+**`/sync` makes a restored guest current and unique.** tined calls it after every create, booted ones included, so every VM is the same in these ways however it started:
+
+| A restored guest has | What fixes it |
+|---|---|
+| the snapshot's wall clock, behind by however long ago the snapshot was taken | `/sync` sets the clock to the host's. The guest keeps time with the TSC, so Firecracker's `clock_realtime`, which moves kvmclock, made no difference, and it stays off. |
+| the snapshot's kernel random state | Firecracker's VMGenID device: the guest kernel reseeds on restore and logs "crng reseeded due to virtual machine fork". `/sync` also credits 64 bytes of host entropy and forces a reseed (`RNDADDENTROPY`, `RNDRESEEDCRNG`). |
+| the snapshot's hostname and machine ID | `/sync` sets the hostname to the VM's ID (in the kernel, `/etc/hostname` and `/etc/hosts`), and the machine ID to one derived from the VM's ID: unique to each VM, and the same after a rollback. |
+| the gateway's MAC in its ARP cache | Nothing to fix: every namespace's `tap0` has the same MAC, `06:00:AC:10:00:01`. |
+
+What `/sync` can't change is anything a program worked out before the snapshot, such as random numbers a process cached, or the kernel's `boot_id`. Every restore of one snapshot shares those, and open TCP connections don't survive. Firecracker's VMClock device lets programs notice a restore themselves.
+
+### Templates
+
+- **Warming** (`tine image warm IMAGE`, `POST /v1/images/{name}/warm`): tined boots the image, waits for `systemctl is-system-running --wait` so every service has started, snapshots it as a `template`, and destroys the VM. It takes about 6.5 s. A snapshot fixes a VM's size, so a template is for one image at one size.
+- **Choosing.** `tine create` uses the newest template for its image and size, if this host can restore it and the image hasn't been imported again since. Otherwise it boots, and notes why on the VM. `--cold` always boots. Each VM records how it started: `cold`, `template` or `snapshot`.
+- **Keeping them usable.** tined keeps the images in `--warm-images` (default `base`) warm by itself. At startup and every 15 s, a missing or unusable template is warmed again in the background, so templates come back after a Firecracker upgrade, a kernel upgrade or a re-import. After a failure it waits 10 minutes, and warms of one image and size never overlap.
+
+### Rollback
+
+`POST /v1/vms/{id}/rollback`, or `tine rollback VM --to SNAPSHOT`, puts a VM back to one of its own snapshots, or to the template it started from:
+
+1. Claim the snapshot, so it can't be deleted.
+2. Stop the VM's Firecracker (through its cgroup) and remove its jail. The network namespace stays.
+3. Build a new jail from the snapshot, load it, wait for the agent, and sync.
+
+The VM keeps its ID, network namespace, slot, uid, hostname and machine ID; everything since the snapshot is gone. A rollback takes 127 ms (p50). It's refused while commands run, a command that arrives during one waits, and a rollback that fails after the old VM is stopped marks the VM `failed`.
+
+### Deleting snapshots, and garbage
+
+- `DELETE /v1/snapshots/{id}`, or `tine snapshot rm`, is refused (409 `in_use`) while any live VM runs from the snapshot, and while it's still being taken.
+- Every 15 s the reaper deletes what nothing needs any more, once no VM runs from it: the snapshots of destroyed VMs, and templates that a newer one replaced or whose image is gone from the disk. Whether an image is gone is checked on disk, because the images table only knows the images registered at startup; a test caught the first version deleting a newly imported image's template.
+- So snapshots never outlive their VMs, whose time to live is an hour by default.
 
 ## Isolation: what keeps a VM in
 
@@ -161,7 +268,8 @@ tine ──HTTP──► tined ──vsock──► tine-agent ──► the com
 | Firecracker | A minimal virtual machine monitor: a few virtio devices and a serial console, with its built-in seccomp filters (tine doesn't turn them off). |
 | Jail: chroot | Firecracker sees only its own jail: the kernel, its disk, two sockets and a log. No other VM's files. |
 | Jail: uid | Each VM's Firecracker runs as its own unprivileged user, `200000 + slot`. The jail's files belong to it with mode 0700. |
-| Jail: cgroup | `cpu.max` (the VM's vCPUs), `memory.max` (guest memory plus 256 MiB) and `pids.max` (128) for each Firecracker. |
+| Jail: cgroup | `cpu.max` (the VM's vCPUs), `memory.max` (twice the guest's memory plus 256 MiB, with room for one snapshot's memory in the page cache) and `pids.max` (128) for each Firecracker. |
+| Snapshot files | Read-only and owned by root. A restored VM's jail has hard links to them that its Firecracker can read but not write. |
 | Network namespace | Each VM has its own network stack. Its only way out is the veth to the host, through the firewall below. |
 | Firewall | VMs reach the internet, and nothing else: not each other, not the host, not private addresses, not the EC2 metadata service. |
 | API socket | `/run/tine/tine.sock` is mode 0660, `root:tine`. Anyone else can't talk to tined at all. |
@@ -178,6 +286,8 @@ drwx------ 3 200106 200106         62 dev              the device nodes Firecrac
 -rw-r--r-- 2 root   root     27940040 vmlinux          hard link to the image's kernel (read-only)
 srwxr-xr-x 1 200106 200106          0 vsock.sock       host end of the guest's vsock
 ```
+
+A VM restored from a snapshot has no kernel in its jail; it has `restore/vmstate` and `restore/memory` instead, hard links to the snapshot's files, owned by root and read-only.
 
 The isolation is checked from inside real VMs, by an e2e test that runs 10 at once. Each must reach `1.1.1.1:443`, and each must fail to reach the metadata service, the host's SSH port through its gateway, and another VM's network. Blocked traffic is dropped, not refused, so the test requires a *timeout*. Without the firewall, a connection to another VM's namespace address would be refused at once by the kernel. A timeout proves the firewall stopped it, rather than nothing listening.
 
@@ -196,7 +306,7 @@ The isolation is checked from inside real VMs, by an e2e test that runs 10 at on
                                               └──────────────────────────────────────┘
 ```
 
-- **Inside every namespace:** `tap0` is `172.16.0.1/30`, and the guest is `172.16.0.2` with MAC `06:00:AC:10:00:02`. The guest's address is set on the kernel command line (`ip=172.16.0.2::172.16.0.1:255.255.255.252::eth0:off`), so it's up before userspace starts.
+- **Inside every namespace:** `tap0` is `172.16.0.1/30` with MAC `06:00:AC:10:00:01`, and the guest is `172.16.0.2` with MAC `06:00:AC:10:00:02`. The MACs are the same everywhere too, so a restored guest's ARP cache is still right. The guest's address is set on the kernel command line (`ip=172.16.0.2::172.16.0.1:255.255.255.252::eth0:off`), so it's up before userspace starts.
 - **Between namespace and host:** a veth pair. The VM's slot picks a /30 out of `10.200.0.0/16` (16,384 slots), and the host end is named `tine<slot>`.
 - **Firewall and NAT** are nftables, all in one `inet tine` table on the host and one in each namespace. Rules are generated in Go as nft scripts and applied with `nft -f`, which applies a whole script or none of it. Cleanup is deleting the table or the namespace.
 
@@ -245,8 +355,8 @@ One implementation detail: Linux creates a tap device in the network namespace o
 **In plain words:** vsock is a direct pipe between the host and the guest. It works even if the guest's network is broken or firewalled, and nothing on the network can reach it. tine-agent listens on it and runs commands for tined.
 
 - Firecracker exposes the guest's vsock (CID 3) as a Unix socket in the jail, `vsock.sock`. A host connection writes `CONNECT 1024\n` and gets `OK <port>\n` back, and from then on it's a plain byte stream to the agent's port 1024.
-- The agent serves HTTP/1.1 on it: `GET /health` and `POST /exec`. The request and response types are defined once in `agentproto`, which both sides import.
-- tined dials a fresh connection for each request. There's nothing to reconnect after a snapshot, which in step 2 resets vsock connections.
+- The agent serves HTTP/1.1 on it: `GET /health`, `POST /exec` and, since protocol version 2, `POST /sync`. The request and response types are defined once in `agentproto`, which both sides import.
+- tined dials a fresh connection for each request. There's nothing to reconnect after a snapshot, which resets vsock connections; the agent's listening socket survives it.
 - In the image, the agent's systemd unit starts early (`DefaultDependencies=no`, wanted by `sysinit.target`) and restarts forever. It only needs vsock, not the network or a login.
 - Commands run as root in the guest, in `/root`, with output capped. The guest is the sandbox, so root inside it is fine; the walls are outside it.
 
@@ -285,6 +395,7 @@ An import takes about 2.6 s. `image.json` records where every part came from, wi
 ```
 /srv/tine/                               XFS data volume (50 GB gp3, reflink=1)
 ├── images/<name>/                       vmlinux, rootfs.ext4, image.json
+├── snapshots/<snap-id>/                 vmstate, memory, rootfs.ext4, snapshot.json
 └── jail/firecracker/<vm-id>/root/       one jail per VM (shown above)
 /sys/fs/cgroup/tine/<vm-id>/             each VM's cgroup (tine/ is root-only, 0750)
 /var/run/netns/tine-<vm-id>              each VM's network namespace
@@ -298,7 +409,7 @@ An import takes about 2.6 s. `image.json` records where every part came from, wi
 
 **The store** is SQLite (`modernc.org/sqlite`, pure Go, no CGO) in WAL mode:
 
-- **Tables:** `images`, `vms`, and `vm_events`, a history of every state change with its reason.
+- **Tables:** `images`, `vms` (each VM's `snapshot_id` and `source` too), `snapshots`, and `vm_events`: a history of every state change with its reason, and notes such as "snapshot taken", "guest synced: its clock was 3.4s behind" or "booted, not restored: template … was imported again since".
 - **Uniqueness:** a network slot and a uid can each belong to only one VM that isn't destroyed (partial unique indexes).
 - **Migrations:** numbered SQL files embedded in the binary, each run in a transaction. tined refuses a database written by a newer version.
 - **Times** are stored fixed-width (`2006-01-02T15:04:05.000000000Z`), because SQLite compares them as text, and RFC 3339's variable-length fractions sort wrongly.
@@ -312,13 +423,16 @@ An import takes about 2.6 s. `image.json` records where every part came from, wi
 | `creating` | tined stopped mid-create | Undo whatever exists; the record says why |
 | `destroying` | tined stopped mid-destroy | Finish the destroy |
 | `running`, Firecracker alive | Normal | Keep it |
+| `running`, paused | tined stopped mid-snapshot | Resume it, and clear the snapshot's files out of its jail. If its Firecracker is still writing that snapshot and doesn't answer, do this in the background once it does; commands for the VM wait. |
 | `running`, Firecracker gone | It died while tined was down | Clean it up as failed |
 | `failed` | Kept for inspection | Keep it until it's destroyed or expires |
-| A namespace, jail, cgroup or veth no live VM owns | Leftover | Remove it, killing any processes in the cgroup |
+| A snapshot `creating` | tined stopped mid-snapshot | Remove its files and record |
+| A snapshot `deleting` | tined stopped mid-delete | Finish the delete |
+| A namespace, jail, cgroup, veth or snapshot directory nothing owns | Leftover | Remove it, killing any processes in the cgroup |
 
 It logs a one-line report, for example `kept 1; cleaned 1; orphans removed 2; errors 0`. While tined runs, it watches every Firecracker it started, and one that exits on its own marks its VM `failed`.
 
-**The reaper** wakes every 15 s and destroys VMs past their time to live (1 hour by default), so forgotten sandboxes clean themselves up. Hourly, it also purges records destroyed more than 7 days ago.
+**The reaper** wakes every 15 s and destroys VMs past their time to live (1 hour by default), so forgotten sandboxes clean themselves up. Each time it also deletes snapshots nothing needs, and warms templates that are missing or out of date. Hourly, it purges records destroyed more than 7 days ago.
 
 ## The API
 
@@ -326,12 +440,18 @@ It logs a one-line report, for example `kept 1; cleaned 1; orphans removed 2; er
 
 | Method and path | What it does |
 |---|---|
-| `POST /v1/vms` | Create a VM: `{"image", "vcpus", "memory_mib", "ttl_seconds"}`, each optional |
+| `POST /v1/vms` | Create a VM: `{"image", "vcpus", "memory_mib", "ttl_seconds", "cold"}`, each optional |
 | `GET /v1/vms` | List VMs (`?all=true` includes destroyed ones) |
 | `GET /v1/vms/{id}` | One VM, with its timings |
 | `POST /v1/vms/{id}/exec` | Run a command; the response streams NDJSON frames |
 | `DELETE /v1/vms/{id}` | Destroy a VM (idempotent) |
-| `GET /v1/images` | List images |
+| `POST /v1/vms/{id}/snapshots` | Snapshot a running VM |
+| `GET /v1/vms/{id}/snapshots` | A VM's snapshots |
+| `POST /v1/vms/{id}/rollback` | Roll a VM back: `{"snapshot_id"}` |
+| `GET /v1/snapshots` | List snapshots (`?vm=`, `?kind=`, `?image=`), with the VMs that run from each |
+| `GET /v1/snapshots/{id}`, `DELETE /v1/snapshots/{id}` | One snapshot; delete one |
+| `GET /v1/images` | List images, with their templates and whether each is usable |
+| `POST /v1/images/{name}/warm` | Warm a template: `{"vcpus", "memory_mib"}`, each optional |
 | `GET /healthz` | tined's version, uptime and VM count |
 | `GET /metrics` | Prometheus metrics |
 
@@ -346,16 +466,22 @@ Unknown JSON fields are rejected, so a typo like `"cpus"` fails loudly instead o
 | 400 | `invalid_request` | Bad JSON, an unknown field, an impossible size |
 | 404 | `not_found`, `image_not_found` | No such VM, image or endpoint |
 | 409 | `not_running`, `conflict` | Exec in a VM that isn't running; a change the state machine refuses |
-| 503 | `capacity` | The VM limit (64 by default) or every network slot is taken |
+| 409 | `busy` | A snapshot or rollback while commands run in the VM |
+| 409 | `in_use` | Deleting a snapshot that VMs run from |
+| 409 | `incompatible` | A snapshot taken with another Firecracker, CPU or host kernel |
+| 503 | `capacity` | The VM limit (64 by default), every network slot, or a VM's 16 snapshots are taken |
+| 507 | `no_space` | A snapshot wouldn't leave 2 GiB of disk free |
 | 500 | `internal` | Anything else; tined logs it with the request ID |
 
 Every response carries an `X-Request-Id` header, which is also on every log line written while handling that request.
 
 ## Observability
 
-- **Timings in every response.** A create's `timings_ms` gives each stage above, and a destroy adds `destroy`.
+- **Timings in every response.** A create's `timings_ms` gives each stage above, a destroy adds `destroy` and a rollback `rollback`, and a snapshot has its own stages, `paused` included.
 - **Prometheus metrics** on the socket at `/metrics`, and on `127.0.0.1:9101` for a Prometheus server:
-  - `tine_vm_create_stage_seconds{stage}`, `tine_vm_creates_total{result}`, `tine_vm_create_failures_total{stage}`
+  - `tine_vm_create_stage_seconds{source,stage}`, `tine_vm_creates_total{result}`, `tine_vm_create_failures_total{stage}`
+  - `tine_snapshot_stage_seconds{stage}` (with `paused` and the background `flush`), `tine_snapshots_total{kind,result}`, `tine_snapshot_failures_total{stage}`, `tine_snapshot_bytes`, `tine_snapshots_deleted_total{reason}`
+  - `tine_vm_rollback_stage_seconds{stage}`
   - `tine_vm_destroy_seconds`, `tine_vm_destroys_total{result}`
   - `tine_exec_seconds`, `tine_execs_total{result}`
   - `tine_firecracker_api_seconds{endpoint}`, `tine_firecracker_api_errors_total{endpoint}`
@@ -386,8 +512,8 @@ tined runs as `deploy/tined.service`, which `make deploy` installs:
 
 | Level | Command | Runs where | What it covers |
 |---|---|---|---|
-| Unit | `make check` (also CI on every push) | Mac, CI | Every package, with the race detector. Fakes: a fake Firecracker socket, a fake host that fails each create stage in turn, the real agent and client over Unix sockets. |
-| Integration | `make test-integration` | Dev server, as root | Each low-level package against the real thing: Firecracker, the jailer, namespaces and nftables, reflinks, image import, and the VM manager booting real VMs. |
+| Unit | `make check` (also CI on every push) | Mac, CI | Every package, with the race detector. Fakes: a fake Firecracker socket, a fake host that fails each create, snapshot and rollback stage in turn or holds one to catch the manager in the middle, and the real agent and client over Unix sockets. |
+| Integration | `make test-integration` | Dev server, as root | Each low-level package against the real thing: Firecracker (a snapshot loaded into a new process), the jailer, namespaces and nftables, reflinks, image import, and the VM manager booting, snapshotting, restoring and rolling back real VMs. |
 | End to end | `make e2e` | Dev server, real tined under systemd | Black-box through the API (list below), ending in a strict leak check |
 | Measure | `make measure` | Dev server | The numbers below |
 
@@ -399,9 +525,15 @@ The e2e suite:
 - `SIGKILL` to tined mid-create, and again with VMs running (they survive with their data)
 - a VM whose Firecracker is killed while tined is down
 - 10 VMs at once, checking isolation as described above
+- a rollback brings a changed file back, and the VM keeps its ID, network and hostname
+- a VM restored from an old template has the host's time
+- two restores of one template read different random numbers, with their own hostnames and machine IDs
+- a template in use can't be deleted, and a destroyed VM's snapshot is collected
+- a snapshot is refused while a command runs
+- `SIGKILL` to tined while it snapshots a 4 GiB VM: the VM comes back running, with nothing half-done
 - a VM with a 60 s time to live, which must be reaped while the rest run
 
-At the end, the leak check requires zero live VMs, network namespaces, veths, jails, cgroups and Firecracker processes. The suite takes about 2 minutes.
+At the end, the leak check requires zero live VMs, network namespaces, veths, jails, cgroups and Firecracker processes, and no snapshots but ready templates, with the store holding exactly the snapshots tined has records of. The suite takes about 3 minutes.
 
 Bugs these tests caught before release:
 
@@ -409,6 +541,9 @@ Bugs these tests caught before release:
 - **Ten racing destroys all "won".** The store accepted a change from a state to itself. Found by the store's concurrency test. Fixed by refusing same-state changes.
 - **Times sorted wrongly** as text, which would have had the reaper compare expiry times out of order. Fixed by storing them fixed-width.
 - **Agent tests hung in CI.** `/root` exists on Linux runners but isn't enterable by a non-root user. Fixed in the agent, which now picks a working directory it can use, and the tests got timeouts.
+- **A second snapshot OOM-killed Firecracker.** Writing a snapshot's memory fills the VM's cgroup with page cache (see [Taking a snapshot](#taking-a-snapshot)). Found by the real-VM snapshot test.
+- **Garbage collection deleted a new template.** It treated a template as orphaned when its image wasn't in the images table, which only knows the images there at startup. Found by a unit test; it now checks the disk.
+- **A restart couldn't resume a VM whose snapshot it had interrupted.** Firecracker was still writing 4 GiB of memory and didn't answer for 20 s. Found by the kill-mid-snapshot e2e test; reconcile now resumes it in the background.
 
 ## Measured numbers
 
@@ -416,25 +551,37 @@ From `make measure` and `make e2e` on the dev server: an AWS m8i.xlarge (4 vCPUs
 
 | What | Result |
 |---|---|
-| Cold-boot create, one at a time (n=100) | p50 **1.83 s**, p99 1.89 s, max 1.90 s |
+| Create from the template, one at a time (n=100) | p50 **111 ms**, p99 145 ms |
+| … restore (load and resume), agent answers, sync | 13 ms, 61 ms, 32 ms (p50) |
+| Cold-boot create, one at a time (n=100) | p50 **1.84 s**, p99 1.91 s |
 | … of which tine's own work (allocate to configure) | about **27 ms**; the rest is the guest booting |
+| Rollback (n=20) | p50 **127 ms**, p99 183 ms |
+| Snapshot pause: 256 MiB, 1 GiB, 4 GiB VMs (n=5 each) | p50 **47 ms**, **341 ms**, **22.0 s** |
+| A VM's next snapshot waits for the last to reach the disk | about 8 s per GiB |
 | Create with 5 at once (n=50, e2e) | p50 2.8 s, p99 3.2 s |
 | Destroy (n=100) | p50 **32 ms**, p99 42 ms |
-| Exec `true` through the API (n=200) | p50 **1.7 ms**, p99 3.3 ms; about 1 ms of it inside the guest |
+| Exec `true` through the API (n=200) | p50 **1.8 ms**, p99 3.3 ms; about 1 ms of it inside the guest |
 | Exec `true` with the `tine` CLI (n=50) | about 6 ms, including starting the CLI |
-| Host memory per idle VM (n=5, 30 s after boot) | Firecracker RSS **127 MiB** (124 MiB of it guest memory); 168 MiB charged to its cgroup, including page cache |
+| Host memory per idle VM, booted (n=5, after 30 s) | Firecracker RSS **127 MiB** (124 MiB private); 168 MiB charged to its cgroup, including page cache |
+| Host memory per idle VM, from the template (n=5) | RSS 127 MiB, but only **19 MiB private**: 108 MiB is the template's memory file, shared; 24 MiB charged to its cgroup |
 | tined restart with VMs running | 41 ms; the VMs keep running |
 | tined back after `SIGKILL` | 2.2 s (systemd waits 2 s before restarting it) |
 | Image import (4 GiB disk) | about 2.6 s |
 | Reflink copy of a 2 GB disk | 5 ms (2,725 ms as a normal copy) |
 
-A guest with 1 GiB uses about 127 MiB on the host when idle, because memory is only handed out when the guest touches it. That's what makes many VMs per host affordable.
+A guest with 1 GiB uses about 127 MiB on the host when idle, because memory is only handed out when the guest touches it. A guest restored from a template uses less still, because most of its memory is the template's, shared through the page cache by every VM restored from it. That's what step 3's forks build on.
+
+The 4 GiB snapshot's 22 s pause is this host's disk, not the snapshot itself. Writing 4 GiB of memory at once is past the kernel's dirty-page limits, so the kernel throttles Firecracker to the EBS volume's write speed, about 150 MB/s. Snapshots up to about 1 GiB fit under the limits and run at memory speed. Bringing that down is one of step 4's first jobs.
 
 ## Known limits
 
-These are known and deliberate for v0.1.0. Most are what the next steps are for.
+These are known and deliberate for v0.2.0. Most are what the next steps are for.
 
-- **Creates are cold boots, 1.8 s each.** Step 2 restores new VMs from a ready snapshot instead.
+- **Snapshots of big VMs pause them for long on this host.** A 4 GiB VM is frozen for 22 s, held to the EBS volume's write speed, and back-to-back snapshots of one VM wait about 8 s per GiB for the last one to reach the disk. Step 4 measures and attacks this: diff snapshots, the kernel's dirty-page limits, and local NVMe on bare metal.
+- **A template is for one size.** A create of another size boots, unless that size is warmed too (`tine image warm --vcpus N --memory M`), and only `--warm-images` at the default size are kept warm by themselves.
+- **Restores share what programs worked out before the snapshot**, such as cached random numbers or the kernel's `boot_id`, and lose open connections. `/sync` covers the clock, the kernel's randomness, the hostname and the machine ID.
+- **Snapshots stay on the host that took them**, and only restore there while the Firecracker version and host kernel stay the same. Templates are warmed again by themselves after an upgrade; VMs' own snapshots can't be.
+- **A snapshot's size counts its disk copy in full**, although the copy shares most of its blocks with the image.
 - **One host only.** Sharing memory and disk between forks only works on one machine, and that's the point of step 3.
 - **A VM that dies after a tined restart isn't noticed straight away.** tined watches the Firecracker processes it started. One started by an earlier tined is only checked at the next restart, or when something touches it: an exec then fails, and a destroy cleans it up. A periodic liveness check would close this.
 - **No IPv6 for VMs**, and outbound traffic is otherwise unrestricted (no egress allow-list or rate limits yet).
