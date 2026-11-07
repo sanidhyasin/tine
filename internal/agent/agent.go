@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/mdlayher/vsock"
+	"golang.org/x/sys/unix"
 
 	"github.com/sanidhyasin/tine/internal/agentproto"
 )
@@ -241,12 +242,14 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 		"ms", status.DurationMs, "client_gone", r.Context().Err() != nil)
 }
 
-// workDir picks the command's working directory.
+// workDir picks the command's working directory: the requested one, else
+// HOME (/root) if the agent may enter it, else /. In a guest the agent runs
+// as root, so it's /root; elsewhere, as in tests, it may not be allowed in.
 func workDir(requested string) string {
 	if requested != "" {
 		return requested
 	}
-	if info, err := os.Stat("/root"); err == nil && info.IsDir() {
+	if unix.Access("/root", unix.X_OK) == nil {
 		return "/root"
 	}
 	return "/"

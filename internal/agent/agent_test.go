@@ -221,7 +221,28 @@ func TestDisconnectKillsTheCommand(t *testing.T) {
 	if err == nil {
 		t.Fatal("Exec after hanging up: want an error")
 	}
-	requireGone(t, <-pids)
+	select {
+	case pid := <-pids:
+		requireGone(t, pid)
+	case <-time.After(time.Second):
+		t.Fatalf("the command never printed its pid; Exec said: %v", err)
+	}
+}
+
+func TestDefaultWorkingDirectory(t *testing.T) {
+	c, _ := startAgent(t, Config{})
+	var out output
+	st, err := c.Exec(context.Background(), agentproto.ExecRequest{Args: []string{"pwd", "-P"}}, out.collect)
+	if err != nil || st.Code != 0 {
+		t.Fatalf("Exec: %+v, %v", st, err)
+	}
+	want := "/\n"
+	if workDir("") == "/root" {
+		want = "/root\n"
+	}
+	if out.String() != want {
+		t.Errorf("default directory %q, want %q", out.String(), want)
+	}
 }
 
 func TestOutputIsCapped(t *testing.T) {

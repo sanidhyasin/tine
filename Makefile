@@ -47,7 +47,7 @@ fmt: $(GOLANGCI_LINT) ## Format all Go code (gofmt and goimports)
 
 .PHONY: test
 test: ## Unit tests, with the race detector
-	go test -race -count=1 ./...
+	go test -race -count=1 -timeout 3m ./...
 
 # Packages with tests tagged `integration`. They need Linux with KVM, and the
 # jailer needs root, so they're compiled here and run on the dev server with sudo.
