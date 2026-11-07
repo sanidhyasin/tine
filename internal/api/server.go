@@ -8,7 +8,9 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -35,6 +37,9 @@ type Backend interface {
 	List(ctx context.Context, includeDestroyed bool) ([]state.VM, error)
 	Destroy(ctx context.Context, id string) (state.VM, error)
 	Exec(ctx context.Context, id string, req agentproto.ExecRequest, onOutput func(stream string, data []byte)) (agentproto.ExitStatus, error)
+	ReadFile(ctx context.Context, id, path string) (io.ReadCloser, agentproto.FileInfo, error)
+	WriteFile(ctx context.Context, id, path string, mode os.FileMode, r io.Reader) (agentproto.FileInfo, error)
+	PutArchive(ctx context.Context, id, dir string, r io.Reader) (agentproto.ArchiveResult, error)
 	Snapshot(ctx context.Context, id string) (state.Snapshot, error)
 	Snapshots(ctx context.Context, f state.SnapshotFilter) ([]vm.SnapshotInfo, error)
 	GetSnapshot(ctx context.Context, id string) (vm.SnapshotInfo, error)
@@ -92,6 +97,8 @@ func NewServer(backend Backend, version string, log *slog.Logger, opts ...Option
 	s.mux.HandleFunc("/v1/vms", s.vms)
 	s.mux.HandleFunc("/v1/vms/{id}", s.oneVM)
 	s.mux.HandleFunc("/v1/vms/{id}/exec", s.exec)
+	s.mux.HandleFunc("/v1/vms/{id}/files", s.files)
+	s.mux.HandleFunc("/v1/vms/{id}/archive", s.archive)
 	s.mux.HandleFunc("/v1/vms/{id}/snapshots", s.vmSnapshots)
 	s.mux.HandleFunc("/v1/vms/{id}/rollback", s.rollback)
 	s.mux.HandleFunc("/v1/vms/{id}/fork", s.fork)
@@ -298,6 +305,66 @@ func (s *Server) memory(ctx context.Context, v state.VM) *Memory {
 		return nil
 	}
 	return &Memory{RSSBytes: m.RSS, PSSBytes: m.PSS, PrivateBytes: m.Private, SharedBytes: m.Shared}
+}
+
+// maxUploadBytes caps a file or an archive sent to a VM.
+const maxUploadBytes = 8 << 30
+
+// files: GET /v1/vms/{id}/files?path=P sends a file from the VM; PUT
+// writes one (&mode=0644).
+func (s *Server) files(w http.ResponseWriter, r *http.Request) {
+	id, path := r.PathValue("id"), r.URL.Query().Get("path")
+	ctx := logging.WithVM(r.Context(), id)
+	switch r.Method {
+	case http.MethodGet:
+		rc, info, err := s.backend.ReadFile(ctx, id, path)
+		if err != nil {
+			s.fail(w, r, err)
+			return
+		}
+		defer func() { _ = rc.Close() }()
+		w.Header().Set("Content-Type", "application/octet-stream")
+		if info.Size >= 0 {
+			w.Header().Set("Content-Length", strconv.FormatInt(info.Size, 10))
+		}
+		w.Header().Set(agentproto.HeaderFileMode, info.Mode)
+		if _, err := io.Copy(w, rc); err != nil {
+			s.log.WarnContext(ctx, "sending a file broke off", "err", err)
+		}
+	case http.MethodPut:
+		mode := os.FileMode(0o644)
+		if m := r.URL.Query().Get("mode"); m != "" {
+			v, err := strconv.ParseUint(m, 8, 32)
+			if err != nil || v > 0o7777 {
+				writeError(w, http.StatusBadRequest, CodeInvalidRequest, fmt.Sprintf("mode %q: want octal, like 0644", m))
+				return
+			}
+			mode = os.FileMode(v)
+		}
+		info, err := s.backend.WriteFile(ctx, id, path, mode, http.MaxBytesReader(w, r.Body, maxUploadBytes))
+		if err != nil {
+			s.fail(w, r, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, info)
+	default:
+		methodNotAllowed(w, r, http.MethodGet, http.MethodPut)
+	}
+}
+
+// archive: PUT /v1/vms/{id}/archive?path=D unpacks a tar stream, gzipped or
+// not, into the directory D in the VM.
+func (s *Server) archive(w http.ResponseWriter, r *http.Request) {
+	if !allow(w, r, http.MethodPut) {
+		return
+	}
+	id := r.PathValue("id")
+	res, err := s.backend.PutArchive(logging.WithVM(r.Context(), id), id, r.URL.Query().Get("path"), http.MaxBytesReader(w, r.Body, maxUploadBytes))
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
 }
 
 func (s *Server) exec(w http.ResponseWriter, r *http.Request) {

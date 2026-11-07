@@ -29,6 +29,9 @@ type backend struct {
 	lastRun agentproto.ExecRequest
 	// nextSource, if "template", makes Create look like a restore.
 	nextSource string
+	// files are the VMs' files, by "vmID:path".
+	files map[string][]byte
+	modes map[string]os.FileMode
 }
 
 func (b *backend) Create(_ context.Context, req vm.CreateRequest) (state.VM, error) {

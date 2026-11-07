@@ -791,26 +791,40 @@ func (m *Manager) List(ctx context.Context, includeDestroyed bool) ([]state.VM, 
 // Exec runs a command in a running VM through its agent. If the VM is being
 // snapshotted or rolled back, it waits for that to finish first.
 func (m *Manager) Exec(ctx context.Context, id string, req agentproto.ExecRequest, onOutput func(stream string, data []byte)) (agentproto.ExitStatus, error) {
-	leave, err := m.gate.enterExec(ctx, id)
+	agent, leave, err := m.agentOf(ctx, id)
 	if err != nil {
 		return agentproto.ExitStatus{}, err
 	}
 	defer leave()
+	start := time.Now()
+	st, err := agent.Exec(logging.WithVM(ctx, id), req, onOutput)
+	m.cfg.Metrics.Exec(time.Since(start), err)
+	return st, err
+}
+
+// agentOf is a client for a running VM's agent. Until leave is called, the
+// VM counts as running a command: a snapshot, which would cut the agent's
+// connections, waits.
+func (m *Manager) agentOf(ctx context.Context, id string) (*agentproto.Client, func(), error) {
+	leave, err := m.gate.enterExec(ctx, id)
+	if err != nil {
+		return nil, nil, err
+	}
 	vm, err := m.store.GetVM(ctx, id)
 	if err != nil {
-		return agentproto.ExitStatus{}, err
+		leave()
+		return nil, nil, err
 	}
 	if vm.State != state.StateRunning {
-		return agentproto.ExitStatus{}, fmt.Errorf("VM %s is %s: %w", id, vm.State, ErrNotRunning)
+		leave()
+		return nil, nil, fmt.Errorf("VM %s is %s: %w", id, vm.State, ErrNotRunning)
 	}
 	_, j, err := m.resources(vm)
 	if err != nil {
-		return agentproto.ExitStatus{}, err
+		leave()
+		return nil, nil, err
 	}
-	start := time.Now()
-	st, err := m.host.agent(j).Exec(logging.WithVM(ctx, id), req, onOutput)
-	m.cfg.Metrics.Exec(time.Since(start), err)
-	return st, err
+	return m.host.agent(j), leave, nil
 }
 
 // Images lists the installed images.

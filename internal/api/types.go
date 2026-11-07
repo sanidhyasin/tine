@@ -201,12 +201,14 @@ type Health struct {
 	Features []string `json:"features,omitempty"`
 }
 
-// Exec uses the agent's types, so tined passes requests and frames through
-// unchanged.
+// Exec and file transfers use the agent's types, so tined passes requests
+// and answers through unchanged.
 type (
-	ExecRequest = agentproto.ExecRequest
-	Frame       = agentproto.Frame
-	ExitStatus  = agentproto.ExitStatus
+	ExecRequest   = agentproto.ExecRequest
+	Frame         = agentproto.Frame
+	ExitStatus    = agentproto.ExitStatus
+	FileInfo      = agentproto.FileInfo
+	ArchiveResult = agentproto.ArchiveResult
 )
 
 // ErrorResponse is the body of every error.

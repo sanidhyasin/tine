@@ -10,6 +10,8 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
+	"os"
 	"strings"
 	"time"
 )
@@ -238,6 +240,61 @@ func ReadFrames(r io.Reader, onOutput func(stream string, data []byte)) (ExitSta
 		return ExitStatus{}, fmt.Errorf("%w: %w", ErrIncomplete, err)
 	}
 	return ExitStatus{}, ErrIncomplete
+}
+
+// ReadFile streams a file from the guest. The caller must close the
+// reader. FileInfo has the file's size and mode.
+func (c *Client) ReadFile(ctx context.Context, path string) (io.ReadCloser, FileInfo, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://agent/files?"+url.Values{"path": {path}}.Encode(), nil)
+	if err != nil {
+		return nil, FileInfo{}, err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, FileInfo{}, fmt.Errorf("agent read file: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		defer func() { _ = resp.Body.Close() }()
+		return nil, FileInfo{}, readError(resp)
+	}
+	return resp.Body, FileInfo{Path: path, Size: resp.ContentLength, Mode: resp.Header.Get(HeaderFileMode)}, nil
+}
+
+// WriteFile writes r to a file in the guest, with permissions mode,
+// creating the directories it's in. The file is replaced whole.
+func (c *Client) WriteFile(ctx context.Context, path string, mode os.FileMode, r io.Reader) (FileInfo, error) {
+	q := url.Values{"path": {path}, "mode": {fmt.Sprintf("%04o", mode.Perm())}}
+	var info FileInfo
+	err := c.put(ctx, "http://agent/files?"+q.Encode(), r, &info)
+	return info, err
+}
+
+// PutArchive unpacks a tar stream (gzipped or not) into a directory in the
+// guest, creating it if need be.
+func (c *Client) PutArchive(ctx context.Context, dir string, r io.Reader) (ArchiveResult, error) {
+	var res ArchiveResult
+	err := c.put(ctx, "http://agent/archive?"+url.Values{"path": {dir}}.Encode(), r, &res)
+	return res, err
+}
+
+func (c *Client) put(ctx context.Context, u string, body io.Reader, out any) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, u, body)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("agent: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return readError(resp)
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxErrorBodyBytes)).Decode(out); err != nil {
+		return fmt.Errorf("agent: decode: %w", err)
+	}
+	return nil
 }
 
 func readError(resp *http.Response) error {

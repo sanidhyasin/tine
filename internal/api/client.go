@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 
 	"github.com/sanidhyasin/tine/internal/agentproto"
@@ -180,6 +181,59 @@ func (c *Client) Exec(ctx context.Context, id string, req ExecRequest, onOutput 
 		return ExitStatus{}, readError(resp)
 	}
 	return agentproto.ReadFrames(resp.Body, onOutput)
+}
+
+// ReadFile streams a file from a VM. The caller must close the reader.
+func (c *Client) ReadFile(ctx context.Context, id, path string) (io.ReadCloser, FileInfo, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/v1/vms/"+url.PathEscape(id)+"/files?"+url.Values{"path": {path}}.Encode(), nil)
+	if err != nil {
+		return nil, FileInfo{}, err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, FileInfo{}, fmt.Errorf("can't reach tined: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		defer func() { _ = resp.Body.Close() }()
+		return nil, FileInfo{}, readError(resp)
+	}
+	return resp.Body, FileInfo{Path: path, Size: resp.ContentLength, Mode: resp.Header.Get(agentproto.HeaderFileMode)}, nil
+}
+
+// WriteFile writes r to a file in a VM, with permissions mode, creating the
+// directories it's in.
+func (c *Client) WriteFile(ctx context.Context, id, path string, mode os.FileMode, r io.Reader) (FileInfo, error) {
+	q := url.Values{"path": {path}, "mode": {fmt.Sprintf("%04o", mode.Perm())}}
+	var info FileInfo
+	err := c.upload(ctx, "/v1/vms/"+url.PathEscape(id)+"/files?"+q.Encode(), r, &info)
+	return info, err
+}
+
+// PutArchive unpacks a tar stream, gzipped or not, into a directory in a VM.
+func (c *Client) PutArchive(ctx context.Context, id, dir string, r io.Reader) (ArchiveResult, error) {
+	var res ArchiveResult
+	err := c.upload(ctx, "/v1/vms/"+url.PathEscape(id)+"/archive?"+url.Values{"path": {dir}}.Encode(), r, &res)
+	return res, err
+}
+
+func (c *Client) upload(ctx context.Context, path string, body io.Reader, out any) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.base+path, body)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("can't reach tined: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return readError(resp)
+	}
+	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+		return fmt.Errorf("tined PUT %s: decode response: %w", path, err)
+	}
+	return nil
 }
 
 func (c *Client) do(ctx context.Context, method, path string, body any, want int, out any) error {

@@ -5,8 +5,12 @@
 // Firecracker's vsock socket: connect to the socket, send "CONNECT 1024\n",
 // read "OK <port>\n", and from then on it's an ordinary HTTP connection.
 //
-//	GET  /health   → Health
-//	POST /exec     ExecRequest → a stream of Frames, one JSON object per line
+//	GET  /health          → Health
+//	POST /exec            ExecRequest → a stream of Frames, one JSON object per line
+//	POST /sync            SyncRequest → SyncResult
+//	GET  /files?path=P    → the file's bytes, its mode in HeaderFileMode
+//	PUT  /files?path=P    the file's bytes (&mode=0644) → FileInfo
+//	PUT  /archive?path=D  a tar stream, maybe gzipped, unpacked into D → ArchiveResult
 //
 // /exec streams output while the command runs and always ends with a frame
 // carrying the ExitStatus. Errors before a command starts come back as a
@@ -19,8 +23,9 @@ const (
 	// Port is the vsock port tine-agent listens on.
 	Port = 1024
 	// Version is the protocol version. It changes when either side would
-	// misunderstand the other. Version 2 added /sync.
-	Version = 2
+	// misunderstand the other. Version 2 added /sync, version 3 /files and
+	// /archive.
+	Version = 3
 
 	// StreamStdout and StreamStderr name a Frame's output stream.
 	StreamStdout = "stdout"
@@ -28,7 +33,26 @@ const (
 
 	// ContentTypeNDJSON is /exec's response type: newline-delimited JSON.
 	ContentTypeNDJSON = "application/x-ndjson"
+
+	// HeaderFileMode carries a file's permissions, in octal, with GET /files.
+	HeaderFileMode = "X-Tine-File-Mode"
 )
+
+// FileInfo is a file that PUT /files wrote, or GET /files sent.
+type FileInfo struct {
+	Path string `json:"path"`
+	Size int64  `json:"size"`
+	// Mode is the file's permissions, in octal, like "0644".
+	Mode string `json:"mode"`
+}
+
+// ArchiveResult says what PUT /archive unpacked.
+type ArchiveResult struct {
+	Files int   `json:"files"`
+	Dirs  int   `json:"dirs"`
+	Links int   `json:"links"`
+	Bytes int64 `json:"bytes"`
+}
 
 // Health is the agent's answer to GET /health.
 type Health struct {
@@ -138,6 +162,10 @@ const (
 	// CodeNotFound and CodeMethodNotAllowed: unknown path or method.
 	CodeNotFound         = "not_found"
 	CodeMethodNotAllowed = "method_not_allowed"
+	// CodeFileNotFound: a file /files was asked for doesn't exist.
+	CodeFileNotFound = "file_not_found"
+	// CodeFileFailed: reading or writing a file failed in the guest.
+	CodeFileFailed = "file_failed"
 )
 
 // Error is an error response from the agent, as the client returns it.

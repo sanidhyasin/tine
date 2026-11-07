@@ -112,6 +112,10 @@ func (s *Server) Handler() http.Handler {
 				return
 			}
 			s.handleSync(w, r)
+		case "/files":
+			s.handleFiles(w, r)
+		case "/archive":
+			s.handleArchive(w, r)
 		default:
 			writeError(w, http.StatusNotFound, agentproto.CodeNotFound, "no such endpoint: "+r.URL.Path)
 		}
