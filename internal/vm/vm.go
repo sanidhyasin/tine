@@ -167,6 +167,9 @@ type Config struct {
 	// SettleQuiet is how long the template's VM is then left alone before
 	// it's saved, for the guest to finish what the end of its boot started.
 	SettleQuiet time.Duration
+	// FlushSettle is how long after its last snapshot reached the disk a
+	// VM's next snapshot waits before pausing it (see takeSnapshot).
+	FlushSettle time.Duration
 	// WarmImages are the images to keep a template of, at the default size,
 	// so creates restore instead of booting. A missing or out-of-date
 	// template is warmed in the background. Nil keeps none warm.
@@ -215,6 +218,7 @@ func DefaultConfig() Config {
 		WarmImages:         []string{"base"},
 		SettleCommand:      []string{"systemctl", "is-system-running", "--wait"},
 		SettleQuiet:        2 * time.Second,
+		FlushSettle:        2 * time.Second,
 	}
 }
 
@@ -276,6 +280,9 @@ func (c Config) withDefaults() Config {
 	if c.SettleQuiet == 0 {
 		c.SettleQuiet = d.SettleQuiet
 	}
+	if c.FlushSettle == 0 {
+		c.FlushSettle = d.FlushSettle
+	}
 	if len(c.SettleCommand) == 0 {
 		c.SettleCommand = d.SettleCommand
 	}
@@ -305,8 +312,8 @@ type Manager struct {
 	procs map[string]*tracked // Firecracker processes this manager started
 	ops   map[string]*createOp
 	locks keyedMutex
-	// flushes are closed when the VM's last snapshot is on disk.
-	flushes map[string]chan struct{}
+	// flushes are the VMs' last snapshots' flushes to disk.
+	flushes map[string]*flush
 	// warming is which images keepWarm is warming now, and warmFailed
 	// when it last failed for each.
 	warming    map[string]bool
@@ -352,7 +359,7 @@ func newManager(cfg Config, store *state.Store, h host) (*Manager, error) {
 	}
 	m := &Manager{
 		cfg: cfg, store: store, host: h, log: cfg.Log, slots: slots, snaps: snaps, gate: newGate(),
-		procs: map[string]*tracked{}, ops: map[string]*createOp{}, flushes: map[string]chan struct{}{},
+		procs: map[string]*tracked{}, ops: map[string]*createOp{}, flushes: map[string]*flush{},
 		warming: map[string]bool{}, warmFailed: map[string]time.Time{}, pins: map[string]int{},
 		diffBases: map[string]string{},
 	}
@@ -746,6 +753,9 @@ func (m *Manager) destroy(ctx context.Context, id, reason string) (state.VM, err
 // teardown stops the VM's Firecracker and removes its jail and network.
 func (m *Manager) teardown(ctx context.Context, vm state.VM) error {
 	m.untrack(vm.ID)
+	m.mu.Lock()
+	delete(m.flushes, vm.ID)
+	m.mu.Unlock()
 	n, j, err := m.resources(vm)
 	if err != nil {
 		return err

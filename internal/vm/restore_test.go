@@ -24,7 +24,7 @@ func (f *fixture) snapshotted(t *testing.T, req CreateRequest) (state.VM, state.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := f.m.waitForFlush(ctx, vm.ID); err != nil {
+	if _, err := f.m.waitForFlush(ctx, vm.ID); err != nil {
 		t.Fatal(err)
 	}
 	f.host.takeCalls()

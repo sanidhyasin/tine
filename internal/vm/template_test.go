@@ -35,7 +35,7 @@ func TestWarmTemplateAndCreateFromIt(t *testing.T) {
 	if vm, _ := f.store.GetVM(ctx, tmpl.VMID); vm.State != state.StateDestroyed {
 		t.Errorf("the template's VM is %s, want destroyed", vm.State)
 	}
-	_ = f.m.waitForFlush(ctx, tmpl.VMID)
+	_, _ = f.m.waitForFlush(ctx, tmpl.VMID)
 	f.host.takeCalls()
 
 	// A create of that image and size restores from it.

@@ -30,7 +30,7 @@ func TestSnapshotTakesEveryStepInOrder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Snapshot: %v", err)
 	}
-	if err := f.m.waitForFlush(context.Background(), vm.ID); err != nil {
+	if _, err := f.m.waitForFlush(context.Background(), vm.ID); err != nil {
 		t.Fatal(err)
 	}
 	want := "describeHost,prepareSnapshot,pause,writeSnapshot,cloneDisk,resume,collectSnapshot,waitAgent,flushSnapshot"
@@ -405,5 +405,27 @@ func TestReconcileResumesABusyVMInTheBackground(t *testing.T) {
 	}
 	if took := time.Since(start); took < 4*time.Second {
 		t.Errorf("the exec finished %v after the restart, before Firecracker answered", took)
+	}
+}
+
+// A snapshot right after the last one's flush waits a moment before the
+// pause: the kernel throttles a writer just after a big flush.
+func TestSnapshotWaitsForTheFlushToSettle(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, func(c *Config) { c.FlushSettle = 300 * time.Millisecond })
+	vm := f.running(t)
+	first, err := f.m.Snapshot(ctx, vm.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta, _ := f.m.snaps.Load(first.ID); meta.TimingsMs["wait"] > 100 {
+		t.Errorf("the first snapshot waited %.0fms, with no flush before it", meta.TimingsMs["wait"])
+	}
+	second, err := f.m.Snapshot(ctx, vm.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta, _ := f.m.snaps.Load(second.ID); meta.TimingsMs["wait"] < 250 {
+		t.Errorf("the second snapshot waited %.0fms after the first's flush, want about 300", meta.TimingsMs["wait"])
 	}
 }

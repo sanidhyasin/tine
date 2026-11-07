@@ -148,8 +148,20 @@ func (m *Manager) takeSnapshot(ctx context.Context, vm state.VM, kind state.Snap
 	// The VM's last snapshot must be on disk first: then its pages in the
 	// cache are clean, and the kernel can drop them at once to make room for
 	// this one's, instead of writing them out while the VM is paused.
-	if err := m.waitForFlush(ctx, vm.ID); err != nil {
+	flushed, err := m.waitForFlush(ctx, vm.ID)
+	if err != nil {
 		return fail("wait", err)
+	}
+	// Just after a big flush, the kernel throttles the next writer to the
+	// disk's speed: a 256 MiB VM's snapshot started then paused it for up
+	// to 1.3 s, instead of 50 ms. So the pause waits until the flush is a
+	// little older, while the VM runs.
+	if d := time.Until(flushed.Add(m.cfg.FlushSettle)); d > 0 {
+		select {
+		case <-time.After(d):
+		case <-ctx.Done():
+			return fail("wait", ctx.Err())
+		}
 	}
 	t.mark("wait")
 	if err := m.host.prepareSnapshot(j); err != nil {
@@ -235,16 +247,26 @@ func (m *Manager) takeSnapshot(ctx context.Context, vm state.VM, kind state.Snap
 	return ready, nil
 }
 
+// flush is a snapshot's flush to disk: done is closed when it's over, at
+// end.
+type flush struct {
+	done chan struct{}
+	end  time.Time
+}
+
 // flushInBackground writes a new snapshot's memory out to disk, now that the
 // VM is running again, so its pages in the cache become clean. The VM's next
 // snapshot waits for it (waitForFlush).
 func (m *Manager) flushInBackground(vmID, snapID string) {
-	done := make(chan struct{})
+	f := &flush{done: make(chan struct{})}
 	m.mu.Lock()
-	m.flushes[vmID] = done
+	m.flushes[vmID] = f
 	m.mu.Unlock()
 	go func() {
-		defer close(done)
+		defer func() {
+			f.end = time.Now()
+			close(f.done)
+		}()
 		start := time.Now()
 		if err := m.host.flushSnapshot(m.snaps.Path(snapID, snapshot.MemoryFile)); err != nil {
 			m.log.Warn("couldn't flush a snapshot to disk", "vm", vmID, "snapshot", snapID, "err", err)
@@ -255,24 +277,20 @@ func (m *Manager) flushInBackground(vmID, snapID string) {
 	}()
 }
 
-// waitForFlush waits until the VM's last snapshot, if any, is on disk.
-func (m *Manager) waitForFlush(ctx context.Context, vmID string) error {
+// waitForFlush waits until the VM's last snapshot, if any, is on disk, and
+// returns when that flush ended (zero if there was none).
+func (m *Manager) waitForFlush(ctx context.Context, vmID string) (time.Time, error) {
 	m.mu.Lock()
-	done := m.flushes[vmID]
+	f := m.flushes[vmID]
 	m.mu.Unlock()
-	if done == nil {
-		return nil
+	if f == nil {
+		return time.Time{}, nil
 	}
 	select {
-	case <-done:
-		m.mu.Lock()
-		if m.flushes[vmID] == done {
-			delete(m.flushes, vmID)
-		}
-		m.mu.Unlock()
-		return nil
+	case <-f.done:
+		return f.end, nil
 	case <-ctx.Done():
-		return fmt.Errorf("waiting for the last snapshot to reach the disk: %w", ctx.Err())
+		return time.Time{}, fmt.Errorf("waiting for the last snapshot to reach the disk: %w", ctx.Err())
 	}
 }
 

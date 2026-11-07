@@ -360,7 +360,7 @@ func newFixture(t *testing.T, change func(*Config)) *fixture {
 	t.Cleanup(func() { _ = store.Close() })
 	cfg := Config{
 		ImagesDir: images, ChrootBaseDir: filepath.Join(dir, "jail"), SnapshotsDir: filepath.Join(dir, "snapshots"),
-		AgentTimeout: 5 * time.Second, MinFreeMiB: 1, SettleCommand: []string{"true"}, SettleQuiet: time.Millisecond,
+		AgentTimeout: 5 * time.Second, MinFreeMiB: 1, SettleCommand: []string{"true"}, SettleQuiet: time.Millisecond, FlushSettle: time.Millisecond,
 	}
 	if change != nil {
 		change(&cfg)
