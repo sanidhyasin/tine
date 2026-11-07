@@ -2,9 +2,10 @@
 version: "2"
 
 run:
-  # Lint the integration tests too (they run on the dev server).
+  # Lint the integration and end-to-end tests too (they run on the dev server).
   build-tags:
     - integration
+    - e2e
 
 linters:
   # errcheck, govet, ineffassign, staticcheck, unused

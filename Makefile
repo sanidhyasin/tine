@@ -69,6 +69,13 @@ test-integration: build ## Integration tests on the dev server, as root, against
 		sudo TINE_ARTIFACTS=$$HOME/tine/artifacts TINE_AGENT_BIN=$$HOME/tine/$(OUT)/tine-agent \
 		./$$t -test.v -test.count=1 || exit 1; done'
 
+.PHONY: e2e
+e2e: deploy ## End-to-end tests against the real tined on the dev server (server must be up; about 2 minutes)
+	@mkdir -p $(OUT)/tests
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test -c -tags e2e -o $(OUT)/tests/e2e.test ./e2e
+	./scripts/dev-server.sh sync
+	./scripts/dev-server.sh ssh 'cd ~/tine && sudo ./$(OUT)/tests/e2e.test -test.v -test.count=1 -test.timeout 20m'
+
 .PHONY: deploy
 deploy: build ## Build, copy to the dev server, install the binaries and the tined service, (re)start it
 	./scripts/dev-server.sh sync
