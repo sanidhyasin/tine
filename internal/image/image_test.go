@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -172,6 +173,7 @@ func TestImportValidatesBeforeDoingAnything(t *testing.T) {
 		"no kernel":      func(o *ImportOptions) { o.Kernel = filepath.Join(dir, "nope") },
 		"kernel is dir":  func(o *ImportOptions) { o.Kernel = dir },
 		"no squashfs":    func(o *ImportOptions) { o.RootfsSquashfs = "" },
+		"tar as well":    func(o *ImportOptions) { o.RootfsTar = o.RootfsSquashfs },
 		"no agent":       func(o *ImportOptions) { o.Agent = filepath.Join(dir, "nope") },
 		"tiny disk":      func(o *ImportOptions) { o.SizeBytes = 1 << 20 },
 	} {
@@ -193,6 +195,40 @@ func TestImportValidatesBeforeDoingAnything(t *testing.T) {
 	}
 	if _, err := Import(context.Background(), good); !errors.Is(err, ErrExists) {
 		t.Errorf("Import over an existing image = %v, want ErrExists", err)
+	}
+}
+
+// TestImportFromTar imports a root filesystem given as a tar, as docker
+// export makes for Build, where the tools exist (Linux).
+func TestImportFromTar(t *testing.T) {
+	for _, tool := range []string{"tar", "mkfs.ext4", "e2fsck"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Skipf("%s isn't installed", tool)
+		}
+	}
+	if runtime.GOOS != "linux" {
+		t.Skip("needs GNU tar and e2fsprogs: Linux")
+	}
+	dir := t.TempDir()
+	tree, _ := fakeGuest(t)
+	_ = os.Remove(filepath.Join(tree, "etc/resolv.conf"))
+	tarPath := filepath.Join(dir, "python.tar")
+	if out, err := exec.CommandContext(context.Background(), "tar", "-cf", tarPath, "-C", tree, ".").CombinedOutput(); err != nil { //nolint:gosec // test tool
+		t.Fatalf("tar: %v\n%s", err, out)
+	}
+	kernel := filepath.Join(dir, "vmlinux-6.18.56")
+	write(t, kernel, "not really a kernel", 0o644)
+	img, err := Import(context.Background(), ImportOptions{
+		Name: "python", ImagesDir: filepath.Join(dir, "images"), Kernel: kernel, RootfsTar: tarPath, Agent: fakeAgent(t), SizeBytes: 256 << 20,
+	})
+	if err != nil {
+		t.Fatalf("Import: %v", err)
+	}
+	if img.Meta.Rootfs.Source != "python.tar" || img.Meta.Rootfs.SourceSHA256 == "" {
+		t.Errorf("rootfs metadata = %+v", img.Meta.Rootfs)
+	}
+	if info, err := os.Stat(img.RootfsPath()); err != nil || info.Size() != 256<<20 {
+		t.Errorf("disk image: %v, %v", info, err)
 	}
 }
 

@@ -127,6 +127,9 @@ type ImportOptions struct {
 	Kernel string
 	// RootfsSquashfs is the guest filesystem to start from, as a squashfs.
 	RootfsSquashfs string
+	// RootfsTar is the guest filesystem as a tar instead, such as `docker
+	// export` makes (see Build). Exactly one of the two is set.
+	RootfsTar string
 	// Agent is the tine-agent binary to install, built for the guest (linux/amd64).
 	Agent string
 	// Extra are more files to install in the guest, as executables: for
@@ -177,10 +180,14 @@ func Import(ctx context.Context, opts ImportOptions) (*Image, error) {
 	}
 	meta.Kernel.Source = filepath.Base(opts.Kernel)
 
-	if meta.Rootfs.SourceSHA256, err = hashFile(opts.RootfsSquashfs); err != nil {
+	source := opts.RootfsSquashfs
+	if opts.RootfsTar != "" {
+		source = opts.RootfsTar
+	}
+	if meta.Rootfs.SourceSHA256, err = hashFile(source); err != nil {
 		return nil, fmt.Errorf("import %s: rootfs: %w", opts.Name, err)
 	}
-	meta.Rootfs.Source = filepath.Base(opts.RootfsSquashfs)
+	meta.Rootfs.Source = filepath.Base(source)
 	meta.Rootfs.SizeBytes = opts.SizeBytes
 	if meta.Agent.SHA256, err = hashFile(opts.Agent); err != nil {
 		return nil, fmt.Errorf("import %s: agent: %w", opts.Name, err)
@@ -188,9 +195,19 @@ func Import(ctx context.Context, opts ImportOptions) (*Image, error) {
 	meta.Agent.Version = agentVersion(ctx, opts.Agent)
 
 	root := filepath.Join(work, "root")
-	log.Info("unpacking", "squashfs", opts.RootfsSquashfs)
-	if err := run(ctx, "unsquashfs", "-no-progress", "-d", root, opts.RootfsSquashfs); err != nil {
-		return nil, fmt.Errorf("import %s: unpack rootfs: %w", opts.Name, err)
+	if opts.RootfsTar != "" {
+		log.Info("unpacking", "tar", opts.RootfsTar)
+		if err := os.Mkdir(root, 0o755); err != nil { //nolint:gosec // the guest's root directory
+			return nil, err
+		}
+		if err := run(ctx, "tar", "-xpf", opts.RootfsTar, "--numeric-owner", "-C", root); err != nil {
+			return nil, fmt.Errorf("import %s: unpack rootfs: %w", opts.Name, err)
+		}
+	} else {
+		log.Info("unpacking", "squashfs", opts.RootfsSquashfs)
+		if err := run(ctx, "unsquashfs", "-no-progress", "-d", root, opts.RootfsSquashfs); err != nil {
+			return nil, fmt.Errorf("import %s: unpack rootfs: %w", opts.Name, err)
+		}
 	}
 	for i, x := range opts.Extra {
 		if !filepath.IsAbs(x.Path) {
@@ -255,7 +272,14 @@ func (o *ImportOptions) fill() error {
 	if o.Log == nil {
 		o.Log = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
-	for flag, p := range map[string]string{"kernel": o.Kernel, "rootfs squashfs": o.RootfsSquashfs, "agent": o.Agent} {
+	if (o.RootfsSquashfs == "") == (o.RootfsTar == "") {
+		return fmt.Errorf("image %s: give the root filesystem as a squashfs or a tar, one of them", o.Name)
+	}
+	rootfs, rootfsKind := o.RootfsSquashfs, "rootfs squashfs"
+	if o.RootfsTar != "" {
+		rootfs, rootfsKind = o.RootfsTar, "rootfs tar"
+	}
+	for flag, p := range map[string]string{"kernel": o.Kernel, rootfsKind: rootfs, "agent": o.Agent} {
 		info, err := os.Stat(p)
 		if err != nil {
 			return fmt.Errorf("image %s: %s: %w", o.Name, flag, err)

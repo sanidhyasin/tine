@@ -47,6 +47,20 @@ sudo DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 install -
   curl jq squashfs-tools e2fsprogs xfsprogs acl iproute2 iptables nftables openssh-client >/dev/null
 echo "OK"
 
+# --- 1b. Docker, for building images from Dockerfiles (tined image build) ----
+# Docker must leave the firewall alone: by default it sets the FORWARD
+# policy to DROP, which would cut every VM off from the internet. Builds run
+# on the host's network instead (docker build --network host), so it needs
+# no bridge or NAT of its own.
+say "Installing Docker (for tined image build)"
+sudo install -d -m 0755 /etc/docker
+echo '{"iptables": false, "ip6tables": false, "bridge": "none"}' | sudo tee /etc/docker/daemon.json >/dev/null
+if ! command -v docker >/dev/null; then
+  sudo DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 install -y -qq docker.io docker-buildx >/dev/null
+fi
+sudo systemctl restart docker
+echo "OK"
+
 # --- 2. KVM -----------------------------------------------------------------
 say "Checking KVM"
 if [ ! -e /dev/kvm ]; then
