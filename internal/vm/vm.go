@@ -274,7 +274,9 @@ type Manager struct {
 	warmFailed map[string]time.Time
 	// pins are snapshots that mustn't be collected or deleted yet (see pin).
 	pins map[string]int
-	// Memory held for VMs being made, by admission control.
+	// admitMu guards admission control's reservations: what's held for VMs
+	// being made.
+	admitMu                                          sync.Mutex
 	reservedCommitMiB, reservedUseMiB, reservedVCPUs int
 }
 
@@ -463,19 +465,21 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (state.VM, erro
 		Slot: slot, UID: m.cfg.UIDBase + slot, ExpiresAt: time.Now().Add(req.TTL),
 		SnapshotID: req.SnapshotID, Source: source, ParentID: req.ParentID,
 	}
-	vm, err := m.store.CreateVM(ctx, record)
-	if errors.Is(err, state.ErrNotFound) && source == state.SourceTemplate {
-		// A newer template replaced this one, which was deleted between
-		// choosing it and claiming it. Booting is always possible.
-		coldBecause = "its template was deleted just as it was chosen"
-		record.SnapshotID, record.Source = "", state.SourceCold
-		vm, err = m.store.CreateVM(ctx, record)
-	}
+	vm, err := res.record(func() (state.VM, error) {
+		vm, err := m.store.CreateVM(ctx, record)
+		if errors.Is(err, state.ErrNotFound) && source == state.SourceTemplate {
+			// A newer template replaced this one, which was deleted between
+			// choosing it and claiming it. Booting is always possible.
+			coldBecause = "its template was deleted just as it was chosen"
+			record.SnapshotID, record.Source = "", state.SourceCold
+			vm, err = m.store.CreateVM(ctx, record)
+		}
+		return vm, err
+	})
 	if err != nil {
 		m.slots.Release(slot)
 		return state.VM{}, err
 	}
-	res.recorded()
 	if coldBecause != "" {
 		_ = m.store.Note(ctx, vm.ID, "booted, not restored: "+coldBecause)
 	}

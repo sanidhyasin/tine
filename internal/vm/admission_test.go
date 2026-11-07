@@ -12,8 +12,8 @@ import (
 
 func (f *fixture) reservedNothing(t *testing.T) {
 	t.Helper()
-	f.m.mu.Lock()
-	defer f.m.mu.Unlock()
+	f.m.admitMu.Lock()
+	defer f.m.admitMu.Unlock()
 	if f.m.reservedCommitMiB != 0 || f.m.reservedUseMiB != 0 || f.m.reservedVCPUs != 0 {
 		t.Errorf("still reserved: %d MiB committed, %d MiB of use, %d vCPUs", f.m.reservedCommitMiB, f.m.reservedUseMiB, f.m.reservedVCPUs)
 	}
