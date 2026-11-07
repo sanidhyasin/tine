@@ -243,6 +243,37 @@ func TestRealDestroyAfterRestart(t *testing.T) {
 	requireClean(t, m, "after destroying it from the restarted manager")
 }
 
+// TestRealOrphansAreRemoved: a VM that's running on the host but missing
+// from the database (as if its record were lost) is an orphan. Reconcile
+// must stop it and remove everything it used.
+func TestRealOrphansAreRemoved(t *testing.T) {
+	m := realManager(t, nil)
+	ctx := context.Background()
+	vm, err := m.Create(ctx, CreateRequest{})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	empty, err := state.Open(ctx, filepath.Join(t.TempDir(), "empty.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = empty.Close() }()
+	other, err := New(m.cfg, empty) // knows nothing about vm
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := other.Reconcile(ctx)
+	if len(r.Errors) > 0 {
+		t.Fatalf("reconcile errors: %v", r.Errors)
+	}
+	if !strings.Contains(strings.Join(r.Orphans, ","), vm.ID) {
+		t.Errorf("report = %s; want %s removed as an orphan", r, vm.ID)
+	}
+	requireClean(t, m, "after reconciling against an empty database")
+	t.Logf("report: %s", r)
+}
+
 // TestRealRollback makes a real create fail late (the agent gets too little
 // time to start) and checks the undo leaves the host clean.
 func TestRealRollback(t *testing.T) {
