@@ -2,7 +2,22 @@
 
 Fork a running microVM into many copies in milliseconds. Built on [Firecracker](https://github.com/firecracker-microvm/firecracker).
 
-> **Status:** step 1 is under way: tined runs VMs, and the `tine` command creates, runs commands in and destroys them. Snapshots and forks come in steps 2 and 3. The step-by-step build plan is in [docs/PLAN.md](docs/PLAN.md), and the reasons behind the project are in [BRIEF.md](BRIEF.md).
+> **Status: v0.1.0, step 1 done.** tined runs isolated microVMs, and the `tine` command creates them, runs commands in them and destroys them. Snapshots and forks come in steps 2 and 3. The step-by-step build plan is in [docs/PLAN.md](docs/PLAN.md), and the reasons behind the project are in [BRIEF.md](BRIEF.md).
+
+## How it works
+
+A service, `tined`, owns every VM on a Linux server. For each one it builds a jail (its own files, user, cgroup and network namespace, behind nftables rules) and starts Firecracker in it. Inside each guest, `tine-agent` runs commands for tined over vsock. Each VM's Firecracker lives in its own cgroup, so VMs keep running when tined restarts, and tined's records in SQLite let it reconcile with what's really on the host when it comes back.
+
+Measured on the dev server (an m8i.xlarge, through nested virtualization):
+
+| What | Result |
+|---|---|
+| Create, from nothing to a VM that runs commands | 1.83 s p50, 1.89 s p99, almost all of it the guest booting |
+| Run `true` in a VM, through the API | 1.7 ms p50 |
+| Destroy | 32 ms p50 |
+| Host memory for an idle 1 GiB VM | 127 MiB |
+
+The full design, with the numbers and the known limits, is in [docs/architecture.md](docs/architecture.md).
 
 ## Layout
 
@@ -10,13 +25,15 @@ Fork a running microVM into many copies in milliseconds. Built on [Firecracker](
 |---|---|
 | `BRIEF.md` | Project brief: goals, design, build order, reading list |
 | `docs/PLAN.md` | The build plan: every step, its design, tasks, and "done when" checks |
-| `docs/` | The plan and step-by-step walkthroughs |
+| `docs/architecture.md` | How tine works: every part, the isolation, recovery, tests and measured numbers |
+| `docs/` | Also the step-by-step walkthroughs |
 | `cmd/`, `internal/` | The Go code: `tine` (CLI), `tined` (service), `tine-agent` (runs in each VM) |
 | `deploy/` | `tined.service`, the systemd unit `make deploy` installs |
 | `e2e/` | End-to-end tests against the real tined: `make e2e` |
-| `Makefile` | `make build`, `make check`, `make deploy`, `make e2e`. Run `make` to list them all. |
+| `Makefile` | `make build`, `make check`, `make deploy`, `make e2e`, `make measure`. Run `make` to list them all. |
 | `scripts/dev-server.sh` | Create, start, stop and SSH into the AWS dev server. Runs on your Mac. |
 | `scripts/host-setup.sh` | Prepares the server: KVM, the `/srv/tine` data volume, Firecracker, a guest kernel and disk image |
+| `scripts/measure.sh` | Measures create, exec and memory per VM against the running tined (`make measure`) |
 | `artifacts/` | Downloaded binaries and images. Created on the server, never committed. |
 
 ## Quick start
