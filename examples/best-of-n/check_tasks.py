@@ -17,8 +17,12 @@ TASKS = Path(__file__).parent / "tasks"
 
 
 def pytest(repo: Path) -> bool:
-    r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "tests"], cwd=repo,
-                       capture_output=True, timeout=120)
+    r = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "tests"],
+        cwd=repo,
+        capture_output=True,
+        timeout=120,
+    )
     return r.returncode == 0
 
 
@@ -35,8 +39,10 @@ def main() -> int:
             passes_after = pytest(repo)
         ok = fails_before and passes_after
         bad += not ok
-        print(f"{'ok ' if ok else 'BAD'}  {meta['name']:14} visible tests fail as is: {fails_before}; "
-              f"all pass with the fix: {passes_after}")
+        print(
+            f"{'ok ' if ok else 'BAD'}  {meta['name']:14} visible tests fail as is: {fails_before}; "
+            f"all pass with the fix: {passes_after}"
+        )
     return 1 if bad else 0
 
 

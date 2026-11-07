@@ -1,0 +1,19 @@
+[project]
+name = "best-of-n"
+version = "0.1.0"
+description = "tine's demo: fork a set-up sandbox N times, and let N agent attempts fix a bug at once"
+requires-python = ">=3.10"
+dependencies = ["anthropic>=0.60", "tine"]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+tine = { path = "../../sdk/python", editable = true }
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
