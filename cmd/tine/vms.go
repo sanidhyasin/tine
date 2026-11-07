@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"regexp"
 	"sort"
 	"strings"
@@ -83,22 +84,31 @@ restored from it, in milliseconds. Otherwise, or with --cold, it boots.`,
 }
 
 func newListCmd(g *globals) *cobra.Command {
-	var all bool
+	var all, tree bool
 	cmd := &cobra.Command{
 		Use:     "ls",
 		Aliases: []string{"list"},
 		Short:   "List VMs",
-		Args:    cobra.NoArgs,
+		Long: `List the VMs that aren't destroyed, oldest first.
+
+--tree shows forks: each VM, the snapshots it was forked from, and the
+children of each, with how much host memory each uses. PSS splits pages that
+VMs share between them, so a fork's children each have a PSS well below
+their RSS.`,
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx, cancel := context.WithTimeout(cmd.Context(), requestTimeout)
 			defer cancel()
-			vms, err := g.client().ListVMs(ctx, all)
+			vms, err := g.client().ListVMsWith(ctx, api.ListOptions{All: all, Memory: tree})
 			if err != nil {
 				return err
 			}
 			sort.Slice(vms, func(i, j int) bool { return vms[i].CreatedAt.Before(vms[j].CreatedAt) })
 			if g.json {
 				return printJSON(cmd.OutOrStdout(), vms)
+			}
+			if tree {
+				return printTree(cmd.OutOrStdout(), vms)
 			}
 			w := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 4, 2, ' ', 0)
 			_, _ = fmt.Fprintln(w, "ID\tSTATE\tIMAGE\tVCPUS\tMEMORY\tAGE\tEXPIRES IN")
@@ -115,7 +125,72 @@ func newListCmd(g *globals) *cobra.Command {
 		},
 	}
 	cmd.Flags().BoolVarP(&all, "all", "a", false, "include destroyed VMs")
+	cmd.Flags().BoolVarP(&tree, "tree", "t", false, "show forks as a tree, with each VM's memory")
 	return cmd
+}
+
+// printTree prints VMs as a tree: each VM, then each snapshot that VMs
+// were forked from, then those VMs, and so on down.
+func printTree(out io.Writer, vms []api.VM) error {
+	byID := map[string]bool{}
+	for _, v := range vms {
+		byID[v.ID] = true
+	}
+	// children[parent][snapshot] are the VMs forked from parent through
+	// snapshot, oldest first (vms is sorted).
+	children := map[string]map[string][]api.VM{}
+	var snapOrder = map[string][]string{}
+	var roots []api.VM
+	for _, v := range vms {
+		if v.ParentID == "" || !byID[v.ParentID] {
+			roots = append(roots, v)
+			continue
+		}
+		if children[v.ParentID] == nil {
+			children[v.ParentID] = map[string][]api.VM{}
+		}
+		if len(children[v.ParentID][v.SnapshotID]) == 0 {
+			snapOrder[v.ParentID] = append(snapOrder[v.ParentID], v.SnapshotID)
+		}
+		children[v.ParentID][v.SnapshotID] = append(children[v.ParentID][v.SnapshotID], v)
+	}
+	w := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
+	_, _ = fmt.Fprintln(w, "VM\tSTATE\tIMAGE\tMEMORY\tRSS\tPSS\tAGE")
+	now := time.Now()
+	var walk func(v api.VM, lead, branch string)
+	walk = func(v api.VM, lead, branch string) {
+		rss, pss := "-", "-"
+		if v.Memory != nil {
+			rss, pss = formatBytes(v.Memory.RSSBytes), formatBytes(v.Memory.PSSBytes)
+		}
+		name := v.ID
+		if v.ParentID != "" && !byID[v.ParentID] {
+			name += " (forked from " + v.ParentID + ")"
+		}
+		_, _ = fmt.Fprintf(w, "%s%s\t%s\t%s\t%s\t%s\t%s\t%s\n", lead+branch, name, v.State, v.Image,
+			formatMiB(v.MemoryMiB), rss, pss, humanDuration(now.Sub(v.CreatedAt)))
+		under := lead + map[string]string{"": "", "├─ ": "│  ", "└─ ": "   "}[branch]
+		snaps := snapOrder[v.ID]
+		for i, snapID := range snaps {
+			snapBranch, snapUnder := "├─ ", under+"│  "
+			if i == len(snaps)-1 {
+				snapBranch, snapUnder = "└─ ", under+"   "
+			}
+			kids := children[v.ID][snapID]
+			_, _ = fmt.Fprintf(w, "%s%s (%d forked)\t\t\t\t\t\t\n", under+snapBranch, snapID, len(kids))
+			for j, kid := range kids {
+				b := "├─ "
+				if j == len(kids)-1 {
+					b = "└─ "
+				}
+				walk(kid, snapUnder, b)
+			}
+		}
+	}
+	for _, r := range roots {
+		walk(r, "", "")
+	}
+	return w.Flush()
 }
 
 func newInspectCmd(g *globals) *cobra.Command {

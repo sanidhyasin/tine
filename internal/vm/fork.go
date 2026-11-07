@@ -3,6 +3,8 @@ package vm
 import (
 	"context"
 	"fmt"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -150,4 +152,58 @@ func (m *Manager) pinned(snapID string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.pins[snapID] > 0
+}
+
+// Memory is how much host memory a VM's Firecracker uses, from
+// /proc/<pid>/smaps_rollup, in bytes. RSS counts every page it has in
+// memory; PSS divides each shared page between the processes that share
+// it, so children of one fork, sharing their parent's pages, each have a
+// PSS well below their RSS. Summed over VMs, PSS is what they really cost.
+type Memory struct {
+	RSS     int64
+	PSS     int64
+	Private int64 // pages only this VM has
+	Shared  int64 // pages it shares with other processes
+}
+
+// Memory reads how much host memory a running VM uses.
+func (m *Manager) Memory(ctx context.Context, id string) (Memory, error) {
+	vm, err := m.store.GetVM(ctx, id)
+	if err != nil {
+		return Memory{}, err
+	}
+	if vm.State != state.StateRunning {
+		return Memory{}, fmt.Errorf("VM %s is %s: %w", id, vm.State, ErrNotRunning)
+	}
+	_, j, err := m.resources(vm)
+	if err != nil {
+		return Memory{}, err
+	}
+	return m.host.memory(j)
+}
+
+// parseSmapsRollup reads the totals in /proc/<pid>/smaps_rollup.
+func parseSmapsRollup(s string) Memory {
+	var mem Memory
+	for _, line := range strings.Split(s, "\n") {
+		f := strings.Fields(line)
+		if len(f) < 3 || f[2] != "kB" {
+			continue
+		}
+		kb, err := strconv.ParseInt(f[1], 10, 64)
+		if err != nil {
+			continue
+		}
+		switch b := kb << 10; f[0] {
+		case "Rss:":
+			mem.RSS = b
+		case "Pss:":
+			mem.PSS = b
+		case "Private_Clean:", "Private_Dirty:":
+			mem.Private += b
+		case "Shared_Clean:", "Shared_Dirty:":
+			mem.Shared += b
+		}
+	}
+	return mem
 }

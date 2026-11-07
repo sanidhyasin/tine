@@ -10,8 +10,8 @@
 //	GET    /v1/images              ListImagesResponse
 //	POST   /v1/images/{name}/warm  WarmRequest → Snapshot (201), the new template
 //	POST   /v1/vms                 CreateVMRequest → VM (201)
-//	GET    /v1/vms[?all=true]      ListVMsResponse
-//	GET    /v1/vms/{id}            VM
+//	GET    /v1/vms[?all=true][&memory=true]  ListVMsResponse
+//	GET    /v1/vms/{id}            VM, with its memory if it's running
 //	DELETE /v1/vms/{id}            VM
 //	POST   /v1/vms/{id}/exec       ExecRequest → a stream of Frames
 //	POST   /v1/vms/{id}/snapshots  Snapshot (201)
@@ -52,8 +52,21 @@ type VM struct {
 	SnapshotID string `json:"snapshot_id,omitempty"`
 	// ParentID is the VM this one was forked from.
 	ParentID string `json:"parent_id,omitempty"`
+	// Memory is how much host memory it uses now: on GET /v1/vms/{id}, and
+	// on lists with ?memory=true, for running VMs.
+	Memory *Memory `json:"memory,omitempty"`
 	// TimingsMs is how long each step of creating (and destroying) it took.
 	TimingsMs map[string]float64 `json:"timings_ms,omitempty"`
+}
+
+// Memory is how much host memory a VM's Firecracker uses, in bytes. PSS
+// divides each shared page between the VMs sharing it: forks of one parent
+// each have a PSS well below their RSS, and PSS is what a VM really costs.
+type Memory struct {
+	RSSBytes     int64 `json:"rss_bytes"`
+	PSSBytes     int64 `json:"pss_bytes"`
+	PrivateBytes int64 `json:"private_bytes"`
+	SharedBytes  int64 `json:"shared_bytes"`
 }
 
 // Snapshot is a saved state of a VM, which VMs can be restored from.

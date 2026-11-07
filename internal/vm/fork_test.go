@@ -160,3 +160,35 @@ func TestForkRefusals(t *testing.T) {
 		t.Errorf("a destroyed parent = %v, want ErrNotRunning", err)
 	}
 }
+
+func TestParseSmapsRollup(t *testing.T) {
+	got := parseSmapsRollup(`55a5c0000000-7ffc00000000 ---p 00000000 00:00 0                          [rollup]
+Rss:              118784 kB
+Pss:               57344 kB
+Pss_Dirty:          9216 kB
+Shared_Clean:      98304 kB
+Shared_Dirty:          0 kB
+Private_Clean:      1024 kB
+Private_Dirty:     19456 kB
+Anonymous:         20480 kB
+`)
+	want := Memory{RSS: 118784 << 10, PSS: 57344 << 10, Private: (1024 + 19456) << 10, Shared: 98304 << 10}
+	if got != want {
+		t.Errorf("parseSmapsRollup = %+v, want %+v", got, want)
+	}
+}
+
+func TestMemory(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, nil)
+	vm := f.running(t)
+	if mem, err := f.m.Memory(ctx, vm.ID); err != nil || mem.PSS != 60<<20 {
+		t.Errorf("Memory = %+v, %v", mem, err)
+	}
+	if _, err := f.m.Destroy(ctx, vm.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.m.Memory(ctx, vm.ID); !errors.Is(err, ErrNotRunning) {
+		t.Errorf("Memory of a destroyed VM = %v, want ErrNotRunning", err)
+	}
+}

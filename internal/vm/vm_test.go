@@ -139,6 +139,12 @@ func (f *fakeHost) collectSnapshot(_ *jailer.Jail, b *snapshot.Building) error {
 	return nil
 }
 func (f *fakeHost) flushSnapshot(string) error { return f.record("flushSnapshot") }
+func (f *fakeHost) prefetch(path string) error {
+	return f.record("prefetch " + filepath.Base(filepath.Dir(path)))
+}
+func (f *fakeHost) memory(j *jailer.Jail) (Memory, error) {
+	return Memory{RSS: 120 << 20, PSS: 60 << 20, Private: 20 << 20, Shared: 100 << 20}, nil
+}
 func (f *fakeHost) hostInfo(context.Context) (snapshot.Host, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

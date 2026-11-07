@@ -67,9 +67,29 @@ func (c *Client) CreateVM(ctx context.Context, req CreateVMRequest) (VM, error) 
 
 // ListVMs lists the VMs that aren't destroyed, or all of them.
 func (c *Client) ListVMs(ctx context.Context, all bool) ([]VM, error) {
+	return c.ListVMsWith(ctx, ListOptions{All: all})
+}
+
+// ListOptions says what ListVMsWith lists.
+type ListOptions struct {
+	// All includes destroyed VMs.
+	All bool
+	// Memory includes each running VM's memory use.
+	Memory bool
+}
+
+// ListVMsWith lists VMs, oldest first.
+func (c *Client) ListVMsWith(ctx context.Context, o ListOptions) ([]VM, error) {
+	q := url.Values{}
+	if o.All {
+		q.Set("all", "true")
+	}
+	if o.Memory {
+		q.Set("memory", "true")
+	}
 	path := "/v1/vms"
-	if all {
-		path += "?all=true"
+	if len(q) > 0 {
+		path += "?" + q.Encode()
 	}
 	var r ListVMsResponse
 	return r.VMs, c.do(ctx, http.MethodGet, path, nil, http.StatusOK, &r)

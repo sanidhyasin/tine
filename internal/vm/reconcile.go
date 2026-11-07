@@ -270,11 +270,13 @@ func (m *Manager) reconcileSnapshots(ctx context.Context, r *Report, errorf func
 // deletes snapshots nothing needs any more, keeps the templates of
 // WarmImages usable (see keepWarm), and once an hour
 // purges the records of VMs destroyed longer ago than DestroyedRetention.
-// It returns when ctx ends.
+// When it starts, it reads the templates into the page cache in the
+// background (see prefetchTemplates). It returns when ctx ends.
 func (m *Manager) RunReaper(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	var lastPurge time.Time
+	go m.prefetchTemplates(ctx)
 	m.keepWarm(ctx)
 	for {
 		select {

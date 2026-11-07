@@ -165,3 +165,25 @@ func reimport(t *testing.T, imagesDir, name string, at time.Time) {
 		t.Fatal(err)
 	}
 }
+
+func TestPrefetchTemplates(t *testing.T) {
+	ctx := context.Background()
+	f := warmFixture(t, nil)
+	tmpl, err := f.m.WarmTemplate(ctx, "base", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other := fakeSnapshotHost
+	f.host.takeCalls()
+	f.m.prefetchTemplates(ctx)
+	if calls := strings.Join(f.host.takeCalls(), ","); calls != "prefetch "+tmpl.ID {
+		t.Errorf("calls = %s, want the template prefetched", calls)
+	}
+	// An unusable template isn't worth reading.
+	other.Kernel = "7.0"
+	f.host.thisHost = &other
+	f.m.prefetchTemplates(ctx)
+	if calls := f.host.takeCalls(); len(calls) != 0 {
+		t.Errorf("prefetched an unusable template: %v", calls)
+	}
+}

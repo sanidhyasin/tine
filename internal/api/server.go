@@ -41,6 +41,7 @@ type Backend interface {
 	DeleteSnapshot(ctx context.Context, id string) (state.Snapshot, error)
 	Rollback(ctx context.Context, id, snapshotID string) (state.VM, error)
 	Fork(ctx context.Context, id string, req vm.ForkRequest) (vm.ForkResult, error)
+	Memory(ctx context.Context, id string) (vm.Memory, error)
 	Images(ctx context.Context) ([]*image.Image, error)
 	Templates(ctx context.Context) ([]vm.Template, error)
 	WarmTemplate(ctx context.Context, image string, vcpus, memoryMiB int) (state.Snapshot, error)
@@ -220,9 +221,14 @@ func (s *Server) vms(w http.ResponseWriter, r *http.Request) {
 			s.fail(w, r, err)
 			return
 		}
+		withMemory := r.URL.Query().Get("memory") == "true"
 		out := ListVMsResponse{VMs: []VM{}}
 		for _, v := range list {
-			out.VMs = append(out.VMs, toAPI(v))
+			a := toAPI(v)
+			if withMemory {
+				a.Memory = s.memory(r.Context(), v)
+			}
+			out.VMs = append(out.VMs, a)
 		}
 		writeJSON(w, http.StatusOK, out)
 	case http.MethodPost:
@@ -267,7 +273,24 @@ func (s *Server) oneVM(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, toAPI(v))
+	out := toAPI(v)
+	if r.Method == http.MethodGet {
+		out.Memory = s.memory(r.Context(), v)
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// memory is a running VM's memory, or nil if it isn't running or can't be read.
+func (s *Server) memory(ctx context.Context, v state.VM) *Memory {
+	if v.State != state.StateRunning {
+		return nil
+	}
+	m, err := s.backend.Memory(ctx, v.ID)
+	if err != nil {
+		s.log.DebugContext(ctx, "couldn't read a VM's memory", "vm", v.ID, "err", err)
+		return nil
+	}
+	return &Memory{RSSBytes: m.RSS, PSSBytes: m.PSS, PrivateBytes: m.Private, SharedBytes: m.Shared}
 }
 
 func (s *Server) exec(w http.ResponseWriter, r *http.Request) {

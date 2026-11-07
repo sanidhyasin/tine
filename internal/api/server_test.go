@@ -137,6 +137,13 @@ func (f *fakeBackend) Fork(_ context.Context, id string, req vm.ForkRequest) (vm
 	return res, nil
 }
 
+func (f *fakeBackend) Memory(_ context.Context, id string) (vm.Memory, error) {
+	if strings.HasPrefix(id, "vm-") {
+		return vm.Memory{RSS: 116 << 20, PSS: 56 << 20, Private: 18 << 20, Shared: 98 << 20}, nil
+	}
+	return vm.Memory{}, fmt.Errorf("VM %s: %w", id, state.ErrNotFound)
+}
+
 func (f *fakeBackend) Rollback(_ context.Context, id, snapID string) (state.VM, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -470,6 +477,36 @@ func TestForkAPI(t *testing.T) {
 	}
 	if _, err := c.Fork(ctx, parent.ID, ForkRequest{Count: 0}); !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusBadRequest {
 		t.Errorf("count 0 = %#v", err)
+	}
+}
+
+func TestMemoryAndLineage(t *testing.T) {
+	ctx := context.Background()
+	c, _ := serve(t, newFakeBackend())
+	parent, err := c.CreateVM(ctx, CreateVMRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Fork(ctx, parent.ID, ForkRequest{Count: 2}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := c.GetVM(ctx, parent.ID)
+	if err != nil || got.Memory == nil || got.Memory.PSSBytes != 56<<20 {
+		t.Errorf("GetVM = %+v, %v; want its memory", got, err)
+	}
+	plain, _ := c.ListVMs(ctx, false)
+	with, _ := c.ListVMsWith(ctx, ListOptions{Memory: true})
+	if len(plain) != 3 || plain[0].Memory != nil || len(with) != 3 || with[1].Memory == nil {
+		t.Errorf("lists: %+v / %+v", plain, with)
+	}
+	children := 0
+	for _, v := range with {
+		if v.ParentID == parent.ID && v.SnapshotID == "snap-forkforkfo" {
+			children++
+		}
+	}
+	if children != 2 {
+		t.Errorf("%d VMs say they're children of %s, want 2", children, parent.ID)
 	}
 }
 

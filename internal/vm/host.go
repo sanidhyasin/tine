@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net/http"
 	"os"
@@ -64,6 +65,10 @@ type host interface {
 	loadSnapshot(ctx context.Context, j *jailer.Jail) error
 	// syncGuest makes the guest current and unique, through its agent.
 	syncGuest(ctx context.Context, j *jailer.Jail, req agentproto.SyncRequest) (agentproto.SyncResult, error)
+	// memory reads how much host memory the VM's Firecracker uses.
+	memory(j *jailer.Jail) (Memory, error)
+	// prefetch reads a file into the page cache.
+	prefetch(path string) error
 	// describeHost says what a snapshot of the VM would depend on: its
 	// Firecracker version, and this host's CPU and kernel.
 	describeHost(ctx context.Context, j *jailer.Jail) (snapshot.Host, error)
@@ -317,6 +322,33 @@ func (h *hostOS) syncGuest(ctx context.Context, j *jailer.Jail, req agentproto.S
 		return res, fmt.Errorf("the image's tine-agent is too old to sync the guest; import the image again: %w", err)
 	}
 	return res, err
+}
+
+func (h *hostOS) prefetch(path string) error {
+	f, err := os.Open(path) //nolint:gosec // a path in tined's own snapshot store
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
+	_, err = io.Copy(io.Discard, f)
+	return err
+}
+
+func (h *hostOS) memory(j *jailer.Jail) (Memory, error) {
+	// The process in the VM's cgroup is its Firecracker, whoever started it.
+	procs, err := os.ReadFile(filepath.Join(j.CgroupDir(), "cgroup.procs"))
+	if err != nil {
+		return Memory{}, err
+	}
+	pid, _, _ := strings.Cut(strings.TrimSpace(string(procs)), "\n")
+	if pid == "" {
+		return Memory{}, errors.New("nothing runs in the VM's cgroup")
+	}
+	data, err := os.ReadFile(filepath.Join("/proc", pid, "smaps_rollup")) //nolint:gosec // a PID read from the cgroup
+	if err != nil {
+		return Memory{}, err
+	}
+	return parseSmapsRollup(string(data)), nil
 }
 
 func (h *hostOS) describeHost(ctx context.Context, j *jailer.Jail) (snapshot.Host, error) {

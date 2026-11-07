@@ -226,6 +226,13 @@ func (b *backend) Fork(_ context.Context, id string, req vm.ForkRequest) (vm.For
 	return res, nil
 }
 
+func (b *backend) Memory(_ context.Context, id string) (vm.Memory, error) {
+	if strings.HasPrefix(id, "vm-") {
+		return vm.Memory{RSS: 116 << 20, PSS: 56 << 20, Private: 18 << 20, Shared: 98 << 20}, nil
+	}
+	return vm.Memory{}, fmt.Errorf("VM %s: %w", id, state.ErrNotFound)
+}
+
 func (b *backend) Rollback(_ context.Context, id, snapID string) (state.VM, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -529,6 +536,35 @@ func TestSnapshotListInspectRemove(t *testing.T) {
 	r = tine(t, sock, "", "snapshot", "rm", "abcdz", "abcdefghij", "nope")
 	if r.code != 1 || r.stdout != "deleted snap-abcdzzzzzz\n" || !strings.Contains(r.stderr, "abcdefghij: ") || !strings.Contains(r.stderr, "nope") {
 		t.Errorf("snapshot rm = %d %q %q", r.code, r.stdout, r.stderr)
+	}
+}
+
+func TestListTree(t *testing.T) {
+	sock, b := startTined(t)
+	parent := strings.TrimSpace(tine(t, sock, "", "create", "-q").stdout)
+	tine(t, sock, "", "create", "-q") // a VM of its own
+	if _, err := b.Fork(context.Background(), parent, vm.ForkRequest{Count: 2}); err != nil {
+		t.Fatal(err)
+	}
+	r := tine(t, sock, "", "ls", "--tree")
+	lines := strings.Split(strings.TrimRight(r.stdout, "\n"), "\n")
+	want := []string{"VM ", parent + " ", "└─ snap-forkaaaaaa (2 forked)", "   ├─ vm-", "   └─ vm-", "vm-aaaaaaaaac "}
+	if r.code != 0 || len(lines) != len(want) {
+		t.Fatalf("ls --tree = %d:\n%s%s", r.code, r.stdout, r.stderr)
+	}
+	for i, prefix := range want {
+		if !strings.HasPrefix(lines[i], prefix) {
+			t.Errorf("line %d = %q, want it to start %q", i, lines[i], prefix)
+		}
+	}
+	if !strings.Contains(lines[3], "116 MiB  56 MiB") {
+		t.Errorf("a child's line lacks its RSS and PSS: %q", lines[3])
+	}
+	// A child whose parent is gone is a root, and says where it came from.
+	tine(t, sock, "", "destroy", parent)
+	r = tine(t, sock, "", "ls", "-t")
+	if !strings.Contains(r.stdout, "(forked from "+parent+")") {
+		t.Errorf("after destroying the parent:\n%s", r.stdout)
 	}
 }
 

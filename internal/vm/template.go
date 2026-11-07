@@ -8,6 +8,7 @@ import (
 
 	"github.com/sanidhyasin/tine/internal/agentproto"
 	"github.com/sanidhyasin/tine/internal/image"
+	"github.com/sanidhyasin/tine/internal/snapshot"
 	"github.com/sanidhyasin/tine/internal/state"
 )
 
@@ -189,5 +190,29 @@ func (m *Manager) keepWarm(ctx context.Context) {
 				m.log.Error("couldn't warm a template; trying again later", "image", name, "retry_in", warmRetry.String(), "err", err)
 			}
 		}()
+	}
+}
+
+// prefetchTemplates reads every usable template's memory file into the page
+// cache, so the first VMs restored from it after the host starts don't wait
+// for the disk on every page the guest touches, nor do snapshots of them,
+// which read all of a VM's memory while it's paused. tined does this once,
+// at startup.
+func (m *Manager) prefetchTemplates(ctx context.Context) {
+	templates, err := m.Templates(ctx)
+	if err != nil {
+		m.log.Warn("couldn't list templates to prefetch", "err", err)
+		return
+	}
+	for _, t := range templates {
+		if t.Problem != "" || ctx.Err() != nil {
+			continue
+		}
+		start := time.Now()
+		if err := m.host.prefetch(m.snaps.Path(t.Snapshot.ID, snapshot.MemoryFile)); err != nil {
+			m.log.Warn("couldn't prefetch a template", "snapshot", t.Snapshot.ID, "err", err)
+			continue
+		}
+		m.log.Info("template's memory is in the page cache", "snapshot", t.Snapshot.ID, "image", t.Snapshot.Image, "ms", ms(time.Since(start)))
 	}
 }
