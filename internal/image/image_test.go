@@ -124,6 +124,13 @@ func TestCustomize(t *testing.T) {
 		t.Errorf("%s = %v (%v)", ImageInfoPath, info, err)
 	}
 
+	// Stamps that stop every boot from rerunning ldconfig and friends.
+	for _, stamp := range []string{"etc/.updated", "var/.updated"} {
+		if _, err := os.Stat(filepath.Join(root, stamp)); err != nil {
+			t.Errorf("missing %s: %v", stamp, err)
+		}
+	}
+
 	// Running it again (as an import with Force would) works and changes nothing important.
 	if err := Customize(root, agent, meta); err != nil {
 		t.Errorf("second Customize: %v", err)

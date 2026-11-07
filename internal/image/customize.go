@@ -117,6 +117,15 @@ func Customize(root, agentBin string, meta Metadata) error {
 	if err := g.writeFile(ImageInfoPath, string(info)+"\n", 0o644); err != nil {
 		return fmt.Errorf("image info: %w", err)
 	}
+
+	// Changing /etc makes systemd think the system was just updated, so every
+	// VM's boot would rerun ldconfig and friends (units with
+	// ConditionNeedsUpdate=). These stamps, newer than /usr, say they've run.
+	for _, stamp := range []string{"/etc/.updated", "/var/.updated"} {
+		if err := g.writeFile(stamp, "# Written by tine: the image is up to date.\n", 0o644); err != nil {
+			return fmt.Errorf("update stamp %s: %w", stamp, err)
+		}
+	}
 	return nil
 }
 
