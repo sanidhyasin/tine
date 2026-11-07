@@ -123,6 +123,18 @@ else
   rm -rf "$tmp"
 fi
 bin/firecracker --version | head -1
+# tined runs them from /usr/local/bin.
+sudo install -m 0755 bin/firecracker bin/jailer /usr/local/bin/
+
+# The tine group may use tined's API socket. Add this user so the tine CLI
+# works without sudo (from the next login on).
+if ! getent group tine >/dev/null; then
+  sudo groupadd --system tine
+fi
+if ! id -nG "$USER" | grep -qw tine; then
+  sudo usermod -aG tine "$USER"
+  echo "Added $USER to the tine group (takes effect at the next login)"
+fi
 
 # --- 5. Guest kernel and rootfs ---------------------------------------------
 say "Guest kernel and rootfs (from Firecracker's CI artifacts)"

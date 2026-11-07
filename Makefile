@@ -62,16 +62,21 @@ test-integration: build ## Integration tests on the dev server, as root, against
 		CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test -c -tags integration -o $(OUT)/tests/$$name.test $$p || exit 1; \
 	done
 	./scripts/dev-server.sh sync
-	./scripts/dev-server.sh ssh 'cd ~/tine && for t in $(OUT)/tests/*.test; do echo "=== $$t"; \
+	@# The tests set up and tear down the host's VM networking themselves, so a
+	@# running tined would clash with them: they stop it (its VMs must be gone).
+	./scripts/dev-server.sh ssh 'sudo systemctl stop tined 2>/dev/null || true; \
+		cd ~/tine && for t in $(OUT)/tests/*.test; do echo "=== $$t"; \
 		sudo TINE_ARTIFACTS=$$HOME/tine/artifacts TINE_AGENT_BIN=$$HOME/tine/$(OUT)/tine-agent \
 		./$$t -test.v -test.count=1 || exit 1; done'
 
 .PHONY: deploy
-deploy: build ## Build, copy to the dev server, install the binaries, restart tined if it's installed
+deploy: build ## Build, copy to the dev server, install the binaries and the tined service, (re)start it
 	./scripts/dev-server.sh sync
-	./scripts/dev-server.sh ssh 'cd ~/tine/$(OUT) && sudo install -m 0755 $(BINARIES) /usr/local/bin/ \
-		&& if systemctl cat tined >/dev/null 2>&1; then sudo systemctl restart tined; fi \
-		&& tine version'
+	./scripts/dev-server.sh ssh 'set -e; cd ~/tine \
+		&& sudo install -m 0755 $(addprefix $(OUT)/,$(BINARIES)) /usr/local/bin/ \
+		&& sudo install -m 0644 deploy/tined.service /etc/systemd/system/tined.service \
+		&& sudo systemctl daemon-reload && sudo systemctl enable --quiet tined && sudo systemctl restart tined \
+		&& echo "tined is $$(systemctl is-active tined): $$(tined version)"'
 
 .PHONY: base-image
 base-image: deploy ## Build the "base" image on the dev server, with this tree's tine-agent (server must be up)
