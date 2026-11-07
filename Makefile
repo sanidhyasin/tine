@@ -21,7 +21,7 @@ GOLANGCI_LINT         := $(TOOLS)/golangci-lint-$(GOLANGCI_LINT_VERSION)
 
 .PHONY: help
 help: ## List the targets
-	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z0-9_-]+:.*## / {printf "  make %-8s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z0-9_-]+:.*## / {printf "  make %-16s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
 .PHONY: build
 build: ## Build every binary for the Linux server into bin/linux-amd64/
@@ -90,6 +90,17 @@ BENCH_NAME ?= dev
 .PHONY: bench
 bench: deploy ## Benchmark on the dev server, fetch and chart the results (server must be up; BENCH_ARGS= picks scenarios)
 	./scripts/dev-server.sh ssh 'sudo /usr/local/bin/tine-bench -out /tmp/tine-bench.jsonl $(BENCH_ARGS)'
+	@dir="bench/results/$$(date -u +%Y-%m-%d)-$(BENCH_NAME)"; mkdir -p "$$dir"; \
+		./scripts/dev-server.sh ssh 'cat /tmp/tine-bench.jsonl' > "$$dir/results.jsonl"; \
+		echo "results in $$dir"; uv run bench/analyze.py "$$dir"
+
+# All of step 4's benchmarks, in one run of bench/run.sh on the dev server.
+PARTS ?=
+QUICK ?=
+
+.PHONY: bench-all
+bench-all: bench-image ## Every benchmark of step 4 on the dev server, fetched and charted (about 3 hours; PARTS= picks some, QUICK=1 tries it)
+	./scripts/dev-server.sh ssh 'cd ~/tine && PARTS="$(PARTS)" QUICK="$(QUICK)" bench/run.sh /tmp/tine-bench.jsonl'
 	@dir="bench/results/$$(date -u +%Y-%m-%d)-$(BENCH_NAME)"; mkdir -p "$$dir"; \
 		./scripts/dev-server.sh ssh 'cat /tmp/tine-bench.jsonl' > "$$dir/results.jsonl"; \
 		echo "results in $$dir"; uv run bench/analyze.py "$$dir"

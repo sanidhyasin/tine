@@ -102,6 +102,23 @@ class Results:
         return out
 
 
+FEATURE_NAMES = {"diff-snapshots": "diff", "huge-pages-2M": "2M"}
+
+
+def features(p: dict) -> list[str]:
+    """What tined and the host ran with beyond the defaults, short names."""
+    return [FEATURE_NAMES.get(f, f) for f in p.get("features", "").split(",") if f]
+
+
+def series(p: dict) -> str:
+    """The rung a run measured: its fork strategy, and what tined ran with,
+    such as "diff" for diff snapshots or "uffd+2M"."""
+    parts = [p.get("strategy", "share")] + features(p)
+    if parts[:2] == ["share", "diff"]:
+        parts = parts[1:]  # diff snapshots are rung 4: "diff", not "share+diff"
+    return "+".join(parts)
+
+
 def stats(values: list[float]) -> dict:
     v = sorted(values)
     if not v:
@@ -214,16 +231,21 @@ def chart_create_cdf(sets: list[Results], out: Path):
     fig, ax = plt.subplots(figsize=(7.5, 4))
     i = 0
     for res in sets:
-        for scenario, name in [("create-template", "template"), ("create-cold", "cold")]:
-            v = sorted(timing([r for rs in res.points(scenario).values() for r in rs], "total"))
+        lines: dict[str, list[float]] = defaultdict(list)
+        for scenario in ("create-template", "create-cold"):
+            for params, runs in res.points(scenario).items():
+                p = dict(params)
+                name = "cold" if scenario == "create-cold" else series(p)
+                lines[name] += timing(runs, "total")
+        for name, v in sorted(lines.items(), key=lambda kv: (kv[0] == "cold", kv[0])):
+            v.sort()
             if not v:
                 continue
             ys = [(k + 1) / len(v) for k in range(len(v))]
-            # Two series of their own: template in slot 1, cold in slot 2.
-            c = SLOTS[(0 if name == "template" else 1) if len(sets) == 1 else i % len(SLOTS)]
-            label = name if len(sets) == 1 else f"{name}, {res.label}"
+            label = ("cold boot" if name == "cold" else f"template, {name}") if len(sets) == 1 else f"{name}, {res.label}"
+            c = color(name, i) if len(sets) == 1 else SLOTS[i % len(SLOTS)]
             ax.step(v, ys, where="post", color=c, label=label)
-            label_end(ax, v[len(v) // 2], 0.5, f"{name} p50 {fmt_ms(v[len(v) // 2])}", c)
+            label_end(ax, v[len(v) // 2], 0.5, f"p50 {fmt_ms(v[len(v) // 2])}", c)
             i += 1
     ax.set_xscale("log")
     ms_axis(ax, "x")
@@ -268,7 +290,7 @@ def chart_fork(sets: list[Results], out: Path, key: str, filename: str, title: s
             p = dict(params)
             if "touch_mib" in p or "dirty_mib" in p:
                 continue
-            by_strategy[p.get("strategy", "share")].append((p["children"], timing(runs, key)))
+            by_strategy[series(p)].append((p["children"], timing(runs, key)))
         for strategy, pts in sorted(by_strategy.items()):
             pts = sorted((n, statistics.median(v)) for n, v in pts if v)
             if not pts:
@@ -295,26 +317,32 @@ def chart_fork(sets: list[Results], out: Path, key: str, filename: str, title: s
 
 def chart_snapshot(sets: list[Results], out: Path):
     fig, ax = plt.subplots(figsize=(7.5, 4))
-    plotted = False
-    for i, res in enumerate(sets):
-        pts = sorted((dict(p)["memory_mib"], statistics.median(timing(rs, "paused"))) for p, rs in res.points("snapshot").items() if timing(rs, "paused"))
-        if not pts:
-            continue
-        xs, ys = zip(*pts)
-        ax.plot(xs, ys, marker="o", color=SLOTS[i], label=res.label)
-        for x, y in pts:
-            label_end(ax, x, y, fmt_ms(y), SLOTS[i])
-        plotted = True
-    if not plotted:
+    lines: dict[str, list[tuple[int, float]]] = defaultdict(list)
+    for res in sets:
+        for params, runs in res.points("snapshot").items():
+            p = dict(params)
+            if not timing(runs, "paused"):
+                continue
+            mode = "+".join(features(p)) or "full"
+            name = mode if len(sets) == 1 else f"{mode}, {res.label}"
+            lines[name].append((p["memory_mib"], statistics.median(timing(runs, "paused"))))
+    if not lines:
         plt.close(fig)
         return
+    for i, (name, pts) in enumerate(sorted(lines.items(), key=lambda kv: kv[0] != "full")):
+        pts.sort()
+        xs, ys = zip(*pts)
+        c = SLOTS[i % len(SLOTS)]
+        ax.plot(xs, ys, marker="o", color=c, label=name)
+        for x, y in pts:
+            label_end(ax, x, y, fmt_ms(y), c)
     ax.set_xscale("log", base=2)
     ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v / 1024:g} GiB" if v >= 1024 else f"{v:g} MiB"))
     ms_axis(ax)
     ax.set_ylim(bottom=0)
     ax.set_xlabel("VM memory")
     ax.set_ylabel("VM paused (p50)")
-    if len(sets) > 1:
+    if len(lines) > 1:
         ax.legend(loc="upper left")
     finish(fig, ax, out / "snapshot-paused.png", "How long a snapshot pauses a VM",
            "Median pause, by the VM's memory size")
@@ -328,22 +356,24 @@ def chart_fork_memory(res: Results, out: Path):
             continue
         m = [r["memory_mib"] for r in runs if r.get("memory_mib", {}).get("child_rss")]
         if m:
-            rows.append((p.get("strategy", "share"), p["children"],
+            rows.append((series(p), p["children"],
                          statistics.fmean(x["child_rss"] for x in m), statistics.fmean(x["child_pss"] for x in m)))
     if not rows:
         return
-    rows.sort()
-    fig, ax = plt.subplots(figsize=(7.5, 4))
-    width = 0.38
-    for i, (strategy, n, rss, pss) in enumerate(rows):
-        ax.bar(i - width / 2 - 0.01, rss, width, color=SLOTS[0], label="RSS" if i == 0 else None)
-        ax.bar(i + width / 2 + 0.01, pss, width, color=SLOTS[1], label="PSS" if i == 0 else None)
-        ax.text(i + width / 2 + 0.01, pss, f"{pss:.0f}", ha="center", va="bottom", color=INK2, fontsize=8)
-        ax.text(i - width / 2 - 0.01, rss, f"{rss:.0f}", ha="center", va="bottom", color=INK2, fontsize=8)
-    ax.set_xticks(range(len(rows)), [f"{s}\n{n} {'child' if n == 1 else 'children'}" for s, n, _, _ in rows])
-    ax.set_ylabel("MiB per child (mean)")
-    ax.grid(axis="x", visible=False)
-    ax.legend(loc="upper right")
+    # Top to bottom: each strategy, by number of children.
+    rows.sort(key=lambda r: (r[0], -r[1]), reverse=True)
+    fig, ax = plt.subplots(figsize=(7.5, 0.9 + 0.42 * len(rows)))
+    h = 0.38
+    for i, (_, _, rss, pss) in enumerate(rows):
+        ax.barh(i + h / 2 + 0.01, rss, h, color=SLOTS[0], label="RSS" if i == 0 else None)
+        ax.barh(i - h / 2 - 0.01, pss, h, color=SLOTS[1], label="PSS" if i == 0 else None)
+        ax.text(rss, i + h / 2 + 0.01, f" {rss:.0f}", va="center", color=INK2, fontsize=8)
+        ax.text(pss, i - h / 2 - 0.01, f" {pss:.0f}", va="center", color=INK2, fontsize=8)
+    ax.set_yticks(range(len(rows)), [f"{s}, {n} {'child' if n == 1 else 'children'}" for s, n, _, _ in rows])
+    ax.set_xlabel("MiB per child (mean)")
+    ax.set_xlim(right=max(r[2] for r in rows) * 1.12)
+    ax.grid(axis="y", visible=False)
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.9 / (0.9 + 0.42 * len(rows)) - 0.02), ncol=2, frameon=False)
     finish(fig, ax, out / "fork-memory.png", "What each child really costs",
            "RSS counts shared pages in full; PSS splits them between the VMs sharing them")
 
@@ -353,7 +383,7 @@ def chart_fork_dirty(res: Results, out: Path):
     for params, runs in res.points("fork").items():
         p = dict(params)
         if "dirty_mib" in p and timing(runs, "paused"):
-            by_strategy[p.get("strategy", "share")].append((p["dirty_mib"], statistics.median(timing(runs, "paused"))))
+            by_strategy[series(p)].append((p["dirty_mib"], statistics.median(timing(runs, "paused"))))
     if not by_strategy:
         return
     fig, ax = plt.subplots(figsize=(7.5, 4))
@@ -375,8 +405,8 @@ def chart_fork_touch(res: Results, out: Path):
     for params, runs in res.points("fork").items():
         p = dict(params)
         t = [r["extra"]["touch_ns_per_page_p50"] for r in runs if "touch_ns_per_page_p50" in r.get("extra", {})]
-        if "touch_mib" in p and t:
-            rows.append((statistics.median(t), p.get("strategy", "share")))
+        if "touch_mib" in p and "read" not in p and t:
+            rows.append((statistics.median(t), series(p)))
     if not rows:
         return
     rows.sort()
@@ -389,7 +419,89 @@ def chart_fork_touch(res: Results, out: Path):
     ax.grid(axis="y", visible=False)
     ax.set_xlabel("time per 4 KiB page (median of the children)")
     finish(fig, ax, out / "fork-touch.png", "A child's first write to its parent's memory",
-           "Each child writes every page its parent filled before the fork")
+           "Four children, one at a time, write every page their parent filled before the fork")
+
+
+def chart_fork_evict(res: Results, out: Path):
+    rows = []
+    for params, runs in res.points("fork").items():
+        p = dict(params)
+        t = [r["extra"]["touch_ns_per_page_p50"] for r in runs if "touch_ns_per_page_p50" in r.get("extra", {})]
+        if p.get("read") and t:
+            where = "evicted" if p.get("evicted") else "in the page cache"
+            rows.append((statistics.median(t), f"{series(p)}, {where}", series(p)))
+    if not rows:
+        return
+    rows.sort()
+    fig, ax = plt.subplots(figsize=(7.5, 0.6 + 0.55 * len(rows)))
+    for i, (ns, _, s) in enumerate(rows):
+        ax.barh(i, ns, height=0.5, color=color(s))
+        ax.text(ns, i, f"  {fmt_ns(ns)}", va="center", color=INK2, fontsize=9)
+    ax.set_yticks(range(len(rows)), [label for _, label, _ in rows])
+    ax.set_xscale("log")
+    ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _: fmt_ns(v)))
+    ax.grid(axis="y", visible=False)
+    ax.set_xlabel("time per 4 KiB page (median of the children, log scale)")
+    finish(fig, ax, out / "fork-evict.png", "A child reading its parent's memory, before and after eviction",
+           "Four children, one at a time, read every page their parent filled; evicted: the page cache was dropped first")
+
+
+def fmt_ns(ns: float) -> str:
+    if ns >= 1e6:
+        return f"{ns / 1e6:g} ms"
+    if ns >= 1e3:
+        return f"{ns / 1e3:.3g} µs"
+    return f"{ns:.0f} ns"
+
+
+def chart_pressure(res: Results, out: Path):
+    for params, runs in res.points("pressure").items():
+        p = dict(params)
+        rounds = runs[0].get("extra", {}).get("rounds", [])
+        if not rounds:
+            continue
+        xs = [r["dirty_mib"] for r in rounds]
+        # Two measures, two panels: never two scales on one axis.
+        fig, (ax, ax2) = plt.subplots(2, 1, figsize=(7.5, 5.5), sharex=True)
+        ax.plot(xs, [r["host_available_mib"] / 1024 for r in rounds], marker="o", color=SLOTS[0])
+        ax.set_ylabel("host memory\navailable (GiB)")
+        ax.set_ylim(bottom=0)
+        ax2.plot(xs, [r["alive"] for r in rounds], marker="o", color=SLOTS[1])
+        for r in rounds:
+            if r.get("oom_kills"):
+                ax2.annotate(f"{r['oom_kills']:.0f} OOM kills", (r["dirty_mib"], r["alive"]), textcoords="offset points",
+                             xytext=(0, -14), ha="center", color=INK2, fontsize=8)
+        ax2.set_ylabel("children running")
+        ax2.set_ylim(bottom=0, top=p["children"] * 1.15)
+        ax2.set_xlabel("memory each child has changed (MiB)")
+        finish(fig, ax, out / "pressure.png", "Running the host out of memory",
+               f"{p['children']} children of a {p['memory_mib'] // 1024} GiB VM, each changing {p['step_mib']} MiB more per round")
+        return
+
+
+def chart_idle(res: Results, out: Path):
+    lines = {}
+    for params, runs in res.points("idle").items():
+        p = dict(params)
+        samples = runs[0].get("extra", {}).get("samples", [])
+        if samples:
+            lines[series(p)] = (p["vms"], samples)
+    if not lines:
+        return
+    fig, ax = plt.subplots(figsize=(7.5, 4))
+    for i, (name, (n, samples)) in enumerate(sorted(lines.items())):
+        xs = [s["seconds"] for s in samples]
+        ys = [s.get("pss_total", 0) / n for s in samples]
+        c = color(name, i)
+        ax.plot(xs, ys, color=c, label=name)
+        label_end(ax, xs[-1], ys[-1], f"{name}: {ys[-1]:.0f} MiB", c)
+    ax.set_xlabel("seconds idle")
+    ax.set_ylabel("PSS per VM (MiB)")
+    ax.set_ylim(bottom=0)
+    if len(lines) > 1:
+        ax.legend(loc="upper right")
+    finish(fig, ax, out / "idle-memory.png", "What an idle VM costs the host, over time",
+           f"Mean PSS of {next(iter(lines.values()))[0]} idle 256 MiB VMs, by how they were made")
 
 
 def charts(sets: list[Results], out: Path):
@@ -405,6 +517,9 @@ def charts(sets: list[Results], out: Path):
         chart_fork_memory(sets[0], out)
         chart_fork_dirty(sets[0], out)
         chart_fork_touch(sets[0], out)
+        chart_idle(sets[0], out)
+        chart_fork_evict(sets[0], out)
+        chart_pressure(sets[0], out)
 
 
 def main():

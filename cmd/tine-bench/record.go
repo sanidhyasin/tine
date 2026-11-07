@@ -57,6 +57,8 @@ type Host struct {
 	THP            string `json:"transparent_hugepages"`
 	KSM            string `json:"ksm_run"`
 	GoVersion      string `json:"go_version"`
+	// Features are what tined runs with, such as "diff-snapshots".
+	Features []string `json:"tined_features,omitempty"`
 }
 
 // writer writes records as JSON lines, safe for concurrent use.
@@ -106,7 +108,7 @@ func describeHost(ctx context.Context, c *api.Client) *Host {
 		}
 	}
 	if health, err := c.Health(ctx); err == nil {
-		h.Tine = health.Version
+		h.Tine, h.Features = health.Version, health.Features
 	}
 	h.DataDisk = diskModel(ctx, "/srv/tine")
 	h.InstanceType = ec2InstanceType(ctx)
