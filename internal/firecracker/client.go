@@ -1,8 +1,8 @@
 // Package firecracker is a small client for the HTTP API that a Firecracker
 // process serves on its Unix socket.
 //
-// It covers what tine needs to configure, start, pause and resume a microVM.
-// Snapshot calls arrive in step 2 (docs/PLAN.md, task 2.1). Request and
+// It covers what tine needs to configure, start, pause and resume a microVM,
+// and to snapshot it and load the snapshot into a new process. Request and
 // response types follow Firecracker v1.17's API spec
 // (src/firecracker/swagger/firecracker.yaml).
 //

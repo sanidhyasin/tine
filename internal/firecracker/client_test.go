@@ -224,6 +224,55 @@ func TestCallsSendTheRightRequests(t *testing.T) {
 			wantMethod: http.MethodPatch, wantPath: "/vm",
 			wantBody: `{"state": "Resumed"}`,
 		},
+		{
+			name: "snapshot create leaves the type and syncing to Firecracker",
+			call: func(c *Client) error {
+				return c.CreateSnapshot(ctx, SnapshotCreate{SnapshotPath: "/snapshot/vmstate", MemFilePath: "/snapshot/memory"})
+			},
+			wantMethod: http.MethodPut, wantPath: "/snapshot/create",
+			wantBody: `{"snapshot_path": "/snapshot/vmstate", "mem_file_path": "/snapshot/memory"}`,
+		},
+		{
+			name: "snapshot create sends sync_snapshot_files false explicitly",
+			call: func(c *Client) error {
+				return c.CreateSnapshot(ctx, SnapshotCreate{
+					SnapshotPath: "/s", MemFilePath: "/m", SnapshotType: SnapshotFull, SyncSnapshotFiles: Bool(false),
+				})
+			},
+			wantMethod: http.MethodPut, wantPath: "/snapshot/create",
+			wantBody: `{"snapshot_path": "/s", "mem_file_path": "/m", "snapshot_type": "Full", "sync_snapshot_files": false}`,
+		},
+		{
+			name: "snapshot load from a file",
+			call: func(c *Client) error {
+				return c.LoadSnapshot(ctx, SnapshotLoad{
+					SnapshotPath: "/restore/vmstate",
+					MemBackend:   MemoryBackend{BackendType: MemoryBackendFile, BackendPath: "/restore/memory"},
+					ResumeVM:     true,
+				})
+			},
+			wantMethod: http.MethodPut, wantPath: "/snapshot/load",
+			wantBody: `{"snapshot_path": "/restore/vmstate", "mem_backend": {"backend_type": "File", "backend_path": "/restore/memory"}, "resume_vm": true}`,
+		},
+		{
+			name: "snapshot load with every option",
+			call: func(c *Client) error {
+				return c.LoadSnapshot(ctx, SnapshotLoad{
+					SnapshotPath:     "/s",
+					MemBackend:       MemoryBackend{BackendType: MemoryBackendUffd, BackendPath: "/uffd.sock"},
+					TrackDirtyPages:  true,
+					ResumeVM:         true,
+					NetworkOverrides: []NetworkOverride{{IfaceID: "eth0", HostDevName: "tap1"}},
+					VsockOverride:    &VsockOverride{UDSPath: "/v.sock"},
+					ClockRealtime:    true,
+					HugePages:        HugePagesSnapshot,
+				})
+			},
+			wantMethod: http.MethodPut, wantPath: "/snapshot/load",
+			wantBody: `{"snapshot_path": "/s", "mem_backend": {"backend_type": "Uffd", "backend_path": "/uffd.sock"},
+				"track_dirty_pages": true, "resume_vm": true, "network_overrides": [{"iface_id": "eth0", "host_dev_name": "tap1"}],
+				"vsock_override": {"uds_path": "/v.sock"}, "clock_realtime": true, "huge_pages": "Snapshot"}`,
+		},
 	}
 
 	for _, tt := range tests {
@@ -331,6 +380,12 @@ func TestMissingIDsAreRejectedBeforeSending(t *testing.T) {
 	if err := c.PutNetworkInterface(context.Background(), NetworkInterface{HostDevName: "tap0"}); err == nil {
 		t.Error("PutNetworkInterface without an IfaceID: want an error")
 	}
+	if err := c.CreateSnapshot(context.Background(), SnapshotCreate{SnapshotPath: "/s"}); err == nil {
+		t.Error("CreateSnapshot without a memory file: want an error")
+	}
+	if err := c.LoadSnapshot(context.Background(), SnapshotLoad{SnapshotPath: "/s"}); err == nil {
+		t.Error("LoadSnapshot without a memory backend: want an error")
+	}
 	fake.mu.Lock()
 	defer fake.mu.Unlock()
 	if len(fake.requests) != 0 {
@@ -351,6 +406,29 @@ func TestDefaultTimeoutAppliesWithoutADeadline(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
 		t.Errorf("call took %v, want about 50ms", elapsed)
+	}
+}
+
+func TestSnapshotCallsOutlastTheDefaultTimeout(t *testing.T) {
+	fake := newFakeFirecracker(t, func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(200 * time.Millisecond) // a large VM's memory takes a while to write
+		w.WriteHeader(http.StatusNoContent)
+	})
+	c := New(fake.socket, WithTimeout(50*time.Millisecond))
+	if err := c.CreateSnapshot(context.Background(), SnapshotCreate{SnapshotPath: "/s", MemFilePath: "/m"}); err != nil {
+		t.Errorf("CreateSnapshot: %v, want it to wait past the client's 50ms default", err)
+	}
+	if err := c.LoadSnapshot(context.Background(), SnapshotLoad{
+		SnapshotPath: "/s", MemBackend: MemoryBackend{BackendType: MemoryBackendFile, BackendPath: "/m"},
+	}); err != nil {
+		t.Errorf("LoadSnapshot: %v, want it to wait past the client's 50ms default", err)
+	}
+
+	// A caller's own deadline still applies.
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if err := c.CreateSnapshot(ctx, SnapshotCreate{SnapshotPath: "/s", MemFilePath: "/m"}); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("CreateSnapshot with a 50ms deadline = %v, want context.DeadlineExceeded", err)
 	}
 }
 

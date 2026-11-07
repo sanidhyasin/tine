@@ -401,7 +401,7 @@ The time between steps 1 and 4 is the VM's **pause time**, which we report separ
 
 ### Tasks
 
-- [ ] **2.1 Firecracker client:** `snapshot/create` and `snapshot/load`, including all their options.
+- [x] **2.1 Firecracker client:** `snapshot/create` and `snapshot/load`, including all their options. *Snapshot calls get a 5-minute default timeout, since writing a large VM's memory outlasts the usual 10 s. Tested against real Firecracker 1.17.0: snapshotting a 256 MiB VM took 121 ms (pause 0.5 ms), and loading it into a new process and resuming took 3 ms. The memory file is written in full, not sparse, so pause time will grow with memory size. The new process must bind the vsock socket at the same path, so the old socket has to be gone first.*
 - [ ] **2.2 Snapshot store:** layout, metadata, reference counts, compatibility checks, garbage collection.
 - [ ] **2.3 Snapshot command:** `POST /v1/vms/{id}/snapshots`, `tine snapshot <vm>`, and the 409 while an exec is running.
 - [ ] **2.4 Restore path** in `internal/vm`, plus the agent's `/sync` (clock, entropy, hostname).

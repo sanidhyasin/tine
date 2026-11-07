@@ -5,10 +5,11 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
+	"time"
 )
 
 // Configuration calls. Except for the logger and metrics, these only work
-// before StartInstance.
+// before StartInstance, and not at all in a process that loads a snapshot.
 
 // PutLogger configures Firecracker's own log.
 func (c *Client) PutLogger(ctx context.Context, l Logger) error {
@@ -95,6 +96,44 @@ func (c *Client) Pause(ctx context.Context) error {
 // Resume unfreezes a paused VM. Resuming a running VM does nothing.
 func (c *Client) Resume(ctx context.Context) error {
 	return c.do(ctx, http.MethodPatch, "/vm", "/vm", vmState{State: "Resumed"}, nil)
+}
+
+// Snapshots.
+
+// SnapshotTimeout applies to snapshot calls whose context has no deadline.
+// Writing or loading a large VM's memory can take longer than DefaultTimeout.
+const SnapshotTimeout = 5 * time.Minute
+
+// CreateSnapshot writes the VM's state and memory to files. The VM must be
+// paused, and stays paused. Taking a snapshot resets the guest's vsock
+// connections; its listening sockets survive.
+func (c *Client) CreateSnapshot(ctx context.Context, s SnapshotCreate) error {
+	if s.SnapshotPath == "" || s.MemFilePath == "" {
+		return errors.New("firecracker PUT /snapshot/create: SnapshotPath and MemFilePath are required")
+	}
+	ctx, cancel := withDefaultTimeout(ctx, SnapshotTimeout)
+	defer cancel()
+	return c.do(ctx, http.MethodPut, "/snapshot/create", "/snapshot/create", s, nil)
+}
+
+// LoadSnapshot loads a snapshot into this Firecracker process, which must not
+// have been configured, other than its logger and metrics. On failure the
+// process exits.
+func (c *Client) LoadSnapshot(ctx context.Context, s SnapshotLoad) error {
+	if s.SnapshotPath == "" || s.MemBackend.BackendPath == "" || s.MemBackend.BackendType == "" {
+		return errors.New("firecracker PUT /snapshot/load: SnapshotPath and a MemBackend are required")
+	}
+	ctx, cancel := withDefaultTimeout(ctx, SnapshotTimeout)
+	defer cancel()
+	return c.do(ctx, http.MethodPut, "/snapshot/load", "/snapshot/load", s, nil)
+}
+
+// withDefaultTimeout gives ctx a timeout of d, unless it already has a deadline.
+func withDefaultTimeout(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+	if _, ok := ctx.Deadline(); ok {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, d)
 }
 
 // Information.
