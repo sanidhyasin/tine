@@ -245,7 +245,10 @@ def chart_create_cdf(sets: list[Results], out: Path):
             label = ("cold boot" if name == "cold" else f"template, {name}") if len(sets) == 1 else f"{name}, {res.label}"
             c = color(name, i) if len(sets) == 1 else SLOTS[i % len(SLOTS)]
             ax.step(v, ys, where="post", color=c, label=label)
-            label_end(ax, v[len(v) // 2], 0.5, f"p50 {fmt_ms(v[len(v) // 2])}", c)
+            # Each label on its own line, at a different height, so close
+            # lines' labels don't collide.
+            y = 0.12 + 0.16 * (i % 5)
+            label_end(ax, v[min(int(y * len(v)), len(v) - 1)], y, f"p50 {fmt_ms(v[len(v) // 2])}", c)
             i += 1
     ax.set_xscale("log")
     ms_axis(ax, "x")
@@ -285,7 +288,8 @@ def chart_restore_stages(res: Results, out: Path):
     ms_axis(ax, "x")
     ax.set_xlim(0, max(sum(m) for _, m in rows) * 1.15)
     ax.grid(axis="y", visible=False)
-    ax.legend(ncol=6, loc="upper center", bbox_to_anchor=(0.5, -0.9 / (0.9 + 0.5 * len(rows)) - 0.05), fontsize=8,
+    # Just below the axis labels, whatever the number of rows.
+    ax.legend(ncol=6, loc="upper center", bbox_to_anchor=(0.5, -0.55 / (0.9 + 0.5 * len(rows)) - 0.04), fontsize=8,
               handlelength=1.2, columnspacing=1.2, frameon=False)
     finish(fig, ax, out / "restore-stages.png", "Where a create from a template spends its time",
            "Median of each stage, by how the VM gets its memory")
@@ -510,7 +514,7 @@ def chart_idle(res: Results, out: Path):
     ax.set_ylabel("PSS per VM (MiB)")
     ax.set_ylim(bottom=0)
     if len(lines) > 1:
-        ax.legend(loc="upper right")
+        ax.legend(loc="center right")
     finish(fig, ax, out / "idle-memory.png", "What an idle VM costs the host, over time",
            f"Mean PSS of {next(iter(lines.values()))[0]} idle 256 MiB VMs, by how they were made")
 
