@@ -12,8 +12,10 @@
 #      boot. Set TINE_DATA_DEVICE to the disk to use; it must be empty or
 #      already XFS, and is never reformatted. dev-server.sh setup sets it.
 #   4. Downloads Firecracker into artifacts/bin/.
-#   5. Downloads a guest kernel and an Ubuntu disk image from Firecracker's CI,
-#      adds an SSH key to the image, and writes artifacts/rootfs.ext4.
+#   5. Downloads a guest kernel and an Ubuntu image (a squashfs) from
+#      Firecracker's CI, and keeps the squashfs for `tined image import`. Also
+#      writes artifacts/rootfs.ext4, the same Ubuntu with an SSH key, for
+#      booting a VM by hand.
 #
 # It's safe to re-run: anything already done is skipped.
 # Based on https://github.com/firecracker-microvm/firecracker/blob/main/docs/getting-started.md
@@ -144,21 +146,29 @@ else
 fi
 KERNEL="$(ls vmlinux-* | sort -V | tail -1)"
 
-if [ -f rootfs.ext4 ]; then
-  echo "Rootfs already built"
+# The pristine Ubuntu image is kept: `tined image import` builds tine's images from it.
+if ls ubuntu-*.squashfs >/dev/null 2>&1; then
+  echo "Ubuntu squashfs already downloaded"
 else
   CI_PREFIX="${CI_PREFIX:-$(ci_prefix)}"
   ubuntu_key="$(curl -fsSL "$S3?list-type=2&prefix=${CI_PREFIX}${ARCH}/ubuntu-" \
     | grep -oP "(?<=<Key>)(${CI_PREFIX}${ARCH}/ubuntu-[0-9]+\.[0-9]+\.squashfs)(?=</Key>)" \
     | sort -V | tail -1)"
   [ -n "$ubuntu_key" ] || die "Couldn't find an Ubuntu rootfs under ${CI_PREFIX}${ARCH}/"
-  basename "$ubuntu_key" .squashfs | grep -oE '[0-9]+\.[0-9]+' > rootfs.version
-  curl -fsSL -o ubuntu.squashfs "$S3/$ubuntu_key"
+  curl -fsSL -o "$(basename "$ubuntu_key").partial" "$S3/$ubuntu_key"
+  mv "$(basename "$ubuntu_key").partial" "$(basename "$ubuntu_key")"
+fi
+SQUASHFS="$(ls ubuntu-*.squashfs | sort -V | tail -1)"
+basename "$SQUASHFS" .squashfs | grep -oE '[0-9]+\.[0-9]+' > rootfs.version
 
-  # The CI image has no SSH keys, so make one and let it log in as root.
+# rootfs.ext4 is for booting by hand (docs/step-0-boot-one-vm.md): the same
+# Ubuntu, with an SSH key that can log in as root.
+if [ -f rootfs.ext4 ]; then
+  echo "Rootfs already built"
+else
   [ -f guest_key ] || ssh-keygen -q -t ed25519 -f guest_key -N "" -C tine-guest
   sudo rm -rf squashfs-root
-  unsquashfs -q ubuntu.squashfs >/dev/null
+  unsquashfs -q "$SQUASHFS" >/dev/null
   mkdir -p squashfs-root/root/.ssh
   cp guest_key.pub squashfs-root/root/.ssh/authorized_keys
 
@@ -166,7 +176,7 @@ else
   sudo chown -R root:root squashfs-root
   truncate -s "$ROOTFS_SIZE" rootfs.ext4
   sudo mkfs.ext4 -q -d squashfs-root -F rootfs.ext4
-  sudo rm -rf squashfs-root ubuntu.squashfs
+  sudo rm -rf squashfs-root
 fi
 e2fsck -fn rootfs.ext4 >/dev/null 2>&1 || die "rootfs.ext4 isn't a valid ext4 image. Delete it and re-run."
 
@@ -175,8 +185,9 @@ say "Ready"
 cat <<EOF
 Firecracker:  $ART/bin/firecracker
 Kernel:       $ART/$KERNEL
-Rootfs:       $ART/rootfs.ext4 (Ubuntu $(cat rootfs.version 2>/dev/null || echo '?'), $ROOTFS_SIZE)
+Squashfs:     $ART/$SQUASHFS (pristine, for tined image import)
+Rootfs:       $ART/rootfs.ext4 (Ubuntu $(cat rootfs.version 2>/dev/null || echo '?'), $ROOTFS_SIZE, for booting by hand)
 Guest key:    $ART/guest_key
 
-Next: docs/step-0-boot-one-vm.md
+Next: make base-image (from your Mac), or docs/step-0-boot-one-vm.md to boot a VM by hand
 EOF

@@ -51,10 +51,10 @@ test: ## Unit tests, with the race detector
 
 # Packages with tests tagged `integration`. They need Linux with KVM, and the
 # jailer needs root, so they're compiled here and run on the dev server with sudo.
-INTEGRATION_PKGS := ./internal/firecracker ./internal/storage ./internal/jailer ./internal/netns
+INTEGRATION_PKGS := ./internal/firecracker ./internal/storage ./internal/jailer ./internal/netns ./internal/image
 
 .PHONY: test-integration
-test-integration: ## Integration tests on the dev server, as root, against real Firecracker (server must be up)
+test-integration: build ## Integration tests on the dev server, as root, against real Firecracker (server must be up)
 	@rm -rf $(OUT)/tests && mkdir -p $(OUT)/tests
 	@for p in $(INTEGRATION_PKGS); do \
 		name=$$(echo $$p | sed 's|^\./||; s|/|-|g'); \
@@ -63,14 +63,21 @@ test-integration: ## Integration tests on the dev server, as root, against real 
 	done
 	./scripts/dev-server.sh sync
 	./scripts/dev-server.sh ssh 'cd ~/tine && for t in $(OUT)/tests/*.test; do echo "=== $$t"; \
-		sudo TINE_ARTIFACTS=$$HOME/tine/artifacts ./$$t -test.v -test.count=1 || exit 1; done'
+		sudo TINE_ARTIFACTS=$$HOME/tine/artifacts TINE_AGENT_BIN=$$HOME/tine/$(OUT)/tine-agent \
+		./$$t -test.v -test.count=1 || exit 1; done'
 
 .PHONY: deploy
 deploy: build ## Build, copy to the dev server, install the binaries, restart tined if it's installed
 	./scripts/dev-server.sh sync
-	./scripts/dev-server.sh ssh 'sudo install -m 0755 ~/tine/$(OUT)/* /usr/local/bin/ \
+	./scripts/dev-server.sh ssh 'cd ~/tine/$(OUT) && sudo install -m 0755 $(BINARIES) /usr/local/bin/ \
 		&& if systemctl cat tined >/dev/null 2>&1; then sudo systemctl restart tined; fi \
 		&& tine version'
+
+.PHONY: base-image
+base-image: deploy ## Build the "base" image on the dev server, with this tree's tine-agent (server must be up)
+	./scripts/dev-server.sh ssh 'cd ~/tine/artifacts && sudo tined image import base --force \
+		--kernel "$$(ls vmlinux-* | sort -V | tail -1)" --rootfs "$$(ls ubuntu-*.squashfs | sort -V | tail -1)" \
+		&& sudo tined image ls'
 
 .PHONY: clean
 clean: ## Remove build output
