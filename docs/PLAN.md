@@ -242,8 +242,9 @@ Firewall rules, all in the `inet tine` table:
 - `tined` connects to `<jail>/vsock.sock`, writes `CONNECT 1024\n`, reads back `OK <port>\n`, and then speaks HTTP over that connection.
 - Agent endpoints for step 1:
   - `GET /health`
-  - `POST /exec`: takes argv, env, cwd and a timeout. It streams NDJSON frames (`{"stream":"stdout","data":"..."}`) and ends with `{"exit_code":0}`. Output is capped, by default at 10 MB.
-- The `agentproto` package defines these types once, for both sides.
+  - `POST /exec`: takes argv, env, a working directory, stdin, a timeout and an output cap. It streams NDJSON frames (`{"stream":"stdout","data":"<base64>"}`) while the command runs, and always ends with an exit frame: `{"exit":{"code":0,"duration_ms":12.3}}`, which also reports a killing signal, a timeout or truncated output. Output is capped, by default at 10 MB.
+  - A timeout, or tined hanging up, kills the command and everything it started (its process group). A background process the command leaves running doesn't keep `exec` waiting.
+- The `agentproto` package defines these types once, for both sides, and holds the host's client, including the vsock `CONNECT` handshake.
 
 **The base image**
 
@@ -279,7 +280,7 @@ Errors come back as `{"error": {"code": "...", "message": "..."}}` with proper H
 - [x] **1.3 Firecracker client** (`internal/firecracker`): typed calls for configure, start, pause and resume over a Unix socket, with every call timed. Unit tests against a fake socket server. *Also tested against real Firecracker 1.17.0 with `make test-integration`: configuration calls take 0.1–2 ms and pause or resume about 0.25 ms (nested virtualization).*
 - [x] **1.4 Jails** (`internal/jailer`): build the jailer command, prepare the chroot (hard links and reflinks), allocate a uid per VM, and clean up. *Measured on the dev server: preparing a jail (reflinking a 2 GB disk and hard-linking the kernel) takes under 1 ms. From starting the jailer, Firecracker's API answers in about 7 ms, the VM is started at about 22 ms, and the guest kernel prints its first line at about 82 ms. The guest didn't shut down within 5 s of Ctrl+Alt+Del, so tined should stop VMs by killing them.*
 - [x] **1.5 Networking** (`internal/netns`): namespaces, tap, veth, routes, NAT and firewall rules in `inet tine`, and a slot allocator. E2e test: create 20, delete 20, nothing left behind. *Slots are allocated with `internal/idalloc`, sized by `netns.MaxSlots`. Measured on the dev server: creating a VM's network takes about 5 ms (median; slowest 17 ms) and destroying it about 16 ms. A real VM reached the internet, and was blocked from the EC2 metadata service, the host (through its gateway and on its main address) and another VM's network, each of which the host could reach.*
-- [ ] **1.6 Guest agent** (`cmd/tine-agent`): vsock HTTP server with `/health` and streaming `/exec`. Unit tests over a local socket.
+- [x] **1.6 Guest agent** (`cmd/tine-agent`): vsock HTTP server with `/health` and streaming `/exec`. Unit tests over a local socket. *The server is in `internal/agent`, and the protocol and host client in `internal/agentproto`. Tests run the real agent and client together over Unix sockets on macOS and on Linux in CI, plus the vsock handshake against a fake Firecracker socket. Real vsock inside a guest is checked in task 1.7, once the image includes the agent.*
 - [ ] **1.7 Images:** `tine image import base` produces the base image with the agent baked in.
 - [ ] **1.8 State** (`internal/state`): SQLite schema for images and VMs, with migrations.
 - [ ] **1.9 VM lifecycle** (`internal/vm`): create and destroy as a state machine (`creating → running → destroying → destroyed`, plus `failed`), with rollback when a step fails.
