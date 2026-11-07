@@ -57,8 +57,13 @@ type inventory struct {
 //
 // Then anything on the host that no live VM owns (a namespace, jail, cgroup
 // with its processes, or veth) is removed.
-func (m *Manager) Reconcile(ctx context.Context) Report {
-	var r Report
+func (m *Manager) Reconcile(ctx context.Context) (r Report) {
+	defer func() {
+		m.cfg.Metrics.Reconciled("kept", len(r.Kept))
+		m.cfg.Metrics.Reconciled("finished", len(r.Finished))
+		m.cfg.Metrics.Reconciled("cleaned", len(r.Cleaned))
+		m.cfg.Metrics.Reconciled("orphan", len(r.Orphans))
+	}()
 	errorf := func(format string, args ...any) { r.Errors = append(r.Errors, fmt.Sprintf(format, args...)) }
 
 	live, err := m.store.ListVMs(ctx, state.ListOptions{})
@@ -183,6 +188,7 @@ func (m *Manager) reapOnce(ctx context.Context, now time.Time) int {
 		m.log.Info("reaper: destroyed an expired VM", "vm", vm.ID, "expired_at", vm.ExpiresAt)
 		n++
 	}
+	m.cfg.Metrics.Reaped(n)
 	return n
 }
 

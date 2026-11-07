@@ -37,6 +37,8 @@ import (
 	"github.com/sanidhyasin/tine/internal/idalloc"
 	"github.com/sanidhyasin/tine/internal/image"
 	"github.com/sanidhyasin/tine/internal/jailer"
+	"github.com/sanidhyasin/tine/internal/logging"
+	"github.com/sanidhyasin/tine/internal/metrics"
 	"github.com/sanidhyasin/tine/internal/netns"
 	"github.com/sanidhyasin/tine/internal/state"
 )
@@ -95,6 +97,9 @@ type Config struct {
 	ReaperInterval time.Duration
 	// DestroyedRetention is how long destroyed VMs' records are kept.
 	DestroyedRetention time.Duration
+
+	// Metrics, if set, records how operations went. Nil records nothing.
+	Metrics *metrics.Metrics
 
 	Log *slog.Logger
 }
@@ -318,6 +323,7 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (state.VM, erro
 		m.slots.Release(slot)
 		return state.VM{}, err
 	}
+	ctx = logging.WithVM(ctx, vm.ID)
 	log := m.log.With("vm", vm.ID)
 	t.mark("allocate")
 
@@ -340,7 +346,8 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (state.VM, erro
 		if ctx.Err() != nil && !errors.Is(cause, context.Canceled) {
 			cause = fmt.Errorf("%w (cancelled: %w)", cause, ctx.Err())
 		}
-		log.Warn("create failed; undoing", "stage", stage, "err", cause)
+		log.WarnContext(ctx, "create failed; undoing", "stage", stage, "err", cause)
+		m.cfg.Metrics.CreateFailed(stage)
 		failed, _ := m.store.Transition(context.Background(), vm.ID, state.StateFailed, stage+": "+cause.Error())
 		var cleanupErrs []error
 		for i := len(undo) - 1; i >= 0; i-- {
@@ -350,7 +357,7 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (state.VM, erro
 		}
 		createErr := fmt.Errorf("create VM %s: %s: %w", vm.ID, stage, cause)
 		if err := errors.Join(cleanupErrs...); err != nil {
-			log.Error("cleanup after a failed create failed too; the VM stays failed", "err", err)
+			log.ErrorContext(ctx, "cleanup after a failed create failed too; the VM stays failed", "err", err)
 			return failed, errors.Join(createErr, fmt.Errorf("cleanup: %w", err))
 		}
 		if _, err := m.store.Transition(context.Background(), vm.ID, state.StateDestroying, "cleaning up after a failed create"); err == nil {
@@ -409,7 +416,8 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (state.VM, erro
 	if err != nil {
 		return fail("record", err)
 	}
-	log.Info("created", "timings_ms", vm.Timings)
+	log.InfoContext(ctx, "created", "timings_ms", vm.Timings)
+	m.cfg.Metrics.CreateSucceeded(vm.Timings)
 	return vm, nil
 }
 
@@ -422,6 +430,7 @@ func (m *Manager) Destroy(ctx context.Context, id string) (state.VM, error) {
 
 // destroy is Destroy, recording reason as why it happened.
 func (m *Manager) destroy(ctx context.Context, id, reason string) (state.VM, error) {
+	ctx = logging.WithVM(ctx, id)
 	m.mu.Lock()
 	op := m.ops[id]
 	m.mu.Unlock()
@@ -451,6 +460,8 @@ func (m *Manager) destroy(ctx context.Context, id, reason string) (state.VM, err
 		}
 	}
 	if err := m.teardown(ctx, vm); err != nil {
+		m.cfg.Metrics.Destroyed(time.Since(start), err)
+		m.log.ErrorContext(ctx, "destroy failed; the VM is marked failed", "vm", id, "err", err)
 		failed, _ := m.store.Transition(context.Background(), id, state.StateFailed, "destroy: "+err.Error())
 		return failed, fmt.Errorf("destroy VM %s: %w", id, err)
 	}
@@ -463,8 +474,9 @@ func (m *Manager) destroy(ctx context.Context, id, reason string) (state.VM, err
 		v.Timings["destroy"] = ms(time.Since(start))
 		return nil
 	})
+	m.cfg.Metrics.Destroyed(time.Since(start), err)
 	if err == nil {
-		m.log.Info("destroyed", "vm", id, "ms", vm.Timings["destroy"])
+		m.log.InfoContext(ctx, "destroyed", "vm", id, "reason", reason, "ms", vm.Timings["destroy"])
 	}
 	return vm, err
 }
@@ -521,7 +533,10 @@ func (m *Manager) Exec(ctx context.Context, id string, req agentproto.ExecReques
 	if err != nil {
 		return agentproto.ExitStatus{}, err
 	}
-	return m.host.agent(j).Exec(ctx, req, onOutput)
+	start := time.Now()
+	st, err := m.host.agent(j).Exec(logging.WithVM(ctx, id), req, onOutput)
+	m.cfg.Metrics.Exec(time.Since(start), err)
+	return st, err
 }
 
 // Images lists the installed images.

@@ -10,7 +10,8 @@ RequiresMountsFor=/srv/tine
 [Service]
 # tined tells systemd when it's ready to serve.
 Type=notify
-ExecStart=/usr/local/bin/tined serve
+# Metrics are on the API socket; this also serves them on localhost for Prometheus.
+ExecStart=/usr/local/bin/tined serve --metrics-listen 127.0.0.1:9101
 Restart=on-failure
 RestartSec=2s
 # Let in-flight requests finish (tined allows them 30s).

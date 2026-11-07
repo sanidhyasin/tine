@@ -18,6 +18,8 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/sanidhyasin/tine/internal/api"
+	"github.com/sanidhyasin/tine/internal/logging"
+	"github.com/sanidhyasin/tine/internal/metrics"
 	"github.com/sanidhyasin/tine/internal/state"
 	"github.com/sanidhyasin/tine/internal/version"
 	"github.com/sanidhyasin/tine/internal/vm"
@@ -27,11 +29,12 @@ import (
 const shutdownGrace = 30 * time.Second
 
 type serveOptions struct {
-	socket      string
-	socketGroup string
-	dbPath      string
-	logLevel    string
-	vm          vm.Config
+	socket        string
+	socketGroup   string
+	metricsListen string
+	dbPath        string
+	logLevel      string
+	vm            vm.Config
 }
 
 func newServeCmd() *cobra.Command {
@@ -50,6 +53,7 @@ its own cgroup, outside tined's.`,
 	f := cmd.Flags()
 	f.StringVar(&opts.socket, "socket", api.DefaultSocket, "Unix socket to serve the API on")
 	f.StringVar(&opts.socketGroup, "socket-group", "tine", "group allowed to use the socket (if it exists); everyone else is refused")
+	f.StringVar(&opts.metricsListen, "metrics-listen", "", `also serve /metrics over TCP for Prometheus, e.g. "127.0.0.1:9101" (always on the socket)`)
 	f.StringVar(&opts.dbPath, "db", state.DefaultPath, "state database")
 	f.StringVar(&opts.logLevel, "log-level", "info", "debug, info, warn or error")
 	f.StringVar(&opts.vm.ImagesDir, "images-dir", opts.vm.ImagesDir, "where images are stored")
@@ -83,7 +87,17 @@ func serve(ctx context.Context, opts serveOptions) error {
 	}
 	defer func() { _ = store.Close() }()
 
+	met := metrics.New(version.Version)
+	met.WatchVMStates([]string{"creating", "running", "destroying", "failed"}, func() (map[string]int, error) {
+		live, err := store.ListVMs(context.Background(), state.ListOptions{})
+		counts := map[string]int{}
+		for _, v := range live {
+			counts[string(v.State)]++
+		}
+		return counts, err
+	})
 	opts.vm.Log = log
+	opts.vm.Metrics = met
 	manager, err := vm.New(opts.vm, store)
 	if err != nil {
 		return err
@@ -104,12 +118,27 @@ func serve(ctx context.Context, opts serveOptions) error {
 		return err
 	}
 	srv := &http.Server{
-		Handler:           api.NewServer(manager, version.Version, log),
+		Handler:           api.NewServer(manager, version.Version, log, api.WithMetrics(met)),
 		ReadHeaderTimeout: 10 * time.Second,
 		ErrorLog:          slog.NewLogLogger(log.Handler(), slog.LevelWarn),
 	}
-	errc := make(chan error, 1)
+	errc := make(chan error, 2)
 	go func() { errc <- srv.Serve(ln) }()
+
+	// Prometheus can't scrape a Unix socket, so it can have a TCP port too.
+	var metricsSrv *http.Server
+	if opts.metricsListen != "" {
+		var lc net.ListenConfig
+		mln, err := lc.Listen(ctx, "tcp", opts.metricsListen)
+		if err != nil {
+			return fmt.Errorf("--metrics-listen: %w", err)
+		}
+		mux := http.NewServeMux()
+		mux.Handle("GET /metrics", met.Handler())
+		metricsSrv = &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+		go func() { errc <- metricsSrv.Serve(mln) }()
+		log.Info("serving metrics over TCP", "addr", mln.Addr().String())
+	}
 
 	log.Info("tined ready", "version", version.String(), "socket", opts.socket, "db", opts.dbPath)
 	notifySystemd("READY=1\nSTATUS=serving on " + opts.socket)
@@ -125,6 +154,9 @@ func serve(ctx context.Context, opts serveOptions) error {
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Warn("some requests didn't finish in time", "err", err)
+	}
+	if metricsSrv != nil {
+		_ = metricsSrv.Shutdown(shutdownCtx)
 	}
 	log.Info("stopped")
 	return nil
@@ -167,8 +199,9 @@ func newLogger(level string) (*slog.Logger, error) {
 	if err := l.UnmarshalText([]byte(level)); err != nil {
 		return nil, fmt.Errorf("--log-level %q: %w", level, err)
 	}
-	// JSON on stderr: under systemd it goes to the journal.
-	return slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: l})), nil
+	// JSON on stderr: under systemd it goes to the journal. Lines also get
+	// the request and VM IDs that their context carries.
+	return slog.New(logging.NewHandler(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: l}))), nil
 }
 
 // notifySystemd tells systemd about tined's state (sd_notify), when it runs

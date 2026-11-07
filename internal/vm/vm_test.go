@@ -5,9 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -17,6 +20,7 @@ import (
 	"github.com/sanidhyasin/tine/internal/agentproto"
 	"github.com/sanidhyasin/tine/internal/image"
 	"github.com/sanidhyasin/tine/internal/jailer"
+	"github.com/sanidhyasin/tine/internal/metrics"
 	"github.com/sanidhyasin/tine/internal/netns"
 	"github.com/sanidhyasin/tine/internal/state"
 )
@@ -549,4 +553,47 @@ func TestDestroyKeepsTheNetworkIfTheJailCantBeCleaned(t *testing.T) {
 	if got, want := strings.Join(f.host.takeCalls(), ","), "kill,cleanupJail"; got != want {
 		t.Errorf("host calls:\n got %s\nwant %s", got, want)
 	}
+}
+
+func TestMetricsRecordCreatesFailuresAndDestroys(t *testing.T) {
+	m := metrics.New("v")
+	f := newFixture(t, func(c *Config) { c.Metrics = m })
+	ctx := context.Background()
+	vm, err := f.m.Create(ctx, CreateRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.m.Destroy(ctx, vm.ID); err != nil {
+		t.Fatal(err)
+	}
+	f.host.fail("waitAgent", errors.New("boom"))
+	_, _ = f.m.Create(ctx, CreateRequest{})
+
+	for series, want := range map[string]float64{
+		`tine_vm_creates_total{result="ok"}`:           1,
+		`tine_vm_creates_total{result="failed"}`:       1,
+		`tine_vm_create_failures_total{stage="agent"}`: 1,
+		`tine_vm_destroys_total{result="ok"}`:          1,
+	} {
+		if got := counterValue(t, m, series); got != want {
+			t.Errorf("%s = %v, want %v", series, got, want)
+		}
+	}
+}
+
+// counterValue reads one series from the metrics' text exposition.
+func counterValue(t *testing.T, m *metrics.Metrics, series string) float64 {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	m.Handler().ServeHTTP(rec, httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/metrics", nil))
+	for _, line := range strings.Split(rec.Body.String(), "\n") {
+		if v, ok := strings.CutPrefix(line, series+" "); ok {
+			f, err := strconv.ParseFloat(v, 64)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return f
+		}
+	}
+	return 0
 }

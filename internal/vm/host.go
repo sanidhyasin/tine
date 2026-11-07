@@ -114,7 +114,9 @@ func (h *hostOS) startFirecracker(j *jailer.Jail) (process, error) {
 }
 
 func (h *hostOS) configureAndBoot(ctx context.Context, j *jailer.Jail, boot bootSpec) error {
-	c := firecracker.New(j.APISocket())
+	c := firecracker.New(j.APISocket(), firecracker.WithObserver(func(ci firecracker.CallInfo) {
+		h.cfg.Metrics.FirecrackerCall(ci.Endpoint, ci.Duration, ci.Err)
+	}))
 	readyCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	if err := c.WaitReady(readyCtx, 2*time.Millisecond); err != nil {

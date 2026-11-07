@@ -1,9 +1,12 @@
 package api
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -15,6 +18,8 @@ import (
 
 	"github.com/sanidhyasin/tine/internal/agentproto"
 	"github.com/sanidhyasin/tine/internal/image"
+	"github.com/sanidhyasin/tine/internal/logging"
+	"github.com/sanidhyasin/tine/internal/metrics"
 	"github.com/sanidhyasin/tine/internal/state"
 	"github.com/sanidhyasin/tine/internal/vm"
 )
@@ -27,6 +32,8 @@ type fakeBackend struct {
 	err     error // returned by every call, when set
 	lastReq vm.CreateRequest
 	panicOn string
+	// lastAttrs are the log attributes the context of the last Get carried.
+	lastAttrs []slog.Attr
 }
 
 func newFakeBackend() *fakeBackend { return &fakeBackend{vms: map[string]state.VM{}} }
@@ -48,9 +55,10 @@ func (f *fakeBackend) Create(_ context.Context, req vm.CreateRequest) (state.VM,
 	return v, nil
 }
 
-func (f *fakeBackend) Get(_ context.Context, id string) (state.VM, error) {
+func (f *fakeBackend) Get(ctx context.Context, id string) (state.VM, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.lastAttrs = logging.Attrs(ctx)
 	v, ok := f.vms[id]
 	if !ok {
 		return state.VM{}, fmt.Errorf("VM %s: %w", id, vm.ErrNotFound)
@@ -112,7 +120,11 @@ func (f *fakeBackend) Images(context.Context) ([]*image.Image, error) {
 func (f *fakeBackend) Ping(context.Context) error { return nil }
 
 // serve runs the API on a Unix socket for the test and returns a client.
-func serve(t *testing.T, b Backend) (*Client, string) {
+func serve(t *testing.T, b Backend, opts ...Option) (*Client, string) {
+	return serveWithLog(t, b, nil, opts...)
+}
+
+func serveWithLog(t *testing.T, b Backend, log *slog.Logger, opts ...Option) (*Client, string) {
 	t.Helper()
 	dir, err := os.MkdirTemp("", "api") // short: socket paths are limited to about 100 bytes
 	if err != nil {
@@ -125,7 +137,7 @@ func serve(t *testing.T, b Backend) (*Client, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := &http.Server{Handler: NewServer(b, "v-test", nil), ReadHeaderTimeout: 5 * time.Second}
+	srv := &http.Server{Handler: NewServer(b, "v-test", log, opts...), ReadHeaderTimeout: 5 * time.Second}
 	go func() { _ = srv.Serve(ln) }()
 	t.Cleanup(func() { _ = srv.Close() })
 	return NewUnixClient(sock), sock
@@ -348,4 +360,95 @@ func rawBody(t *testing.T, sock, method, path, body string) string {
 		}
 	}
 	return sb.String()
+}
+
+func TestMetricsEndpointAndRequestMetrics(t *testing.T) {
+	m := metrics.New("v-test")
+	c, sock := serve(t, newFakeBackend(), WithMetrics(m))
+	ctx := context.Background()
+	v, _ := c.CreateVM(ctx, CreateVMRequest{})
+	_, _ = c.GetVM(ctx, v.ID)
+	_, _ = c.GetVM(ctx, "vm-nope")
+
+	body := rawBody(t, sock, http.MethodGet, "/metrics", "")
+	for _, want := range []string{
+		`tine_api_requests_total{code="201",method="POST",route="/v1/vms"} 1`,
+		// One series for every VM ID: the route pattern, not the path.
+		`tine_api_requests_total{code="200",method="GET",route="/v1/vms/{id}"} 1`,
+		`tine_api_requests_total{code="404",method="GET",route="/v1/vms/{id}"} 1`,
+		`tine_build_info{version="v-test"} 1`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("/metrics lacks %q", want)
+		}
+	}
+	if strings.Contains(body, v.ID) {
+		t.Error("a VM ID leaked into a metric label")
+	}
+}
+
+func TestNoMetricsEndpointWithoutMetrics(t *testing.T) {
+	_, sock := serve(t, newFakeBackend())
+	if status, _, _ := rawStatus(t, sock, http.MethodGet, "/metrics", ""); status != http.StatusNotFound {
+		t.Errorf("/metrics without metrics = %d, want 404", status)
+	}
+}
+
+func TestRequestIDs(t *testing.T) {
+	_, sock := serve(t, newFakeBackend())
+	get := func(id string) string {
+		req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://tined/healthz", nil)
+		if id != "" {
+			req.Header.Set(RequestIDHeader, id)
+		}
+		resp, err := rawClient(sock).Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		return resp.Header.Get(RequestIDHeader)
+	}
+	if got := get(""); len(got) != 12 {
+		t.Errorf("generated request ID %q, want 12 hex characters", got)
+	}
+	if got := get("trace-123_ab"); got != "trace-123_ab" {
+		t.Errorf("caller's request ID came back as %q", got)
+	}
+	if got := get("evil\"id"); got == "evil\"id" || len(got) != 12 {
+		t.Errorf("a request ID with odd characters was kept: %q", got)
+	}
+}
+
+// Every log line for a request carries its request ID, and lines about one
+// VM carry its ID, including lines written deep inside the backend.
+func TestRequestAndVMIDsReachTheBackendAndTheLog(t *testing.T) {
+	var buf bytes.Buffer
+	log := slog.New(logging.NewHandler(slog.NewJSONHandler(&buf, nil)))
+	b := newFakeBackend()
+	c, sock := serveWithLog(t, b, log)
+	v, _ := c.CreateVM(context.Background(), CreateVMRequest{})
+	buf.Reset()
+
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://tined/v1/vms/"+v.ID, nil)
+	req.Header.Set(RequestIDHeader, "req-42")
+	resp, err := rawClient(sock).Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+
+	got := map[string]string{}
+	for _, a := range b.lastAttrs {
+		got[a.Key] = a.Value.String()
+	}
+	if got["request_id"] != "req-42" || got["vm"] != v.ID {
+		t.Errorf("the backend's context carried %v; want request_id and vm", got)
+	}
+	var line map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &line); err != nil {
+		t.Fatalf("request log isn't one JSON line: %q", buf.String())
+	}
+	if line["request_id"] != "req-42" || line["vm"] != v.ID || line["route"] != "/v1/vms/{id}" || line["status"] != float64(200) {
+		t.Errorf("request log line = %v", line)
+	}
 }

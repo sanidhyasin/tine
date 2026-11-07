@@ -15,6 +15,8 @@ import (
 
 	"github.com/sanidhyasin/tine/internal/agentproto"
 	"github.com/sanidhyasin/tine/internal/image"
+	"github.com/sanidhyasin/tine/internal/logging"
+	"github.com/sanidhyasin/tine/internal/metrics"
 	"github.com/sanidhyasin/tine/internal/state"
 	"github.com/sanidhyasin/tine/internal/vm"
 )
@@ -41,16 +43,33 @@ type Server struct {
 	backend Backend
 	version string
 	log     *slog.Logger
+	metrics *metrics.Metrics
 	started time.Time
 	mux     *http.ServeMux
 }
 
+// Option configures a Server.
+type Option func(*Server)
+
+// WithMetrics serves GET /metrics and records every request in m.
+func WithMetrics(m *metrics.Metrics) Option { return func(s *Server) { s.metrics = m } }
+
+// RequestIDHeader carries a request's ID: tined answers with it, and uses
+// the caller's if one is sent.
+const RequestIDHeader = "X-Request-Id"
+
 // NewServer returns the API handler for backend.
-func NewServer(backend Backend, version string, log *slog.Logger) *Server {
+func NewServer(backend Backend, version string, log *slog.Logger, opts ...Option) *Server {
 	if log == nil {
 		log = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 	s := &Server{backend: backend, version: version, log: log, started: time.Now(), mux: http.NewServeMux()}
+	for _, opt := range opts {
+		opt(s)
+	}
+	if s.metrics != nil {
+		s.mux.Handle("GET /metrics", s.metrics.Handler())
+	}
 	// Methods are checked in the handlers, so wrong ones get a JSON error too.
 	s.mux.HandleFunc("/healthz", s.health)
 	s.mux.HandleFunc("/v1/images", s.images)
@@ -63,21 +82,56 @@ func NewServer(backend Backend, version string, log *slog.Logger) *Server {
 	return s
 }
 
-// ServeHTTP logs every request and turns panics into 500s.
+// ServeHTTP gives every request an ID, logs it, records it in the metrics,
+// and turns panics into 500s.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
+	id := r.Header.Get(RequestIDHeader)
+	if !validRequestID(id) {
+		id = logging.NewRequestID()
+	}
+	w.Header().Set(RequestIDHeader, id)
+	r = r.WithContext(logging.With(r.Context(), slog.String("request_id", id)))
+
 	rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 	defer func() {
 		if p := recover(); p != nil {
-			s.log.Error("handler panicked", "method", r.Method, "path", r.URL.Path, "panic", p, "stack", string(debug.Stack()))
+			s.log.ErrorContext(r.Context(), "handler panicked", "method", r.Method, "path", r.URL.Path, "panic", p, "stack", string(debug.Stack()))
 			if !rec.wrote {
 				writeError(rec, http.StatusInternalServerError, CodeInternal, "internal error")
 			}
 		}
-		s.log.Info("request", "method", r.Method, "path", r.URL.Path, "status", rec.status,
-			"ms", float64(time.Since(start).Microseconds())/1000)
+		// The mux records the matched pattern on r, e.g. "/v1/vms/{id}": a
+		// metric label that doesn't grow with every VM ID.
+		route := r.Pattern
+		if route == "" || route == "/" {
+			route = "other"
+		}
+		took := time.Since(start)
+		s.metrics.APIRequest(r.Method, route, rec.status, took)
+		attrs := []any{"method", r.Method, "path", r.URL.Path, "route", route, "status", rec.status,
+			"ms", float64(took.Microseconds()) / 1000}
+		if vm := r.PathValue("id"); vm != "" {
+			attrs = append(attrs, "vm", vm)
+		}
+		s.log.InfoContext(r.Context(), "request", attrs...)
 	}()
 	s.mux.ServeHTTP(rec, r)
+}
+
+// validRequestID accepts short, plain IDs from callers, so they can't
+// inject anything into the logs.
+func validRequestID(id string) bool {
+	if id == "" || len(id) > 64 {
+		return false
+	}
+	for _, c := range id {
+		ok := c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '_'
+		if !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
@@ -90,7 +144,7 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	}
 	vms, err := s.backend.List(r.Context(), false)
 	if err != nil {
-		s.fail(w, err)
+		s.fail(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, Health{Status: "ok", Version: s.version, VMs: len(vms), UptimeSeconds: time.Since(s.started).Seconds()})
@@ -102,7 +156,7 @@ func (s *Server) images(w http.ResponseWriter, r *http.Request) {
 	}
 	imgs, err := s.backend.Images(r.Context())
 	if err != nil {
-		s.fail(w, err)
+		s.fail(w, r, err)
 		return
 	}
 	out := ListImagesResponse{Images: []Image{}}
@@ -120,7 +174,7 @@ func (s *Server) vms(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		list, err := s.backend.List(r.Context(), r.URL.Query().Get("all") == "true")
 		if err != nil {
-			s.fail(w, err)
+			s.fail(w, r, err)
 			return
 		}
 		out := ListVMsResponse{VMs: []VM{}}
@@ -141,7 +195,7 @@ func (s *Server) vms(w http.ResponseWriter, r *http.Request) {
 			Image: req.Image, VCPUs: req.VCPUs, MemoryMiB: req.MemoryMiB, TTL: time.Duration(req.TTLSeconds) * time.Second,
 		})
 		if err != nil {
-			s.fail(w, err)
+			s.fail(w, r, err)
 			return
 		}
 		writeJSON(w, http.StatusCreated, toAPI(created))
@@ -152,6 +206,7 @@ func (s *Server) vms(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) oneVM(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	r = r.WithContext(logging.WithVM(r.Context(), id))
 	var (
 		v   state.VM
 		err error
@@ -166,7 +221,7 @@ func (s *Server) oneVM(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		s.fail(w, err)
+		s.fail(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, toAPI(v))
@@ -181,24 +236,25 @@ func (s *Server) exec(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out := &frameWriter{w: w}
-	st, err := s.backend.Exec(r.Context(), r.PathValue("id"), req, func(stream string, data []byte) {
+	ctx := logging.WithVM(r.Context(), r.PathValue("id"))
+	st, err := s.backend.Exec(ctx, r.PathValue("id"), req, func(stream string, data []byte) {
 		out.write(Frame{Stream: stream, Data: data})
 	})
 	if err != nil {
 		if !out.started() {
-			s.fail(w, err)
+			s.fail(w, r, err)
 			return
 		}
 		// The stream has begun, so an HTTP error is no longer possible. Ending
 		// it without an exit frame tells the client it was cut short.
-		s.log.Warn("exec stream broke", "vm", r.PathValue("id"), "err", err)
+		s.log.WarnContext(ctx, "exec stream broke", "err", err)
 		return
 	}
 	out.write(Frame{Exit: &st})
 }
 
 // fail answers with the error's status and code.
-func (s *Server) fail(w http.ResponseWriter, err error) {
+func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
 	status, code := http.StatusInternalServerError, CodeInternal
 	var agentErr *agentproto.Error
 	switch {
@@ -218,7 +274,7 @@ func (s *Server) fail(w http.ResponseWriter, err error) {
 		status, code = http.StatusConflict, CodeConflict
 	}
 	if status >= 500 {
-		s.log.Error("request failed", "err", err)
+		s.log.ErrorContext(r.Context(), "request failed", "err", err)
 	}
 	writeError(w, status, code, err.Error())
 }
