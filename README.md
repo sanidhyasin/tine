@@ -31,6 +31,12 @@ Copy the repo over and prepare the server. It's safe to re-run.
 ./scripts/dev-server.sh setup
 ```
 
+Build tine, install it on the server, and build the `base` image VMs boot from (Ubuntu with `tine-agent` inside):
+
+```bash
+make base-image
+```
+
 Then log in:
 
 ```bash

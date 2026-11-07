@@ -248,11 +248,12 @@ Firewall rules, all in the `inet tine` table:
 
 **The base image**
 
-`tine image import base` builds it:
+`tined image import base` builds it. It's an admin command of `tined` rather than `tine`, because it needs root and host paths, and `tine` only ever talks to tined's API. `make base-image` runs it on the dev server.
 
-- It starts from Firecracker's CI Ubuntu rootfs, as `host-setup.sh` does today.
-- It adds `tine-agent`, its systemd unit, and a static `/etc/resolv.conf`.
-- It removes the SSH server, because we don't need it anymore.
+- It starts from Firecracker's CI Ubuntu squashfs, which `host-setup.sh` keeps, unpacks it into a directory, and packs the result with `mkfs.ext4 -d`. Nothing is mounted.
+- It adds `tine-agent` with a systemd unit that starts early and never stops restarting, a static `/etc/resolv.conf`, and stamps that stop every boot from rerunning `ldconfig`.
+- It masks the SSH server, the resolver service and background apt updates.
+- It never writes through a symlink in the unpacked image, which could point at the host's own files.
 
 **API v1**, served over `/run/tine/tine.sock`
 
@@ -281,7 +282,7 @@ Errors come back as `{"error": {"code": "...", "message": "..."}}` with proper H
 - [x] **1.4 Jails** (`internal/jailer`): build the jailer command, prepare the chroot (hard links and reflinks), allocate a uid per VM, and clean up. *Measured on the dev server: preparing a jail (reflinking a 2 GB disk and hard-linking the kernel) takes under 1 ms. From starting the jailer, Firecracker's API answers in about 7 ms, the VM is started at about 22 ms, and the guest kernel prints its first line at about 82 ms. The guest didn't shut down within 5 s of Ctrl+Alt+Del, so tined should stop VMs by killing them.*
 - [x] **1.5 Networking** (`internal/netns`): namespaces, tap, veth, routes, NAT and firewall rules in `inet tine`, and a slot allocator. E2e test: create 20, delete 20, nothing left behind. *Slots are allocated with `internal/idalloc`, sized by `netns.MaxSlots`. Measured on the dev server: creating a VM's network takes about 5 ms (median; slowest 17 ms) and destroying it about 16 ms. A real VM reached the internet, and was blocked from the EC2 metadata service, the host (through its gateway and on its main address) and another VM's network, each of which the host could reach.*
 - [x] **1.6 Guest agent** (`cmd/tine-agent`): vsock HTTP server with `/health` and streaming `/exec`. Unit tests over a local socket. *The server is in `internal/agent`, and the protocol and host client in `internal/agentproto`. Tests run the real agent and client together over Unix sockets on macOS and on Linux in CI, plus the vsock handshake against a fake Firecracker socket. Real vsock inside a guest is checked in task 1.7, once the image includes the agent.*
-- [ ] **1.7 Images:** `tine image import base` produces the base image with the agent baked in.
+- [x] **1.7 Images:** `tined image import base` produces the base image with the agent baked in. *Measured on the dev server: an import takes about 2 s for a 4 GiB disk. A VM booted from it answers over real vsock 2.2 s after starting, and running `true` takes 2–3 ms end to end. Of the boot, the guest kernel takes about 1.1 s and userspace 0.9 s, and the agent starts 1.7 s in. Leads for task 1.9 and step 4: Firecracker's usual fast-boot kernel arguments, and mounting the root disk read-write from the start. Templates (step 2) skip booting entirely.*
 - [ ] **1.8 State** (`internal/state`): SQLite schema for images and VMs, with migrations.
 - [ ] **1.9 VM lifecycle** (`internal/vm`): create and destroy as a state machine (`creating → running → destroying → destroyed`, plus `failed`), with rollback when a step fails.
 - [ ] **1.10 The service** (`cmd/tined`): API server, config flags, systemd unit in `deploy/`, and `/healthz`.
