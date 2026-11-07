@@ -36,6 +36,9 @@ type Backend interface {
 	Destroy(ctx context.Context, id string) (state.VM, error)
 	Exec(ctx context.Context, id string, req agentproto.ExecRequest, onOutput func(stream string, data []byte)) (agentproto.ExitStatus, error)
 	Snapshot(ctx context.Context, id string) (state.Snapshot, error)
+	Snapshots(ctx context.Context, f state.SnapshotFilter) ([]vm.SnapshotInfo, error)
+	GetSnapshot(ctx context.Context, id string) (vm.SnapshotInfo, error)
+	DeleteSnapshot(ctx context.Context, id string) (state.Snapshot, error)
 	Rollback(ctx context.Context, id, snapshotID string) (state.VM, error)
 	Images(ctx context.Context) ([]*image.Image, error)
 	Templates(ctx context.Context) ([]vm.Template, error)
@@ -84,6 +87,8 @@ func NewServer(backend Backend, version string, log *slog.Logger, opts ...Option
 	s.mux.HandleFunc("/v1/vms/{id}/exec", s.exec)
 	s.mux.HandleFunc("/v1/vms/{id}/snapshots", s.vmSnapshots)
 	s.mux.HandleFunc("/v1/vms/{id}/rollback", s.rollback)
+	s.mux.HandleFunc("/v1/snapshots", s.snapshots)
+	s.mux.HandleFunc("/v1/snapshots/{id}", s.oneSnapshot)
 	s.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, CodeNotFound, "no such endpoint: "+r.Method+" "+r.URL.Path)
 	})
@@ -290,16 +295,63 @@ func (s *Server) exec(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) vmSnapshots(w http.ResponseWriter, r *http.Request) {
-	if !allow(w, r, http.MethodPost) {
+	ctx := logging.WithVM(r.Context(), r.PathValue("id"))
+	switch r.Method {
+	case http.MethodPost:
+		snap, err := s.backend.Snapshot(ctx, r.PathValue("id"))
+		if err != nil {
+			s.fail(w, r, err)
+			return
+		}
+		writeJSON(w, http.StatusCreated, toAPISnapshot(snap, nil))
+	case http.MethodGet:
+		s.listSnapshots(w, r.WithContext(ctx), state.SnapshotFilter{VMID: r.PathValue("id")})
+	default:
+		methodNotAllowed(w, r, http.MethodGet, http.MethodPost)
+	}
+}
+
+func (s *Server) snapshots(w http.ResponseWriter, r *http.Request) {
+	if !allow(w, r, http.MethodGet) {
 		return
 	}
-	ctx := logging.WithVM(r.Context(), r.PathValue("id"))
-	snap, err := s.backend.Snapshot(ctx, r.PathValue("id"))
+	q := r.URL.Query()
+	s.listSnapshots(w, r, state.SnapshotFilter{VMID: q.Get("vm"), Kind: state.SnapshotKind(q.Get("kind")), Image: q.Get("image")})
+}
+
+func (s *Server) listSnapshots(w http.ResponseWriter, r *http.Request, f state.SnapshotFilter) {
+	list, err := s.backend.Snapshots(r.Context(), f)
 	if err != nil {
 		s.fail(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, toAPISnapshot(snap, nil))
+	out := ListSnapshotsResponse{Snapshots: []Snapshot{}}
+	for _, info := range list {
+		out.Snapshots = append(out.Snapshots, toAPISnapshot(info.Snapshot, info.UsedBy))
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) oneSnapshot(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	switch r.Method {
+	case http.MethodGet:
+		info, err := s.backend.GetSnapshot(r.Context(), id)
+		if err != nil {
+			s.fail(w, r, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, toAPISnapshot(info.Snapshot, info.UsedBy))
+	case http.MethodDelete:
+		snap, err := s.backend.DeleteSnapshot(r.Context(), id)
+		if err != nil {
+			s.fail(w, r, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, toAPISnapshot(snap, nil))
+	default:
+		methodNotAllowed(w, r, http.MethodGet, http.MethodDelete)
+	}
 }
 
 func (s *Server) rollback(w http.ResponseWriter, r *http.Request) {

@@ -223,9 +223,11 @@ func (s *Store) LatestTemplate(ctx context.Context, image string, vcpus, memoryM
 // first: ready snapshots that no live VM runs from and that are either
 //
 //   - a VM's snapshot, whose VM is destroyed or gone, or
-//   - a template that a newer one has replaced, or whose image is gone.
+//   - a template that a newer one has replaced.
 //
 // It also returns snapshots stuck in SnapshotDeleting, to finish them.
+// (Templates whose image is gone are the caller's to find: images live on
+// disk, and the images table only knows those registered at startup.)
 func (s *Store) GarbageSnapshots(ctx context.Context) ([]Snapshot, error) {
 	return querySnapshots(ctx, s.db, "SELECT "+snapshotColumns+` FROM snapshots s
 		WHERE s.state = 'deleting'
@@ -234,11 +236,10 @@ func (s *Store) GarbageSnapshots(ctx context.Context) ([]Snapshot, error) {
 		       AND ((s.kind = 'vm'
 		             AND NOT EXISTS (SELECT 1 FROM vms v WHERE v.id = s.vm_id AND v.state != 'destroyed'))
 		         OR (s.kind = 'template'
-		             AND (NOT EXISTS (SELECT 1 FROM images i WHERE i.name = s.image)
-		               OR EXISTS (SELECT 1 FROM snapshots n
-		                          WHERE n.kind = 'template' AND n.state = 'ready' AND n.image = s.image
-		                            AND n.vcpus = s.vcpus AND n.memory_mib = s.memory_mib
-		                            AND (n.created_at > s.created_at OR (n.created_at = s.created_at AND n.id > s.id)))))))
+		             AND EXISTS (SELECT 1 FROM snapshots n
+		                         WHERE n.kind = 'template' AND n.state = 'ready' AND n.image = s.image
+		                           AND n.vcpus = s.vcpus AND n.memory_mib = s.memory_mib
+		                           AND (n.created_at > s.created_at OR (n.created_at = s.created_at AND n.id > s.id))))))
 		ORDER BY s.created_at, s.id`)
 }
 

@@ -234,7 +234,7 @@ func TestGarbageSnapshots(t *testing.T) {
 	c.advance(time.Minute)
 	mustSnapshot(t, s, template("snap-new", "base", 1024), true)     // the current one: kept
 	mustSnapshot(t, s, template("snap-other", "base", 512), true)    // the current one for its size: kept
-	mustSnapshot(t, s, template("snap-orphan", "gone", 1024), true)  // its image is gone: garbage
+	mustSnapshot(t, s, template("snap-orphan", "gone", 1024), true)  // its image is gone: the caller's to find
 	mustSnapshot(t, s, template("snap-py", "python", 1024), true)    // kept
 	mustSnapshot(t, s, template("snap-dying", "python", 1024), true) // being deleted: returned to finish
 	if _, err := s.MarkSnapshotDeleting(ctx, "snap-dying"); err != nil {
@@ -249,7 +249,7 @@ func TestGarbageSnapshots(t *testing.T) {
 	for _, g := range garbage {
 		got = append(got, g.ID)
 	}
-	if want := "[snap-of-gone snap-old snap-dying snap-orphan]"; fmt.Sprint(got) != want {
+	if want := "[snap-of-gone snap-old snap-dying]"; fmt.Sprint(got) != want {
 		t.Errorf("GarbageSnapshots = %v, want %s", got, want)
 	}
 

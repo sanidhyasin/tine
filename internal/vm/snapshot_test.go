@@ -279,3 +279,101 @@ func (f *fakeHost) anyPaused() bool {
 	defer f.mu.Unlock()
 	return len(f.isPaused) > 0
 }
+
+func TestListAndDeleteSnapshots(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, nil)
+	vm, snap := f.snapshotted(t, CreateRequest{})
+	other, _ := f.snapshotted(t, CreateRequest{})
+	child, err := f.m.Create(ctx, CreateRequest{SnapshotID: snap.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	list, err := f.m.Snapshots(ctx, state.SnapshotFilter{VMID: vm.ID})
+	if err != nil || len(list) != 1 || list[0].ID != snap.ID || strings.Join(list[0].UsedBy, ",") != child.ID {
+		t.Fatalf("Snapshots(vm) = %+v, %v", list, err)
+	}
+	if all, _ := f.m.Snapshots(ctx, state.SnapshotFilter{}); len(all) != 2 {
+		t.Errorf("all snapshots = %d, want 2", len(all))
+	}
+	if got, err := f.m.GetSnapshot(ctx, snap.ID); err != nil || len(got.UsedBy) != 1 {
+		t.Errorf("GetSnapshot = %+v, %v", got, err)
+	}
+	if _, err := f.m.DeleteSnapshot(ctx, snap.ID); !errors.Is(err, state.ErrInUse) {
+		t.Errorf("deleting a snapshot a VM runs from = %v, want ErrInUse", err)
+	}
+	if _, err := f.m.Destroy(ctx, child.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.m.DeleteSnapshot(ctx, snap.ID); err != nil {
+		t.Fatalf("DeleteSnapshot: %v", err)
+	}
+	if _, err := f.m.snaps.Load(snap.ID); err == nil {
+		t.Error("its files are still there")
+	}
+	if _, err := f.m.GetSnapshot(ctx, snap.ID); !errors.Is(err, ErrNotFound) {
+		t.Errorf("GetSnapshot after delete = %v, want ErrNotFound", err)
+	}
+	if _, err := f.m.DeleteSnapshot(ctx, snap.ID); !errors.Is(err, ErrNotFound) {
+		t.Errorf("deleting it again = %v, want ErrNotFound", err)
+	}
+	_ = other
+}
+
+func TestGarbageCollection(t *testing.T) {
+	ctx := context.Background()
+	f := warmFixture(t, nil)
+	parent, snap := f.snapshotted(t, CreateRequest{})
+	child, err := f.m.Create(ctx, CreateRequest{SnapshotID: snap.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	old, err := f.m.WarmTemplate(ctx, "base", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fromOld, err := f.m.Create(ctx, CreateRequest{}) // runs from the old template
+	if err != nil || fromOld.SnapshotID != old.ID {
+		t.Fatalf("Create = %+v, %v", fromOld, err)
+	}
+	current, err := f.m.WarmTemplate(ctx, "base", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := f.m.collectGarbage(ctx); n != 0 {
+		t.Errorf("collected %d while everything is in use", n)
+	}
+
+	// The parent is gone, but a VM still runs from its snapshot.
+	if _, err := f.m.Destroy(ctx, parent.ID); err != nil {
+		t.Fatal(err)
+	}
+	if n := f.m.collectGarbage(ctx); n != 0 {
+		t.Errorf("collected %d; the snapshot is still in use", n)
+	}
+	// Now nothing needs it, or the replaced template.
+	for _, id := range []string{child.ID, fromOld.ID} {
+		if _, err := f.m.Destroy(ctx, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := f.m.collectGarbage(ctx); n != 2 {
+		t.Errorf("collected %d, want 2: the snapshot and the replaced template", n)
+	}
+	left, _ := f.m.Snapshots(ctx, state.SnapshotFilter{})
+	if len(left) != 1 || left[0].ID != current.ID {
+		t.Errorf("left = %+v, want only the current template", left)
+	}
+	if ids, building, _ := f.m.snaps.List(); strings.Join(ids, ",") != current.ID || len(building) != 0 {
+		t.Errorf("files left = %v %v", ids, building)
+	}
+
+	// Once its image is removed, the current template goes too.
+	if err := os.RemoveAll(filepath.Join(f.m.cfg.ImagesDir, "base")); err != nil {
+		t.Fatal(err)
+	}
+	if n := f.m.collectGarbage(ctx); n != 1 {
+		t.Errorf("collected %d, want the template of the removed image", n)
+	}
+}

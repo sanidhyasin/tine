@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"strings"
 	"time"
 
@@ -297,4 +298,101 @@ func newSnapshotID() string {
 	b := make([]byte, 7)
 	_, _ = rand.Read(b)
 	return "snap-" + strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(b))[:10]
+}
+
+// SnapshotInfo is a snapshot and the VMs that run from it.
+type SnapshotInfo struct {
+	state.Snapshot
+	// UsedBy are the live VMs restored from it. It can't be deleted while
+	// there are any.
+	UsedBy []string
+}
+
+// Snapshots lists snapshots, oldest first.
+func (m *Manager) Snapshots(ctx context.Context, f state.SnapshotFilter) ([]SnapshotInfo, error) {
+	snaps, err := m.store.ListSnapshots(ctx, f)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]SnapshotInfo, 0, len(snaps))
+	for _, s := range snaps {
+		users, err := m.store.SnapshotUsers(ctx, s.ID)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, SnapshotInfo{Snapshot: s, UsedBy: users})
+	}
+	return out, nil
+}
+
+// GetSnapshot returns one snapshot.
+func (m *Manager) GetSnapshot(ctx context.Context, id string) (SnapshotInfo, error) {
+	s, err := m.store.GetSnapshot(ctx, id)
+	if err != nil {
+		return SnapshotInfo{}, err
+	}
+	users, err := m.store.SnapshotUsers(ctx, id)
+	return SnapshotInfo{Snapshot: s, UsedBy: users}, err
+}
+
+// DeleteSnapshot deletes a snapshot's files and record. It's refused with
+// ErrInUse while VMs run from it, and with ErrBusy while it's being taken.
+func (m *Manager) DeleteSnapshot(ctx context.Context, id string) (state.Snapshot, error) {
+	snap, err := m.store.GetSnapshot(ctx, id)
+	if err != nil {
+		return state.Snapshot{}, err
+	}
+	if snap.State == state.SnapshotCreating {
+		return state.Snapshot{}, fmt.Errorf("%w: snapshot %s is still being taken", ErrBusy, id)
+	}
+	if snap, err = m.store.MarkSnapshotDeleting(ctx, id); err != nil {
+		return state.Snapshot{}, err
+	}
+	if err := m.removeSnapshot(ctx, id); err != nil {
+		return snap, fmt.Errorf("delete snapshot %s: %w", id, err)
+	}
+	m.cfg.Metrics.SnapshotDeleted("requested")
+	m.log.InfoContext(ctx, "snapshot deleted", "snapshot", id)
+	return snap, nil
+}
+
+// collectGarbage deletes the snapshots nothing needs any more (see
+// state.Store.GarbageSnapshots): those of destroyed VMs, and templates
+// that newer ones replaced or whose image is gone, once no VM runs from
+// them. It returns how many it deleted.
+func (m *Manager) collectGarbage(ctx context.Context) int {
+	garbage, err := m.store.GarbageSnapshots(ctx)
+	if err != nil {
+		m.log.Error("snapshot GC: list garbage", "err", err)
+		return 0
+	}
+	// Templates of images that are gone from the disk are garbage too.
+	templates, err := m.store.ListSnapshots(ctx, state.SnapshotFilter{Kind: state.SnapshotKindTemplate})
+	if err != nil {
+		m.log.Error("snapshot GC: list templates", "err", err)
+		return 0
+	}
+	for _, s := range templates {
+		if _, err := image.Open(m.cfg.ImagesDir, s.Image); s.State == state.SnapshotReady && errors.Is(err, fs.ErrNotExist) {
+			garbage = append(garbage, s)
+		}
+	}
+	n := 0
+	for _, s := range garbage {
+		// A VM may have claimed it since it was listed: then this refuses.
+		if _, err := m.store.MarkSnapshotDeleting(ctx, s.ID); err != nil {
+			if !errors.Is(err, state.ErrInUse) && !errors.Is(err, state.ErrNotFound) {
+				m.log.Error("snapshot GC", "snapshot", s.ID, "err", err)
+			}
+			continue
+		}
+		if err := m.removeSnapshot(ctx, s.ID); err != nil {
+			m.log.Error("snapshot GC: remove", "snapshot", s.ID, "err", err)
+			continue
+		}
+		m.cfg.Metrics.SnapshotDeleted("garbage")
+		m.log.Info("snapshot GC: deleted a snapshot nothing needs", "snapshot", s.ID, "kind", s.Kind, "vm", s.VMID)
+		n++
+	}
+	return n
 }

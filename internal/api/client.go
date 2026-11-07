@@ -88,6 +88,41 @@ func (c *Client) WarmTemplate(ctx context.Context, image string, req WarmRequest
 	return snap, c.do(ctx, http.MethodPost, "/v1/images/"+url.PathEscape(image)+"/warm", req, http.StatusCreated, &snap)
 }
 
+// SnapshotFilter narrows ListSnapshots. Empty fields match everything.
+type SnapshotFilter struct {
+	VMID  string
+	Kind  string // "vm" or "template"
+	Image string
+}
+
+// ListSnapshots lists snapshots, oldest first.
+func (c *Client) ListSnapshots(ctx context.Context, f SnapshotFilter) ([]Snapshot, error) {
+	q := url.Values{}
+	for k, v := range map[string]string{"vm": f.VMID, "kind": f.Kind, "image": f.Image} {
+		if v != "" {
+			q.Set(k, v)
+		}
+	}
+	path := "/v1/snapshots"
+	if len(q) > 0 {
+		path += "?" + q.Encode()
+	}
+	var out ListSnapshotsResponse
+	return out.Snapshots, c.do(ctx, http.MethodGet, path, nil, http.StatusOK, &out)
+}
+
+// GetSnapshot returns one snapshot, with the VMs that run from it.
+func (c *Client) GetSnapshot(ctx context.Context, id string) (Snapshot, error) {
+	var snap Snapshot
+	return snap, c.do(ctx, http.MethodGet, "/v1/snapshots/"+url.PathEscape(id), nil, http.StatusOK, &snap)
+}
+
+// DeleteSnapshot deletes a snapshot that no VM runs from.
+func (c *Client) DeleteSnapshot(ctx context.Context, id string) (Snapshot, error) {
+	var snap Snapshot
+	return snap, c.do(ctx, http.MethodDelete, "/v1/snapshots/"+url.PathEscape(id), nil, http.StatusOK, &snap)
+}
+
 // Rollback rolls a VM back to a snapshot.
 func (c *Client) Rollback(ctx context.Context, vmID, snapshotID string) (VM, error) {
 	var v VM

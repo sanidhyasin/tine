@@ -63,6 +63,47 @@ func (*fakeBackend) WarmTemplate(_ context.Context, image string, vcpus, memoryM
 	}, nil
 }
 
+func (f *fakeBackend) Snapshots(_ context.Context, flt state.SnapshotFilter) ([]vm.SnapshotInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return nil, f.err
+	}
+	all := []vm.SnapshotInfo{
+		{Snapshot: state.Snapshot{ID: "snap-aaaaaaaaaa", Kind: state.SnapshotKindVM, State: state.SnapshotReady, VMID: "vm-1", Image: "base", VCPUs: 2, MemoryMiB: 1024}, UsedBy: []string{"vm-2"}},
+		{Snapshot: state.Snapshot{ID: "snap-tmplaaaaaa", Kind: state.SnapshotKindTemplate, State: state.SnapshotReady, Image: "base", VCPUs: 2, MemoryMiB: 1024}},
+	}
+	var out []vm.SnapshotInfo
+	for _, s := range all {
+		if (flt.VMID == "" || s.VMID == flt.VMID) && (flt.Kind == "" || s.Kind == flt.Kind) {
+			out = append(out, s)
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeBackend) GetSnapshot(ctx context.Context, id string) (vm.SnapshotInfo, error) {
+	all, _ := f.Snapshots(ctx, state.SnapshotFilter{})
+	for _, s := range all {
+		if s.ID == id {
+			return s, nil
+		}
+	}
+	return vm.SnapshotInfo{}, fmt.Errorf("snapshot %s: %w", id, state.ErrNotFound)
+}
+
+func (f *fakeBackend) DeleteSnapshot(ctx context.Context, id string) (state.Snapshot, error) {
+	s, err := f.GetSnapshot(ctx, id)
+	if err != nil {
+		return state.Snapshot{}, err
+	}
+	if len(s.UsedBy) > 0 {
+		return state.Snapshot{}, fmt.Errorf("snapshot %s: %w", id, state.ErrInUse)
+	}
+	s.State = state.SnapshotDeleting
+	return s.Snapshot, nil
+}
+
 func (f *fakeBackend) Rollback(_ context.Context, id, snapID string) (state.VM, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -334,6 +375,35 @@ func TestRollbackAPI(t *testing.T) {
 	}
 }
 
+func TestSnapshotListing(t *testing.T) {
+	ctx := context.Background()
+	c, sock := serve(t, newFakeBackend())
+	all, err := c.ListSnapshots(ctx, SnapshotFilter{})
+	if err != nil || len(all) != 2 || all[0].UsedBy[0] != "vm-2" {
+		t.Fatalf("ListSnapshots = %+v, %v", all, err)
+	}
+	if got, _ := c.ListSnapshots(ctx, SnapshotFilter{Kind: "template"}); len(got) != 1 || got[0].ID != "snap-tmplaaaaaa" {
+		t.Errorf("templates = %+v", got)
+	}
+	var vmOnes ListSnapshotsResponse
+	if status := getJSON(t, sock, "/v1/vms/vm-1/snapshots", &vmOnes); status != http.StatusOK || len(vmOnes.Snapshots) != 1 {
+		t.Errorf("GET /v1/vms/vm-1/snapshots = %d %+v", status, vmOnes)
+	}
+	if got, err := c.GetSnapshot(ctx, "snap-aaaaaaaaaa"); err != nil || got.VMID != "vm-1" {
+		t.Errorf("GetSnapshot = %+v, %v", got, err)
+	}
+	var apiErr *Error
+	if _, err := c.DeleteSnapshot(ctx, "snap-aaaaaaaaaa"); !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusConflict || apiErr.Code != CodeInUse {
+		t.Errorf("deleting a snapshot in use = %#v, want 409 in_use", err)
+	}
+	if got, err := c.DeleteSnapshot(ctx, "snap-tmplaaaaaa"); err != nil || got.State != "deleting" {
+		t.Errorf("DeleteSnapshot = %+v, %v", got, err)
+	}
+	if _, err := c.GetSnapshot(ctx, "snap-nope"); !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusNotFound {
+		t.Errorf("GetSnapshot of nothing = %#v", err)
+	}
+}
+
 func TestErrorsMapToStatusCodes(t *testing.T) {
 	tests := []struct {
 		err    error
@@ -583,4 +653,22 @@ func TestRequestAndVMIDsReachTheBackendAndTheLog(t *testing.T) {
 	if line["request_id"] != "req-42" || line["vm"] != v.ID || line["route"] != "/v1/vms/{id}" || line["status"] != float64(200) {
 		t.Errorf("request log line = %v", line)
 	}
+}
+
+// getJSON GETs path from the server on sock and decodes the answer into out.
+func getJSON(t *testing.T, sock, path string, out any) int {
+	t.Helper()
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://tined"+path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := rawClient(sock).Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+		t.Fatal(err)
+	}
+	return resp.StatusCode
 }

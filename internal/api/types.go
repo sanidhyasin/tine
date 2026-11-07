@@ -15,7 +15,11 @@
 //	DELETE /v1/vms/{id}            VM
 //	POST   /v1/vms/{id}/exec       ExecRequest → a stream of Frames
 //	POST   /v1/vms/{id}/snapshots  Snapshot (201)
+//	GET    /v1/vms/{id}/snapshots  ListSnapshotsResponse, the VM's
 //	POST   /v1/vms/{id}/rollback   RollbackRequest → VM
+//	GET    /v1/snapshots[?vm=&kind=&image=]  ListSnapshotsResponse
+//	GET    /v1/snapshots/{id}      Snapshot
+//	DELETE /v1/snapshots/{id}      Snapshot (409 in_use while VMs run from it)
 package api
 
 import (
@@ -111,6 +115,11 @@ type Template struct {
 	// Problem says why new VMs can't start from it, so they boot instead.
 	// It's empty when they can.
 	Problem string `json:"problem,omitempty"`
+}
+
+// ListSnapshotsResponse is GET /v1/snapshots's answer.
+type ListSnapshotsResponse struct {
+	Snapshots []Snapshot `json:"snapshots"`
 }
 
 // RollbackRequest rolls a VM back to one of its snapshots, or to the

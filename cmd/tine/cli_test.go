@@ -158,6 +158,48 @@ func (*backend) WarmTemplate(_ context.Context, image string, vcpus, memoryMiB i
 	}, nil
 }
 
+func (b *backend) Snapshots(_ context.Context, flt state.SnapshotFilter) ([]vm.SnapshotInfo, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	all := []vm.SnapshotInfo{
+		{Snapshot: state.Snapshot{ID: "snap-abcdefghij", Kind: state.SnapshotKindVM, State: state.SnapshotReady, VMID: "vm-aaaaaaaaab", Image: "base", VCPUs: 2, MemoryMiB: 1024,
+			SizeBytes: 1395864371, CreatedAt: time.Now().Add(-5 * time.Minute), Metadata: json.RawMessage(`{"timings_ms":{"paused":251.2}}`)}, UsedBy: []string{"vm-aaaaaaaaac"}},
+		{Snapshot: state.Snapshot{ID: "snap-abcdzzzzzz", Kind: state.SnapshotKindVM, State: state.SnapshotReady, VMID: "vm-aaaaaaaaab", Image: "base", VCPUs: 2, MemoryMiB: 1024,
+			SizeBytes: 1 << 30, CreatedAt: time.Now().Add(-time.Minute)}},
+		{Snapshot: state.Snapshot{ID: "snap-tmplaaaaaa", Kind: state.SnapshotKindTemplate, State: state.SnapshotReady, VMID: "vm-warmwarmwa", Image: "base", VCPUs: 2, MemoryMiB: 1024,
+			SizeBytes: 1 << 30, CreatedAt: time.Now().Add(-time.Hour)}},
+	}
+	var out []vm.SnapshotInfo
+	for _, s := range all {
+		if (flt.VMID == "" || s.VMID == flt.VMID) && (flt.Kind == "" || s.Kind == flt.Kind) {
+			out = append(out, s)
+		}
+	}
+	return out, nil
+}
+
+func (b *backend) GetSnapshot(ctx context.Context, id string) (vm.SnapshotInfo, error) {
+	all, _ := b.Snapshots(ctx, state.SnapshotFilter{})
+	for _, s := range all {
+		if s.ID == id {
+			return s, nil
+		}
+	}
+	return vm.SnapshotInfo{}, fmt.Errorf("snapshot %s: %w", id, state.ErrNotFound)
+}
+
+func (b *backend) DeleteSnapshot(ctx context.Context, id string) (state.Snapshot, error) {
+	s, err := b.GetSnapshot(ctx, id)
+	if err != nil {
+		return state.Snapshot{}, err
+	}
+	if len(s.UsedBy) > 0 {
+		return state.Snapshot{}, fmt.Errorf("snapshot %s: %w", id, state.ErrInUse)
+	}
+	s.State = state.SnapshotDeleting
+	return s.Snapshot, nil
+}
+
 func (b *backend) Rollback(_ context.Context, id, snapID string) (state.VM, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -427,7 +469,7 @@ func TestImageWarm(t *testing.T) {
 func TestRollback(t *testing.T) {
 	sock, _ := startTined(t)
 	id := strings.TrimSpace(tine(t, sock, "", "create", "-q").stdout)
-	if r := tine(t, sock, "", "rollback", id[3:7], "--to", "snap-abcdefghij"); r.code != 0 || r.stdout != "rolled back "+id+" to snap-abcdefghij (180ms)\n" {
+	if r := tine(t, sock, "", "rollback", id[3:7], "--to", "abcde"); r.code != 0 || r.stdout != "rolled back "+id+" to snap-abcdefghij (180ms)\n" {
 		t.Errorf("rollback = %d %q %q", r.code, r.stdout, r.stderr)
 	}
 	if r := tine(t, sock, "", "rollback", id); r.code != 1 || !strings.Contains(r.stderr, "--to") {
@@ -435,6 +477,32 @@ func TestRollback(t *testing.T) {
 	}
 	if r := tine(t, sock, "", "rollback", id, "--to", "nope"); r.code != 1 || !strings.Contains(r.stderr, "nope") {
 		t.Errorf("rollback to a missing snapshot = %d %q", r.code, r.stderr)
+	}
+	if r := tine(t, sock, "", "rollback", id, "--to", "abcd"); r.code != 1 || !strings.Contains(r.stderr, "several snapshots match") {
+		t.Errorf("rollback to an ambiguous prefix = %d %q", r.code, r.stderr)
+	}
+}
+
+func TestSnapshotListInspectRemove(t *testing.T) {
+	sock, _ := startTined(t)
+	r := tine(t, sock, "", "snapshot", "ls")
+	lines := strings.Split(strings.TrimSpace(r.stdout), "\n")
+	if r.code != 0 || len(lines) != 4 || !strings.HasPrefix(lines[0], "ID") ||
+		!strings.Contains(lines[1], "snap-abcdefghij  vm") || !strings.Contains(lines[1], "1.3 GiB") ||
+		!strings.Contains(lines[1], "251ms") || !strings.HasSuffix(lines[1], "vm-aaaaaaaaac") ||
+		!strings.Contains(lines[3], "template") {
+		t.Errorf("snapshot ls = %d:\n%s%s", r.code, r.stdout, r.stderr)
+	}
+	if r := tine(t, sock, "", "snapshot", "ls", "--kind", "template"); strings.Count(r.stdout, "\n") != 2 {
+		t.Errorf("snapshot ls --kind template:\n%s", r.stdout)
+	}
+	var snap api.Snapshot
+	if r := tine(t, sock, "", "snapshot", "inspect", "tmpl"); json.Unmarshal([]byte(r.stdout), &snap) != nil || snap.Kind != "template" {
+		t.Errorf("snapshot inspect = %q %q", r.stdout, r.stderr)
+	}
+	r = tine(t, sock, "", "snapshot", "rm", "abcdz", "abcdefghij", "nope")
+	if r.code != 1 || r.stdout != "deleted snap-abcdzzzzzz\n" || !strings.Contains(r.stderr, "abcdefghij: ") || !strings.Contains(r.stderr, "nope") {
+		t.Errorf("snapshot rm = %d %q %q", r.code, r.stdout, r.stderr)
 	}
 }
 
