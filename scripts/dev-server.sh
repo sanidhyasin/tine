@@ -23,6 +23,9 @@
 #
 #   TINE_NAME=tine-metal TINE_INSTANCE_TYPE=c5d.metal TINE_LOCAL_DATA=1 ./scripts/dev-server.sh up
 #
+# TINE_ZONE picks the availability zone (by default, the first that offers the
+# type), for when that one has no capacity.
+#
 # .metal types run Firecracker on KVM directly, without nested virtualization.
 # TINE_LOCAL_DATA=1 puts /srv/tine on the instance's own NVMe disk instead of
 # an EBS volume; that disk is wiped whenever the server stops, so it suits a
@@ -166,8 +169,14 @@ default_subnet() {
   zones="$(aws_ ec2 describe-instance-type-offerings --location-type availability-zone \
            --filters "Name=instance-type,Values=$TYPE" \
            --query 'InstanceTypeOfferings[].Location' --output text)"
-  az="$(printf '%s' "$zones" | tr '\t' '\n' | sort | head -1)"
-  expect "$REGION*" "$az" "$TYPE isn't offered in $REGION"
+  if [ -n "${TINE_ZONE:-}" ]; then
+    # A zone of your choice, such as when the first has no capacity for the type.
+    az="$(printf '%s' "$zones" | tr '\t' '\n' | grep -x "$TINE_ZONE" || true)"
+    expect "$REGION*" "$az" "$TYPE isn't offered in $TINE_ZONE"
+  else
+    az="$(printf '%s' "$zones" | tr '\t' '\n' | sort | head -1)"
+    expect "$REGION*" "$az" "$TYPE isn't offered in $REGION"
+  fi
   subnet="$(aws_ ec2 describe-subnets \
             --filters Name=default-for-az,Values=true "Name=availability-zone,Values=$az" \
             --query 'Subnets[0].SubnetId' --output text)"
