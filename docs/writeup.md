@@ -94,9 +94,18 @@ async with AsyncClient(host="ssh://tine-dev") as tine:
         attempts = await asyncio.gather(*(attempt(llm, f, issue, i, model=model, budget=budget) for i, f in enumerate(forks)))
 ```
 
-Forking five set-up sandboxes took about half a second, where setting up each of these tiny repositories took 1.0 to 4.7 s. For one of them, setting it up once and forking it took 1.8 s, and setting up five sandboxes separately 4.9 s. Real repositories, with dependencies to install, take minutes to set up; the fork stays under a second.
+Forking a set-up sandbox into five took about half a second. Setting up each of these tiny repositories took 1 to 5 s, depending on how busy the disk was, so forking saved anything from almost nothing to a few seconds: for one of them, setting it up once and forking took 1.4 to 1.8 s, and setting up five sandboxes at once 1.5 to 4.9 s. Real repositories, with dependencies to install, take minutes to set up; the fork stays under a second, and the five forks share their parent's memory.
 
-<!-- DEMO-RESULTS: best-of-1 against best-of-5 with Claude, from `make demo` -->
+It ran with Claude Sonnet 5.5, and again with Claude Haiku 5.5:
+
+| | One attempt fixed the bug | The best of five fixed it | The run cost |
+|---|---|---|---|
+| Claude Sonnet 5.5 | 88% of 50 attempts | 9 of 10 tasks | $0.43 |
+| Claude Haiku 5.5 | 90% of 50 attempts | 10 of 10 tasks | $0.04 |
+
+Both models fixed nearly every bug on the first try. These bugs are small and plain, so the demo shows the mechanism more than the gain, and an honest result is that most of the time one attempt was enough. Where it wasn't, five were the difference. One task's hidden tests count a date range given backwards as no days, which the issue doesn't say and the docstring only implies: one of Haiku's five attempts got it, so Haiku fixed the task only because it had five tries, and all five of Sonnet's missed it. The others that failed dropped the apostrophe in "don't" and got semantic versioning's pre-release order wrong, and their siblings covered for them. Passing fixes to one bug also differed in size, 9 to 13 lines for one and 37 to 50 for another, and the demo keeps the smallest.
+
+That's the case for forks in agent work: attempts are cheap (under a cent each here), but setting up the place they run in isn't, on a real repository, and every attempt needs its own. With a fork, five attempts start from one set-up sandbox in half a second, and cost the host little more than one.
 
 ## What's next
 
