@@ -152,7 +152,8 @@ SUMMARY_KEYS = {
     "exec": ["client", "guest"],
     "rollback": ["rollback"],
     "snapshot": ["paused", "total", "wait"],
-    "fork": ["total", "paused", "children", "child_p50"],
+    # "first": uffd-prefetch's first child, which records the pages a restore touches.
+    "fork": ["total", "paused", "first", "children", "child_p50"],
 }
 
 
