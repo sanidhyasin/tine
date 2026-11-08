@@ -1,0 +1,668 @@
+{
+  "time": "2026-11-08T01:43:50.761772+00:00",
+  "model": "scripted",
+  "n": 5,
+  "best_of_1": 0.58,
+  "best_of_n": 1.0,
+  "wall_seconds": 76.7953104590415,
+  "usage": {
+    "input": 0,
+    "output": 0,
+    "cache_write": 0,
+    "cache_read": 0,
+    "requests": 0
+  },
+  "cost_usd": 0.0,
+  "tasks": [
+    {
+      "name": "bisect",
+      "setup_seconds": 1.289916459005326,
+      "fork_seconds": 0.46359279099851847,
+      "attempts_seconds": 0.5420747500029393,
+      "resetup_seconds": 4.897170500014909,
+      "winner": 0,
+      "attempts": [
+        {
+          "index": 0,
+          "passed": true,
+          "lines_changed": 6,
+          "steps": 3,
+          "stop": "done",
+          "seconds": 0.4519246660056524,
+          "summary": "scripted: wrote the reference fix",
+          "error": "",
+          "cost_usd": 0.0
+        },
+        {
+          "index": 1,
+          "passed": false,
+          "lines_changed": 0,
+          "steps": 3,
+          "stop": "gave up",
+          "seconds": 0.08486533298855647,
+          "summary": "scripted: gave up",
+          "error": "",
+          "cost_usd": 0.0
+        },
+        {
+          "index": 2,
+          "passed": false,
+          "lines_changed": 0,
+          "steps": 3,
+          "stop": "gave up",
+          "seconds": 0.09180412505520508,
+          "summary": "scripted: gave up",
+          "error": "",
+          "cost_usd": 0.0
+        },
+        {
+          "index": 3,
+          "passed": true,
+          "lines_changed": 6,
+          "steps": 3,
+          "stop": "done",
+          "seconds": 0.5407690409920178,
+          "summary": "scripted: wrote the reference fix",
+          "error": "",
+          "cost_usd": 0.0
+        },
+        {
+          "index": 4,
+          "passed": false,
+          "lines_changed": 0,
+          "steps": 3,
+          "stop": "gave up",
+          "seconds": 0.11140579200582579,
+          "summary": "scripted: gave up",
+          "error": "",
+          "cost_usd": 0.0
+        }
+      ]
+    },
+    {
+      "name": "businessdays",
+      "setup_seconds": 1.9052469169837423,
+      "fork_seconds": 0.5603414580109529,
+      "attempts_seconds": 0.5295344170299359,
+      "resetup_seconds": null,
+      "winner": 0,
+      "attempts": [
+        {
+          "index": 0,
+          "passed": true,
+          "lines_changed": 8,
+          "steps": 3,
+          "stop": "done",
+          "seconds": 0.4158670830074698,
+          "summary": "scripted: wrote the reference fix",
+          "error": "",
+          "cost_usd": 0.0
+        },
+        {
+          "index": 1,
+          "passed": true,
+          "lines_changed": 8,
+          "steps": 3,
+          "stop": "done",
+          "seconds": 0.4787380840280093,
+          "summary": "scripted: wrote the reference fix",
+          "error": "",
+          "cost_usd": 0.0
+        },
+        {
+          "index": 2,
+          "passed": false,
+          "lines_changed": 0,
+          "steps": 3,
+          "stop": "gave up",
+          "seconds": 0.06074074999196455,
+          "summary": "scripted: gave up",
+          "error": "",
+          "cost_usd": 0.0
+        },
+        {
+          "index": 3,
+          "passed": true,
+          "lines_changed": 8,
+          "steps": 3,
+          "stop": "done",
+          "seconds": 0.5277318329899572,
+          "summary": "scripted: wrote the reference fix",
+          "error": "",
+          "cost_usd": 0.0
+        },
+        {
+          "index": 4,
+          "passed": false,
+          "lines_changed": 0,
+          "steps": 3,
+          "stop": "gave up",
+          "seconds": 0.0357659169822,
+          "summary": "scripted: gave up",
+          "error": "",
+          "cost_usd": 0.0
+        }
+      ]
+    },
+    {
+      "name": "csvline",
+      "setup_seconds": 3.133856291999109,
+      "fork_seconds": 0.5545049579814076,
+      "attempts_seconds": 0.44943112501641735,
+      "resetup_seconds": null,
+      "winner": 3,
+      "attempts": [
+        {
+          "index": 0,
+          "passed": true,
+          "lines_changed": 22,
+          "steps": 3,
+          "stop": "done",
+          "seconds": 0.4492829169612378,
+          "summary": "scripted: wrote the reference fix",
+          "error": "",
+          "cost_usd": 0.0
+        },
+        {
+          "index": 1,
+          "passed": false,
+          "lines_changed": 0,
+          "steps": 3,
+          "stop": "gave up",
+          "seconds": 0.05915370798902586,
+          "summary": "scripted: gave up",
+          "error": "",
+          "cost_usd": 0.0
+        },
+        {
+          "index": 2,
+          "passed": false,
+          "lines_changed": 0,
+          "steps": 3,
+          "stop": "gave up",
+          "seconds": 0.038098957971669734,
+          "summary": "scripted: gave up",
+          "error": "",
+          "cost_usd": 0.0
+        },
+        {
+          "index": 3,
+          "passed": true,
+          "lines_changed": 22,
+          "steps": 3,
+          "stop": "done",
+          "seconds": 0.42306654097046703,
+          "summary": "scripted: wrote the reference fix",
+          "error": "",
+          "cost_usd": 0.0
+        },
+        {
+          "index": 4,
+          "passed": false,
+          "lines_changed": 0,
+          "steps": 3,
+          "stop": "gave up",
+          "seconds": 0.03735170897562057,
+          "summary": "scripted: gave up",
+          "error": "",
+          "cost_usd": 0.0
+        }
+      ]
+    },
+    {
+      "name": "intervals",
+      "setup_seconds": 3.1398961660452187,
+      "fork_seconds": 0.490587041946128,
+      "attempts_seconds": 0.5342689580284059,
+      "resetup_seconds": null,
+      "winner": 2,
+      "attempts": [
+        {
+          "index": 0,
+          "passed": true,
+          "lines_changed": 4,
+          "steps": 3,
+          "stop": "done",
+          "seconds": 0.5099340419983491,
+          "summary": "scripted: wrote the reference fix",
+          "error": "",
+          "cost_usd": 0.0
+        },
+        {
+          "index": 1,
+          "passed": false,
+          "lines_changed": 0,
+          "steps": 3,
+          "stop": "gave up",
+          "seconds": 0.05646616598824039,
+          "summary": "scripted: gave up",
+          "error": "",
+          "cost_usd": 0.0
+        },
+        {
+          "index": 2,
+          "passed": true,
+          "lines_changed": 4,
+          "steps": 3,
+          "stop": "done",
+          "seconds": 0.48400466598104686,
+          "summary": "scripted: wrote the reference fix",
+          "error": "",
+          "cost_usd": 0.0
+        },
+        {
+          "index": 3,
+          "passed": true,
+          "lines_changed": 4,
+          "steps": 3,
+          "stop": "done",
+          "seconds": 0.5331207499839365,
+          "summary": "scripted: wrote the reference fix",
+          "error": "",
+          "cost_usd": 0.0
+        },
+        {
+          "index": 4,
+          "passed": false,
+          "lines_changed": 0,
+          "steps": 3,
+          "stop": "gave up",
+          "seconds": 0.040599583997391164,
+          "summary": "scripted: gave up",
+          "error": "",
+          "cost_usd": 0.0
+        }
+      ]
+    },
+    {
+      "name": "lru",
+      "setup_seconds": 4.7473532920121215,
+      "fork_seconds": 0.5500484159565531,
+      "attempts_seconds": 0.5703555000363849,
+      "resetup_seconds": null,
+      "winner": 0,
+      "attempts": [
+        {
+          "index": 0,
+          "passed": true,
+          "lines_changed": 7,
+          "steps": 3,
+          "stop": "done",
+          "seconds": 0.450321750016883,
+          "summary": "scripted: wrote the reference fix",
+          "error": "",
+          "cost_usd": 0.0
+        },
+        {
+          "index": 1,
+          "passed": false,
+          "lines_changed": 0,
+          "steps": 3,
+          "stop": "gave up",
+          "seconds": 0.08823766699060798,
+          "summary": "scripted: gave up",
+          "error": "",
+          "cost_usd": 0.0
+        },
+        {
+          "index": 2,
+          "passed": true,
+          "lines_changed": 7,
+          "steps": 3,
+          "stop": "done",
+          "seconds": 0.5697332919808105,
+          "summary": "scripted: wrote the reference fix",
+          "error": "",
+          "cost_usd": 0.0
+        },
+        {
+          "index": 3,
+          "passed": true,
+          "lines_changed": 7,
+          "steps": 3,
+          "stop": "done",
+          "seconds": 0.5694223330356181,
+          "summary": "scripted: wrote the reference fix",
+          "error": "",
+          "cost_usd": 0.0
+        },
+        {
+          "index": 4,
+          "passed": false,
+          "lines_changed": 0,
+          "steps": 3,
+          "stop": "gave up",
+          "seconds": 0.08819120901171118,
+          "summary": "scripted: gave up",
+          "error": "",
+          "cost_usd": 0.0
+        }
+      ]
+    },
+    {
+      "name": "matrix",
+      "setup_seconds": 3.7788746249862015,
+      "fork_seconds": 0.4937290839734487,
+      "attempts_seconds": 0.5026788749964908,
+      "resetup_seconds": null,
+      "winner": 2,
+      "attempts": [
+        {
+          "index": 0,
+          "passed": true,
+          "lines_changed": 3,
+          "steps": 3,
+          "stop": "done",
+          "seconds": 0.5020517500233836,
+          "summary": "scripted: wrote the reference fix",
+          "error": "",
+          "cost_usd": 0.0
+        },
+        {
+          "index": 1,
+          "passed": true,
+          "lines_changed": 3,
+          "steps": 3,
+          "stop": "done",
+          "seconds": 0.5014733340358362,
+          "summary": "scripted: wrote the reference fix",
+          "error": "",
+          "cost_usd": 0.0
+        },
+        {
+          "index": 2,
+          "passed": true,
+          "lines_changed": 3,
+          "steps": 3,
+          "stop": "done",
+          "seconds": 0.44968595798127353,
+          "summary": "scripted: wrote the reference fix",
+          "error": "",
+          "cost_usd": 0.0
+        },
+        {
+          "index": 3,
+          "passed": false,
+          "lines_changed": 0,
+          "steps": 3,
+          "stop": "gave up",
+          "seconds": 0.04025429202010855,
+          "summary": "scripted: gave up",
+          "error": "",
+          "cost_usd": 0.0
+        },
+        {
+          "index": 4,
+          "passed": false,
+          "lines_changed": 0,
+          "steps": 3,
+          "stop": "gave up",
+          "seconds": 0.038943457999266684,
+          "summary": "scripted: gave up",
+          "error": "",
+          "cost_usd": 0.0
+        }
+      ]
+    },
+    {
+      "name": "roman",
+      "setup_seconds": 3.1497165840119123,
+      "fork_seconds": 21.71352854097495,
+      "attempts_seconds": 0.7426574170240201,
+      "resetup_seconds": null,
+      "winner": 0,
+      "attempts": [
+        {
+          "index": 0,
+          "passed": true,
+          "lines_changed": 13,
+          "steps": 3,
+          "stop": "done",
+          "seconds": 0.5452529169851914,
+          "summary": "scripted: wrote the reference fix",
+          "error": "",
+          "cost_usd": 0.0
+        },
+        {
+          "index": 1,
+          "passed": true,
+          "lines_changed": 13,
+          "steps": 3,
+          "stop": "done",
+          "seconds": 0.6486667080316693,
+          "summary": "scripted: wrote the reference fix",
+          "error": "",
+          "cost_usd": 0.0
+        },
+        {
+          "index": 2,
+          "passed": true,
+          "lines_changed": 13,
+          "steps": 3,
+          "stop": "done",
+          "seconds": 0.6487532919854857,
+          "summary": "scripted: wrote the reference fix",
+          "error": "",
+          "cost_usd": 0.0
+        },
+        {
+          "index": 3,
+          "passed": true,
+          "lines_changed": 13,
+          "steps": 3,
+          "stop": "done",
+          "seconds": 0.7375340000144206,
+          "summary": "scripted: wrote the reference fix",
+          "error": "",
+          "cost_usd": 0.0
+        },
+        {
+          "index": 4,
+          "passed": false,
+          "lines_changed": 0,
+          "steps": 3,
+          "stop": "gave up",
+          "seconds": 0.07641516701551154,
+          "summary": "scripted: gave up",
+          "error": "",
+          "cost_usd": 0.0
+        }
+      ]
+    },
+    {
+      "name": "semver",
+      "setup_seconds": 1.032852999982424,
+      "fork_seconds": 0.483868999988772,
+      "attempts_seconds": 0.5441150830010884,
+      "resetup_seconds": null,
+      "winner": 2,
+      "attempts": [
+        {
+          "index": 0,
+          "passed": true,
+          "lines_changed": 13,
+          "steps": 3,
+          "stop": "done",
+          "seconds": 0.4918365420307964,
+          "summary": "scripted: wrote the reference fix",
+          "error": "",
+          "cost_usd": 0.0
+        },
+        {
+          "index": 1,
+          "passed": false,
+          "lines_changed": 0,
+          "steps": 3,
+          "stop": "gave up",
+          "seconds": 0.03768541698809713,
+          "summary": "scripted: gave up",
+          "error": "",
+          "cost_usd": 0.0
+        },
+        {
+          "index": 2,
+          "passed": true,
+          "lines_changed": 13,
+          "steps": 3,
+          "stop": "done",
+          "seconds": 0.4240637909970246,
+          "summary": "scripted: wrote the reference fix",
+          "error": "",
+          "cost_usd": 0.0
+        },
+        {
+          "index": 3,
+          "passed": true,
+          "lines_changed": 13,
+          "steps": 3,
+          "stop": "done",
+          "seconds": 0.5418180829728954,
+          "summary": "scripted: wrote the reference fix",
+          "error": "",
+          "cost_usd": 0.0
+        },
+        {
+          "index": 4,
+          "passed": false,
+          "lines_changed": 0,
+          "steps": 3,
+          "stop": "gave up",
+          "seconds": 0.036261332978028804,
+          "summary": "scripted: gave up",
+          "error": "",
+          "cost_usd": 0.0
+        }
+      ]
+    },
+    {
+      "name": "tokenbucket",
+      "setup_seconds": 3.2665420409757644,
+      "fork_seconds": 0.5789547089952976,
+      "attempts_seconds": 0.6864490830339491,
+      "resetup_seconds": null,
+      "winner": 4,
+      "attempts": [
+        {
+          "index": 0,
+          "passed": true,
+          "lines_changed": 3,
+          "steps": 3,
+          "stop": "done",
+          "seconds": 0.6862938340054825,
+          "summary": "scripted: wrote the reference fix",
+          "error": "",
+          "cost_usd": 0.0
+        },
+        {
+          "index": 1,
+          "passed": false,
+          "lines_changed": 0,
+          "steps": 3,
+          "stop": "gave up",
+          "seconds": 0.036925624997820705,
+          "summary": "scripted: gave up",
+          "error": "",
+          "cost_usd": 0.0
+        },
+        {
+          "index": 2,
+          "passed": true,
+          "lines_changed": 3,
+          "steps": 3,
+          "stop": "done",
+          "seconds": 0.6614306249539368,
+          "summary": "scripted: wrote the reference fix",
+          "error": "",
+          "cost_usd": 0.0
+        },
+        {
+          "index": 3,
+          "passed": true,
+          "lines_changed": 3,
+          "steps": 3,
+          "stop": "done",
+          "seconds": 0.5555581250227988,
+          "summary": "scripted: wrote the reference fix",
+          "error": "",
+          "cost_usd": 0.0
+        },
+        {
+          "index": 4,
+          "passed": true,
+          "lines_changed": 3,
+          "steps": 3,
+          "stop": "done",
+          "seconds": 0.5295474579907022,
+          "summary": "scripted: wrote the reference fix",
+          "error": "",
+          "cost_usd": 0.0
+        }
+      ]
+    },
+    {
+      "name": "wordfreq",
+      "setup_seconds": 3.4410625000018626,
+      "fork_seconds": 0.5055384160368703,
+      "attempts_seconds": 0.5164320839685388,
+      "resetup_seconds": null,
+      "winner": 2,
+      "attempts": [
+        {
+          "index": 0,
+          "passed": false,
+          "lines_changed": 0,
+          "steps": 3,
+          "stop": "gave up",
+          "seconds": 0.03246724995551631,
+          "summary": "scripted: gave up",
+          "error": "",
+          "cost_usd": 0.0
+        },
+        {
+          "index": 1,
+          "passed": true,
+          "lines_changed": 5,
+          "steps": 3,
+          "stop": "done",
+          "seconds": 0.5157185830175877,
+          "summary": "scripted: wrote the reference fix",
+          "error": "",
+          "cost_usd": 0.0
+        },
+        {
+          "index": 2,
+          "passed": true,
+          "lines_changed": 5,
+          "steps": 3,
+          "stop": "done",
+          "seconds": 0.3937705419957638,
+          "summary": "scripted: wrote the reference fix",
+          "error": "",
+          "cost_usd": 0.0
+        },
+        {
+          "index": 3,
+          "passed": false,
+          "lines_changed": 0,
+          "steps": 3,
+          "stop": "gave up",
+          "seconds": 0.05799445800948888,
+          "summary": "scripted: gave up",
+          "error": "",
+          "cost_usd": 0.0
+        },
+        {
+          "index": 4,
+          "passed": false,
+          "lines_changed": 0,
+          "steps": 3,
+          "stop": "gave up",
+          "seconds": 0.05754224996780977,
+          "summary": "scripted: gave up",
+          "error": "",
+          "cost_usd": 0.0
+        }
+      ]
+    }
+  ]
+}

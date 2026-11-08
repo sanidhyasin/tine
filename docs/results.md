@@ -13,6 +13,7 @@ Everything here is from one run of `bench/run.sh` per host. The raw results, a t
 - [Host settings](#host-settings)
 - [What breaks](#what-breaks)
 - [Nested virtualization against bare metal](#nested-virtualization-against-bare-metal)
+- [The demo: best-of-N](#the-demo-best-of-n)
 - [How it was measured](#how-it-was-measured)
 - [Rerunning it](#rerunning-it)
 
@@ -207,6 +208,29 @@ Diff snapshots pause a VM for a few ms on both hosts, so they're the fix for the
 **Limits.** Nested virtualization's limit of about 60 guest vCPUs isn't there: 550 children of one VM ran, with 180 GiB still available, and what stopped them was tined's own VM limit, which they should never have passed ([What breaks](#what-breaks), 9). Running 96 children out of memory failed as 24 did on the nested host. The host settings behaved as they did nested, with one exception: transparent huge pages made 1 GiB snapshots almost twice as slow (466 ms against 245), so `madvise` stays. KSM took 20 idle booted VMs from 109 to 41 MiB each.
 
 Every bare-metal chart is in [`2026-11-08-metal`](../bench/results/2026-11-08-metal/), and the comparisons in [`compare`](../bench/results/compare/).
+
+## The demo: best-of-N
+
+Step 5's [demo](../examples/best-of-n) is the use case in miniature: for each of ten small Python repositories with a bug, set one sandbox up from the `python` image (2 vCPUs, 1 GiB), fork it five times, let five agents try to fix the bug at once, run hidden tests in each fork, and keep the smallest passing fix. With a scripted stand-in for the model (`make demo DEMO_ARGS="--scripted --compare-setup"`), on the nested dev server, the pipeline's own times were:
+
+| Task | Set up | Fork into 5 | Attempts and checks |
+|---|---|---|---|
+| bisect | 1.3 s | 0.46 s | 0.5 s |
+| businessdays | 1.9 s | 0.56 s | 0.5 s |
+| csvline | 3.1 s | 0.55 s | 0.4 s |
+| intervals | 3.1 s | 0.49 s | 0.5 s |
+| lru | 4.7 s | 0.55 s | 0.6 s |
+| matrix | 3.8 s | 0.49 s | 0.5 s |
+| roman | 3.1 s | **21.7 s** | 0.7 s |
+| semver | 1.0 s | 0.48 s | 0.5 s |
+| tokenbucket | 3.3 s | 0.58 s | 0.7 s |
+| wordfreq | 3.4 s | 0.51 s | 0.5 s |
+
+- **Forking the set-up sandbox into five took about half a second**, where setting it up took 1 to 5 s for these tiny repositories. For `bisect`, setting it up once and forking took 1.8 s, and setting up five sandboxes instead, at once, 4.9 s. A real repository, with dependencies to install, takes minutes to set up, and the fork still takes half a second.
+- **One fork took 21.7 s.** The tasks run one after another, a few seconds each, so ten 1 GiB sandboxes were forked within a minute, each fork writing 1.3 GiB of memory to the EBS volume. Those writes overlapped, and each took 23 to 31 s to reach the disk. By `roman`'s fork, what was waiting to be written was past the kernel's dirty-page limits, and its children's agents didn't answer until the earlier snapshots had reached the disk, 21 s later. A local NVMe disk, or fewer forks of big VMs at once, avoids it; it's in the [known limits](architecture.md#known-limits).
+- The whole run, 50 attempts, took 77 s. Its report is in [`examples/best-of-n/results`](../examples/best-of-n/results/2026-11-08-scripted.json).
+
+The scripted stand-in writes the reference fix in two attempts out of three, so its success rates (58% for one attempt, 100% for the best of five) only check the pipeline. **The comparison the demo is for, how many bugs one Claude attempt fixes against the best of five, needs a run with the model** (`make demo`), which isn't in this version.
 
 ## How it was measured
 
