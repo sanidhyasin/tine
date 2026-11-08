@@ -1,8 +1,8 @@
 # tine architecture
 
-This is how tine works as of **v0.4.0**, the end of step 4: one service on a Linux server that creates microVMs, runs commands in them, snapshots them, rolls them back, starts new ones from pre-booted templates in about a twentieth of a second, **forks running VMs into many copies that share their memory**, and destroys them, safely and without leaking anything. Step 4 added the other ways to do it, to measure them side by side: diff snapshots, and page servers that load a VM's memory on demand or in advance. How they compare, and what breaks, is in [results.md](results.md).
+This is how tine works as of **v0.5.0**, the end of step 5: one service on a Linux server that creates microVMs, runs commands in them, copies files in and out, snapshots them, rolls them back, starts new ones from pre-booted templates in about a twentieth of a second, **forks running VMs into many copies that share their memory**, and destroys them, safely and without leaking anything. Step 4 added the other ways to do it, to measure them side by side: diff snapshots, and page servers that load a VM's memory on demand or in advance. How they compare, and what breaks, is in [results.md](results.md). Step 5 made it usable from anywhere: images built from Dockerfiles, files in and out, the CLI and a Python SDK that reach tined over SSH, and a demo of what forking is for.
 
-Each section starts in plain words and then gives the detail. The *why* of the project is in [BRIEF.md](../BRIEF.md), and the step-by-step plan, including what comes after v0.4.0, is in [PLAN.md](PLAN.md).
+Each section starts in plain words and then gives the detail. The *why* of the project is in [BRIEF.md](../BRIEF.md), and the step-by-step plan is in [PLAN.md](PLAN.md). The API, endpoint by endpoint, is in [api.md](api.md), and running tined on a host in [operations.md](operations.md).
 
 ## Contents
 
@@ -15,6 +15,7 @@ Each section starts in plain words and then gives the detail. The *why* of the p
 - [Networking](#networking)
 - [Talking to the guest: vsock and tine-agent](#talking-to-the-guest-vsock-and-tine-agent)
 - [Images and disks](#images-and-disks)
+- [Using tine from another machine](#using-tine-from-another-machine)
 - [State, restarts and recovery](#state-restarts-and-recovery)
 - [The API](#the-api)
 - [Observability](#observability)
@@ -28,11 +29,11 @@ Each section starts in plain words and then gives the detail. The *why* of the p
 **In plain words:** a program called `tined` runs on the server and owns every VM. You ask it for things with the `tine` command. For each VM, tined builds a locked box (its own files, its own user, its own slice of CPU and memory, its own network) and starts Firecracker inside it. Firecracker runs the guest: a real Linux kernel on virtual hardware. Inside every guest, a small program called `tine-agent` runs commands for tined. tined talks to it over vsock, a direct pipe between host and guest, so no SSH or guest network is involved. tined can also freeze a VM and save it as a snapshot, then start new VMs from it, or put the VM back to it.
 
 ```
- you
-  │  tine create / exec / snapshot / rollback / fork / ls / destroy
+ you, or a program with the Python SDK
+  │  tine create / exec / cp / snapshot / rollback / fork / ls / top / destroy
   ▼
  tine (CLI) ──── HTTP over /run/tine/tine.sock ────┐
-                                                   ▼
+   (on the server, or anywhere: --host ssh://…)    ▼
 ┌─────────────────────────────── tined ─────────────────────────────────────┐
 │ api      HTTP routes, errors, request IDs, /metrics                       │
 │ vm       create: boot or restore (with undo) · snapshot, full or diff ·   │
@@ -67,9 +68,9 @@ The binaries, all Go, built on the Mac (or in CI) for linux/amd64 and run on the
 
 | Binary | What it is |
 |---|---|
-| `cmd/tined` | The service. `tined serve` runs under systemd; `tined image import` builds images. |
-| `cmd/tine` | The CLI: `create`, `ls` (and `ls --tree`), `inspect`, `exec`, `snapshot` (and `snapshot ls`, `inspect`, `rm`), `rollback`, `fork`, `destroy`, `images`, `image warm`, `version`. |
-| `cmd/tine-agent` | Runs inside every guest and serves `/health`, `/exec` and `/sync` over vsock. |
+| `cmd/tined` | The service. `tined serve` runs under systemd; `tined image import` and `tined image build` (from a Dockerfile) build images. |
+| `cmd/tine` | The CLI: `create`, `ls` (and `ls --tree`), `top`, `inspect`, `exec`, `cp`, `snapshot` (and `snapshot ls`, `inspect`, `rm`), `rollback`, `fork`, `destroy`, `images`, `image warm`, `version`. `--host ssh://…` uses tined on another machine. |
+| `cmd/tine-agent` | Runs inside every guest and serves `/health`, `/exec`, `/sync`, `/files` and `/archive` over vsock. |
 | `cmd/tine-uffd` | A page server: serves one VM's memory from a snapshot, page by page, through userfaultfd (see [Fork strategies and page servers](#fork-strategies-and-page-servers)). |
 | `cmd/tine-bench` | The benchmark harness: drives tined's API through every scenario of step 4 and writes a JSON line per run (see [results.md](results.md)). |
 | `cmd/tine-touch`, `cmd/tine-dirty` | Benchmark workloads, baked into the `bench` image: time each page a guest touches, and change a given amount of memory. |
@@ -94,6 +95,14 @@ The packages under `internal/`:
 | `idalloc` | Allocates network slots | none |
 | `metrics`, `logging` | Prometheus metrics; structured logs with request and VM IDs | none |
 | `testenv` | Helpers that find test artifacts and skip tests that can't run | none |
+
+Beyond the Go:
+
+| Path | What it is |
+|---|---|
+| `sdk/python` | The Python SDK, package `tine`: `Client`, `AsyncClient` and `Sandbox` (see [its README](../sdk/python/README.md)) |
+| `examples/best-of-n` | The demo: an agent fixing ten buggy repositories, five forked attempts at a time (see [its README](../examples/best-of-n/README.md)) |
+| `images/python` | The Dockerfile of the `python` image the demo runs in |
 
 `vm` is the one place that knows about everything. The packages below it each do one job and know nothing about VMs as a whole, so each can be tested on its own, most against fakes and all against the real thing on the server.
 
@@ -476,6 +485,16 @@ One implementation detail: Linux creates a tap device in the network namespace o
 
 This is how production sandboxes do it too, for example E2B's `envd`.
 
+### Files
+
+Since protocol version 3, the agent also moves files, so a program can put a repository into a VM and get results out without a shell trick:
+
+- `GET /files?path=` streams a file out, with its permissions in a header. `PUT /files?path=&mode=` writes one, whole: into a temporary file next to it, renamed into place, so a reader never sees half a file.
+- `PUT /archive?path=` unpacks a tar stream, gzipped or not, into a directory. Every entry must stay inside it: no absolute paths, no `..`, and nothing written through a symlink that an earlier entry, or the guest, put on the way. Hard links must point inside too.
+- One file or archive is at most 8 GiB.
+
+tined passes these through as `/v1/vms/{id}/files` and `/v1/vms/{id}/archive`, holding off snapshots of the VM while a transfer runs, as it does for commands. A VM whose image has an agent from before file transfers gets an `invalid_request` that says to import the image again. `tine cp` copies either way, a directory as an archive, and the SDK's `upload` and `read_file` are the same calls.
+
 ## Images and disks
 
 **In plain words:** an image is a kernel and a disk that VMs boot from. Every VM gets its own copy of the disk, but copying is nearly free: the filesystem shares the blocks until the VM changes one.
@@ -504,6 +523,10 @@ An import takes about 2.6 s. `image.json` records where every part came from, wi
 
 **Per-VM disks are reflinks.** `/srv/tine` is an XFS volume, where `FICLONE` copies a file by sharing its blocks. Copying a 2 GB disk took 2,725 ms normally and 5 ms as a reflink, using no extra space. `storage.Clone` never falls back to a real copy: on a filesystem without reflinks it fails, rather than quietly making creates seconds slower. The kernel is read-only, so it's hard-linked instead.
 
+### Images from Dockerfiles
+
+`tined image build NAME -f Dockerfile` makes an image from a Dockerfile instead: Docker builds it (with `--network host`, as tine's hosts keep Docker off the firewall), its filesystem is exported as a tar stream, and from there it's the same as an import: tine-agent installed, the disk packed, `image.json` written, and a template warmed. The Dockerfile must give the guest systemd as its init, since tine-agent is a systemd service: [`images/python`](../images/python/Dockerfile) is Ubuntu 24.04 with systemd, Python 3, pip, pytest and git, and `make python-image` builds it on the dev server. Docker is only needed to build images; `scripts/host-setup.sh` installs it with its own iptables and bridge turned off, so it leaves tine's nftables rules alone.
+
 ### Files on the server
 
 ```
@@ -516,6 +539,16 @@ An import takes about 2.6 s. `image.json` records where every part came from, wi
 /var/lib/tine/tine.db                    SQLite state
 /run/tine/tine.sock                      the API socket (root:tine, 0660)
 ```
+
+## Using tine from another machine
+
+**In plain words:** tined only listens on a Unix socket on its server. To use it from a laptop, tine borrows SSH: the same keys, the same config, no open port and no new kind of password.
+
+- `tine --host ssh://user@server …` (or `TINE_HOST`) runs `ssh user@server tine dial-stdio` and speaks HTTP over that SSH session's stdin and stdout, which `tine dial-stdio` connects to tined's socket. It's the trick Docker uses for its `ssh://` hosts. `TINE_SSH` replaces the `ssh` command, for an SSH config of its own; `./scripts/dev-server.sh ssh-config` writes one for the dev server.
+- The Python SDK does the same with an SSH tunnel: `Client(host="ssh://user@server")` forwards a local Unix socket to tined's for as long as the client is open, so every request is ordinary HTTP over it.
+- Access is the server's: you need an SSH login there in the `tine` group.
+
+The SDK is a thin layer over the API, sync (`Client`, `Sandbox`) and async (`AsyncClient`, `AsyncSandbox`): create, exec (streamed, or collected into a result), files, snapshot, rollback, fork and destroy. A sandbox is a context manager that destroys its VM, and its forks, at the end, and API errors become exceptions with the API's codes. [Its README](../sdk/python/README.md) has the details.
 
 ## State, restarts and recovery
 
@@ -558,6 +591,8 @@ It logs a one-line report, for example `kept 1; cleaned 1; orphans removed 2; er
 | `GET /v1/vms` | List VMs (`?all=true` includes destroyed ones, `?memory=true` adds each one's RSS and PSS) |
 | `GET /v1/vms/{id}` | One VM, with its timings, lineage and memory |
 | `POST /v1/vms/{id}/exec` | Run a command; the response streams NDJSON frames |
+| `GET /v1/vms/{id}/files?path=`, `PUT /v1/vms/{id}/files?path=&mode=` | Read a file out of a VM; write one into it |
+| `PUT /v1/vms/{id}/archive?path=` | Unpack a tar stream into a directory in the VM |
 | `DELETE /v1/vms/{id}` | Destroy a VM (idempotent) |
 | `POST /v1/vms/{id}/snapshots` | Snapshot a running VM |
 | `GET /v1/vms/{id}/snapshots` | A VM's snapshots |
@@ -643,6 +678,8 @@ Optional behaviours, each off by default, are flags on `tined serve`, and `GET /
 | End to end | `make e2e` | Dev server, real tined under systemd | Black-box through the API (list below), ending in a strict leak check |
 | Measure | `make measure` | Dev server | Quick numbers for each feature |
 | Benchmark | `make bench-all` (`bench/run.sh` on any KVM host) | Dev server, or a bare-metal host | Every scenario of step 4: see [results.md](results.md) |
+| Python SDK | `uv run --group dev pytest` in `sdk/python` (also CI) | Mac, CI | The clients and sandboxes against a fake tined: creates, streamed execs, files, forks, errors, and that a sandbox's forks go with it |
+| Demo | `uv run --with pytest python check_tasks.py` in `examples/best-of-n`; `make demo DEMO_ARGS=--scripted` | Mac; Mac against the dev server | Each task's visible tests fail and its fix passes the hidden ones; then the whole demo, with a scripted stand-in for the model |
 
 The e2e suite:
 
@@ -662,6 +699,8 @@ The e2e suite:
 - a fork too big for the host is refused, with no snapshot taken
 - forking until admission control refuses, then checking nothing crashed
 - a VM with a 60 s time to live, which must be reaped while the rest run
+- files into and out of a VM: a script written in runs, and reads back byte for byte with its permissions; 5 MiB both ways; a gzipped tar unpacked into a directory; a missing file and a relative path refused (the agent's unit tests refuse archives that try to leave their directory)
+- `tine dial-stdio` carrying the API, as `--host ssh://` uses it
 
 At the end, the leak check requires zero live VMs, network namespaces, veths, jails, cgroups and Firecracker processes, and no snapshots but ready templates, with the store holding exactly the snapshots tined has records of. The suite takes about 3 minutes.
 
@@ -736,6 +775,9 @@ These are known and deliberate for v0.4.0. Most are what the next steps are for.
 - **Snapshots stay on the host that took them**, and only restore there while the Firecracker version and host kernel stay the same. Templates are warmed again by themselves after an upgrade; VMs' own snapshots can't be.
 - **A snapshot's size counts its disk copy in full**, although the copy shares most of its blocks with the image.
 - **One host only.** Forks share memory and disk with their parent, which only works on one machine.
+- **Many big snapshots at once wait for a slow disk.** Each fork writes its parent's memory, and on the dev server's EBS volume a 1 GiB snapshot takes about 8 s to reach the disk. The demo forks ten 1 GiB sandboxes within a minute, and once their snapshots were more than the kernel's dirty-page limits allow, one fork's children waited 21 s for their agents, until the others' writes were done. A local NVMe disk, or fewer, smaller forks at once, avoids it.
+- **Files move whole.** A file or archive is at most 8 GiB, sent in one request, and a transfer holds off snapshots of its VM until it's done.
+- **`tined image build` needs Docker** on the host, and an image whose init is systemd.
 - **A VM that dies after a tined restart isn't noticed straight away.** tined watches the Firecracker processes it started. One started by an earlier tined is only checked at the next restart, or when something touches it: an exec then fails, and a destroy cleans it up. A periodic liveness check would close this.
 - **No IPv6 for VMs**, and outbound traffic is otherwise unrestricted (no egress allow-list or rate limits yet).
 - **Access is all or nothing.** Anyone in the `tine` group can create, use and destroy every VM. There are no per-user quotas or ownership.
