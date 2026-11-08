@@ -120,7 +120,7 @@ The store enforces this table, not the callers. Every change is recorded in `vm_
 
 | Stage | What happens | p50 |
 |---|---|---|
-| allocate | Check the image and the VM limit. Pick an ID (`vm-` plus 10 base32 characters), a network slot and a uid. Record the VM as `creating`. | 0.32 ms |
+| allocate | Check the image, and admission control's rules. Pick an ID (`vm-` plus 10 base32 characters), a network slot and a uid. Record the VM as `creating`. | 0.32 ms |
 | network | Create the namespace `tine-<id>` with `tap0`, the veth pair, routes, NAT and firewall rules. | 5.2 ms |
 | jail | Create the chroot, hard-link the kernel, and reflink-copy the 4 GiB disk. | 0.32 ms |
 | start | Run the jailer, which sets up the cgroup and namespace and becomes Firecracker. | 0.20 ms |
@@ -353,22 +353,23 @@ tined starts one page server per VM, once the VM's Firecracker is up:
 
 ### Admission control
 
-Before a create or a fork touches the host, three rules must hold for the VMs it would add:
+Before a create or a fork touches the host, four rules must hold for the VMs it would add:
 
 | Rule | Default | Why |
 |---|---|---|
 | All live VMs' guest memory, plus the new ones', within `--overcommit` × the host's memory | 4, so 62.8 GiB on the dev server | VMs rarely use all their memory, and forks share most of theirs, so committing more than the host has is the point. The ratio bounds the worst case, of every guest filling its memory. |
 | The host's available memory, less what the new VMs will use at first, above `--min-free-memory-mib` | 1 GiB, counting 192 MiB per boot and 64 MiB per restore (measured) | Keeps the host itself out of trouble now. |
 | All live VMs' vCPUs, plus the new ones', within `--cpu-overcommit` × the host's CPUs | 8, so 32 on the dev server | A host can only run so many guests, even idle ones (see below). |
+| All live VMs, plus the new ones, at most `--max-vms` | 512 | A bound on what one tined runs and tracks, whatever the host could hold. |
 
-Requests in flight hold a reservation, so concurrent ones can't take the last room together: six creates with room for three admit exactly three. A fork is admitted as a whole, before its parent is paused. A refusal is 503 `no_memory` or `no_cpu`, saying which rule and with what numbers:
+Requests in flight hold a reservation, so concurrent ones can't take the last room together: six creates with room for three admit exactly three. A fork is admitted as a whole, before its parent is paused. A refusal is 503 `no_memory`, `no_cpu` or, for the VM count, `capacity`, saying which rule and with what numbers:
 
 ```
 not enough memory: 100 more VMs of 1024 MiB would commit 103424 MiB of guest memory, more than the
 limit of 62804 MiB (4.0 times the host's 15701 MiB); the VMs there now commit 1024 MiB
 ```
 
-**Density.** The density test forks a 1-vCPU, 256 MiB VM until even one more child is refused, and checks nothing broke. On the dev server, the vCPU rule refuses after 30 children. The 30 children use 946 MiB of PSS between them, with 14 GiB of host memory still available. So here the CPUs limit density, not the memory, for a reason that's the dev server's: under EC2's nested virtualization, KVM starts failing to enter guests (`KVM_EXIT_FAIL_ENTRY`, VMX error 7) once about 60 1-vCPU VMs, or 20 2-vCPU ones, are running, whether booted or restored. The vCPU limit keeps the host below that. Forks of 50 and 100 children, and the real limit on memory, are for the bare-metal host of step 4.
+**Density.** The density test forks a 1-vCPU, 256 MiB VM until even one more child is refused, and checks nothing broke. On the dev server, the vCPU rule refuses after 30 children. The 30 children use 946 MiB of PSS between them, with 14 GiB of host memory still available. So here the CPUs limit density, not the memory, for a reason that's the dev server's: under EC2's nested virtualization, KVM starts failing to enter guests (`KVM_EXIT_FAIL_ENTRY`, VMX error 7) once about 60 1-vCPU VMs, or 20 2-vCPU ones, are running, whether booted or restored. The vCPU limit keeps the host below that. Bare metal has no such limit: there the density test forked 550 children, at 9 MiB of PSS each with 180 GiB still available, and showed the VM limit wasn't one yet (see the bugs [below](#testing)). With that fixed, `--max-vms` is what stops a big host.
 
 ## Isolation: what keeps a VM in
 
@@ -583,7 +584,7 @@ Unknown JSON fields are rejected, so a typo like `"cpus"` fails loudly instead o
 | 409 | `busy` | A snapshot or rollback while commands run in the VM |
 | 409 | `in_use` | Deleting a snapshot that VMs run from |
 | 409 | `incompatible` | A snapshot taken with another Firecracker, CPU or host kernel |
-| 503 | `capacity` | The VM limit (64 by default), every network slot, or a VM's 16 snapshots are taken |
+| 503 | `capacity` | The VM limit (`--max-vms`, 512 by default), every network slot, or a VM's 16 snapshots are taken |
 | 503 | `no_memory`, `no_cpu` | Admission control: the host hasn't room for the VMs asked for |
 | 507 | `no_space` | A snapshot wouldn't leave 2 GiB of disk free |
 | 500 | `internal` | Anything else; tined logs it with the request ID |
@@ -676,6 +677,8 @@ Bugs these tests caught before release:
 - **Guests failed beyond about 60.** EC2's nested virtualization starts refusing guest entries. Found by the density test; admission control now limits vCPUs.
 - **The first fork after a reboot paused its parent for 12 s.** The snapshot read the template's memory from disk. tined now reads templates into the page cache when it starts.
 - **A restart couldn't resume a VM whose snapshot it had interrupted.** Firecracker was still writing 4 GiB of memory and didn't answer for 20 s. Found by the kill-mid-snapshot e2e test; reconcile now resumes it in the background.
+- **Forks went past the VM limit.** Each child of a fork checked the count of VMs for itself, before any of them had a record, so 551 VMs ran under a limit of 512. Found by the density test on bare metal. The count is now an admission rule, reserved under the same lock as memory and vCPUs.
+- **A refused create kept its network slot.** It took the slot before admission control refused it, and never gave it back. Found while fixing the VM limit; a create now takes a slot only once it's admitted.
 
 ## Measured numbers
 
@@ -695,6 +698,8 @@ Step 4's benchmarks, every way of giving a VM its memory side by side, the host 
 | Exec `true` through the API (n=200) | **1.9 ms**; about 1 ms of it inside the guest |
 | A fork child's first write to a page it shares | 62 µs; 1.1 µs per 4 KiB page with 2 MiB huge pages |
 | Most idle children of one 256 MiB VM | **31**, set by the vCPU limit, with 14.4 GiB still available |
+
+On bare metal, a c5d.metal with 96 CPUs and an older CPU, the guest's own work is several times faster and copying memory slower: cold boots take 803 ms, a fork of 100 children 998 ms, and a 1 GiB snapshot pauses its VM 245 ms. [results.md](results.md#nested-virtualization-against-bare-metal) compares the two.
 
 Measured earlier, with `make measure` and `make e2e`:
 
@@ -719,13 +724,13 @@ The dev server's limits are its own. Its disk is a network volume, at about 150 
 
 These are known and deliberate for v0.4.0. Most are what the next steps are for.
 
-- **Snapshots of one VM wait for the disk.** Back-to-back snapshots, or forks, of one VM wait about 8 s per GiB for the last one to reach the disk, and 2 s more. The VM runs meanwhile; diff snapshots shorten the pause, not this wait.
+- **Snapshots of one VM wait for the disk.** Back-to-back snapshots, or forks, of one VM wait for the last one to reach the disk, and 2 s more: about 8 s per GiB on the dev server's EBS volume, and 1 s per GiB on local NVMe. The VM runs meanwhile; diff snapshots shorten the pause, not this wait.
 - **Diff snapshots and page servers are opt-in.** Firecracker calls diff snapshots a developer preview, so they're behind `--diff-snapshots`. A VM from before tined restarted gets a full snapshot first, as tined can't know since when its pages are tracked.
 - **Page-server VMs don't share memory.** Each VM restored through a page server has its own copy of every page it touched, where `share` maps the page cache. It needs its page server for as long as it runs: if the page server dies, the guest hangs at its next untouched page.
 - **A working set is recorded once.** A snapshot's working set is what its first restore through a page server touched by the time it was synced. It isn't refreshed, and a restore that then does something else gets those pages on demand.
 - **`--ksm` relies on Linux 6.7 or later**, where a process's mergeable setting survives exec, and on KSM running (`/sys/kernel/mm/ksm/run`).
 - **A fork's shared memory counts against its parent's cgroup.** The parent wrote the fork's memory file, so the kernel charges its pages to the parent. The parent has room for one fork's worth, so forking it again while the first fork's children run makes the kernel reclaim pages they share, which pauses the parent for longer (1.4 s seen for 256 MiB).
-- **Density on the dev server is set by nested virtualization.** About 60 guest vCPUs are the most it runs before KVM fails, so tine's vCPU limit stops at 32. Memory would allow far more children. Forks of 50 and 100 children wait for bare metal.
+- **Density is set by limits, not measured room.** On the nested dev server, about 60 guest vCPUs are the most it runs before KVM fails, so tine's vCPU limit stops at 32. On bare metal, the VM limit (`--max-vms`, 512) stops it long before memory would: 550 idle children used 5 GiB of a 188 GiB host.
 - **A template is for one size.** A create of another size boots, unless that size is warmed too (`tine image warm --vcpus N --memory M`), and only `--warm-images` at the default size are kept warm by themselves.
 - **Restores and forks share what programs and the kernel worked out before the snapshot**, such as cached random numbers, the kernel's `boot_id` and its TCP secrets, and they lose open connections. `/sync` covers the clock, the kernel's randomness, the hostname and the machine ID.
 - **Snapshots stay on the host that took them**, and only restore there while the Firecracker version and host kernel stay the same. Templates are warmed again by themselves after an upgrade; VMs' own snapshots can't be.

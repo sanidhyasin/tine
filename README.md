@@ -25,6 +25,8 @@ Measured on the dev server (an m8i.xlarge, through nested virtualization; [resul
 | Roll a VM back to a snapshot | 66 ms |
 | Run `true` in a VM, through the API | 1.9 ms |
 
+On bare metal (a c5d.metal), a cold boot takes 803 ms and a fork into 100 running copies 998 ms, at 12 MiB each.
+
 The full design and the known limits are in [docs/architecture.md](docs/architecture.md); every benchmark, and what breaks, in [docs/results.md](docs/results.md).
 
 ## Layout

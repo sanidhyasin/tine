@@ -22,7 +22,9 @@ The *why* behind the project is in [BRIEF.md](../BRIEF.md). This file is the *ho
 
 ## Where we are
 
-**Step 3 is done, released as v0.3.0.** tined forks a running VM into many children that share its memory. 10 children of a 256 MiB VM take 397 ms, with the parent paused 62 ms, and each idle child costs 14 MiB of PSS. Admission control refuses what the host can't take. How it all works is in [architecture.md](architecture.md). Next is step 4, measuring and optimizing on bare metal, starting with task 4.1.
+**Step 4 is done, released as v0.4.0.** Every way of giving a VM its memory is measured side by side, on the nested dev server and on bare metal, with what breaks and why: [results.md](results.md). Forks can share the page cache, copy it, or go through a page server with prefetch; diff snapshots pause a VM for 4 to 9 ms at any size; and KSM, the balloon and huge pages are flags. On bare metal, a 256 MiB VM forks into 100 in 998 ms, at 12 MiB per idle child. Next is step 5: the Python SDK, the demo and the writeup.
+
+Step 3 (v0.3.0) forked a running VM into many children that share its memory: 10 children of a 256 MiB VM in 397 ms, each idle child costing 14 MiB.
 
 Step 2 (v0.2.0) added snapshots, rollback, and templates that start new VMs in 111 ms instead of booting them in 1.84 s.
 
@@ -613,14 +615,14 @@ Every cliff gets a chart and an explanation.
 - [x] **4.7 Working-set prefetch:** record on first restore, prefetch afterwards. Try huge pages. *`--strategy uffd-prefetch` restores a snapshot's first child alone, recording the pages it touches until it's synced, and copies those into later restores before they run. It's the fastest create from a template (41 ms) and forks 10 in 462 ms. `--page-server-huge-pages 2M` backs page-server guests with 2 MiB pages: forks of 10 in 345 ms, the fastest of all, and a child's first write costs 1.1 µs per 4 KiB page instead of 47 to 62 µs, at the cost of a reserved pool and 2 MiB per page touched.*
 - [x] **4.8 Tuning experiments:** transparent huge pages, KSM, balloon. *KSM (`--ksm`) took 20 idle booted VMs from 109 to 42 MiB each, fork children from 17 to 11 MiB and page-server children from 21 to 7 MiB. The balloon with free page reporting (`--balloon`) saved nothing measurable for idle guests, which haven't freed much. THP `always` made cold boots 11% faster but booted VMs 9% bigger and snapshots 20% slower, so the host stays at `madvise`.*
 - [x] **4.9 "What breaks" runs:** push each limit and document every cliff. *24 children of a 2 GiB VM changing more memory each round ran until each had changed 640 MiB, when the kernel's OOM killer killed 2 to 5 of them per run; tined marked them failed and the rest ran on. Dropping the page cache under children reading their parent's memory didn't evict it, so that cliff isn't shown yet. The others: big snapshots past the dirty-page limits, back-to-back snapshots, parents forked too early, copies past the page cache, and nested virtualization's guest limit. Each is in [results.md](results.md#what-breaks).*
-- [ ] **4.10 Bare-metal run:** full suite, compared with nested.
-- [ ] **4.11 Results and release:** `docs/results.md` with every chart and the method, reproducible with one command. Tag `v0.4.0`.
+- [x] **4.10 Bare-metal run:** full suite, compared with nested. *On a c5d.metal (96 CPUs, 192 GiB, local NVMe; $4.75 an hour, about $20 in all), with forks of up to 100 children and the pressure run on 96. Guests boot, run and fault much faster without the nested layer (a cold boot 803 ms, a child's first write 7.7 µs instead of 62); the older CPU copies memory more slowly (a 1 GiB snapshot pauses 245 ms instead of 157). The density test went past tined's VM limit, to 551 VMs under 512: each fork child had checked the count for itself. The count is now an admission rule, and a refused create no longer keeps its network slot.*
+- [x] **4.11 Results and release:** `docs/results.md` with every chart and the method, reproducible with one command. Tag `v0.4.0`. *`bench/run.sh` reruns it all on a KVM host, and `make bench-all` from a Mac.*
 
 ### Done when
 
-- [ ] Every rung is measured the same way, on nested and on bare metal.
-- [ ] `docs/results.md` explains where the time goes at each rung, and what breaks and why.
-- [ ] Anyone with a KVM machine can rerun it with one command.
+- [x] Every rung is measured the same way, on nested and on bare metal.
+- [x] `docs/results.md` explains where the time goes at each rung, and what breaks and why.
+- [x] Anyone with a KVM machine can rerun it with one command.
 
 ---
 

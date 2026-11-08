@@ -22,32 +22,32 @@ Everything here is from one run of `bench/run.sh` per host. The raw results, a t
 |---|---|---|
 | Instance | AWS m8i.xlarge, ap-south-1 | AWS c5d.metal, ap-south-1 |
 | Virtualization | Firecracker's guests run through **nested virtualization** (KVM inside an EC2 VM) | KVM on the machine itself |
-| CPU | Intel Xeon 6975P-C, 4 vCPUs | Intel Xeon Platinum 8275CL, 96 vCPUs |
+| CPU | Intel Xeon 6975P-C (Granite Rapids, 2025), 4 vCPUs | Intel Xeon Platinum 8275CL (Cascade Lake, 2019), 96 vCPUs |
 | Memory | 16 GiB | 192 GiB |
 | `/srv/tine` | EBS gp3 volume (about 150 MB/s of writes) | Local NVMe SSD |
-| Results | [`2026-11-08-nested`](../bench/results/2026-11-08-nested/) | Next |
+| Results | [`2026-11-08-nested`](../bench/results/2026-11-08-nested/) | [`2026-11-08-metal`](../bench/results/2026-11-08-metal/) |
 
 Both ran Firecracker v1.17.0, the guest kernel 6.18.56 and the Ubuntu 24.04 base image, on Ubuntu 24.04's AWS kernel, with `vm.dirty_ratio` at 60 and transparent huge pages at `madvise`. Unless a part says otherwise, a fork's parent has 1 vCPU and 256 MiB, and a create 2 vCPUs and 1 GiB.
 
-The numbers below are from the nested host unless they say bare metal: it's the dev server, where most of the work happened, and every number on it was measured. The bare-metal run compares them in [its own section](#nested-virtualization-against-bare-metal).
+The sections below are about the nested host unless they say bare metal: it's the dev server, where most of the work happened. The bare-metal run is compared with it in [its own section](#nested-virtualization-against-bare-metal); the two hosts differ in more than the nesting, as that section explains.
 
 ## The short version
 
-| What | p50 |
-|---|---|
-| Create a VM from a template (`share`) | **57 ms**; 41 ms through a page server with prefetch |
-| Cold-boot a VM | 1.83 s |
-| Fork a running VM into 10 | **398 ms**, the parent paused 64 ms |
-| Fork into 30 | 1.02 s, the parent paused 65 ms |
-| Boot 10 or 30 fresh VMs instead | 7.5 s, 21.3 s |
-| Snapshot a running VM: pause for 256 MiB, 1 GiB, 4 GiB | 48 ms, 157 ms, 601 ms |
-| The same with diff snapshots, little changed | **4.2 ms, 4.0 ms, 6.1 ms** |
-| Roll back to a snapshot | 66 ms |
-| Run `true` in a VM through the API | 1.9 ms |
-| An idle fork child's host memory, one of 30 (PSS) | **14 MiB**, against 109 MiB for a booted VM |
-| A child's first write to a page it shares with its parent | 62 µs (nested); 1.1 µs per 4 KiB page with 2 MiB huge pages |
+| What (p50) | Nested | Bare metal |
+|---|---|---|
+| Create a VM from a template (`share`) | **57 ms**; 41 ms through a page server with prefetch | **47 ms**; 46 ms |
+| Cold-boot a VM | 1.83 s | 803 ms |
+| Fork a running VM into 10 | **398 ms**, the parent paused 64 ms | **226 ms**, paused 106 ms |
+| Fork into 30, 100 | 1.02 s; 100 don't fit (31 at most) | 374 ms, **998 ms** |
+| Boot that many fresh VMs instead: 10, 30, 100 | 7.5 s, 21.3 s | 1.08 s, 1.51 s, 4.02 s |
+| Snapshot a running VM: pause for 256 MiB, 1 GiB, 4 GiB | 48 ms, 157 ms, 601 ms | 83 ms, 245 ms, 900 ms |
+| The same with diff snapshots, little changed | **4.2 ms, 4.0 ms, 6.1 ms** | **4.5 ms, 5.2 ms, 9.0 ms** |
+| Roll back to a snapshot | 66 ms | 48 ms |
+| Run `true` in a VM through the API | 1.9 ms | 1.0 ms |
+| An idle fork child's host memory (PSS), one of 30 | **14 MiB**, against 109 MiB for a booted VM | **14 MiB**, 12 MiB of 100; 109 MiB booted |
+| A child's first write to a page it shares with its parent | 62 µs; 1.1 µs per 4 KiB page with 2 MiB huge pages | 7.7 µs; 1.4 to 1.6 µs |
 
-Forking is about 20 times faster than booting the same number of VMs, and an idle child costs an eighth of a booted VM. Snapshots pause a VM in proportion to its memory, unless diff snapshots save only what changed. The slowest thing left is a child's first write to each page of shared memory, and that's mostly nested virtualization's cost.
+Forking is about 20 times faster than booting the same number of VMs on the nested host, and 4 to 5 times on bare metal, where a boot is cheaper and 96 CPUs boot many at once. On both, an idle child costs an eighth of a booted VM, or less. Snapshots pause a VM in proportion to its memory, unless diff snapshots save only what changed. A child's first write to each page of shared memory costs 62 µs nested and 7.7 µs on bare metal, so most of that is nested virtualization's cost.
 
 ## The ladder
 
@@ -132,6 +132,7 @@ RSS counts every page a process has mapped; PSS divides shared pages between the
 - A **share** child maps about 105 MiB of its parent's memory, but shares it: with 10 children its PSS is 20 MiB, with 30 it's 14 MiB. Most of what's left is the page tables and Firecracker itself.
 - A **uffd** child has only what it touched, 20 MiB, all of it its own, so more children don't make it cheaper.
 - The most children on the nested host was **31** of one 256 MiB VM, with 14.4 GiB still available: admission control's vCPU limit stopped it, at 8 vCPUs per host CPU, set to keep the host below the ~60 guest vCPUs where EC2's nested virtualization fails.
+- On bare metal it was **550**, at 8.9 MiB of PSS each, with 180 GiB still available. tined's limit of 512 VMs should have stopped it at 511, and didn't ([below](#what-breaks)): memory would have allowed thousands more.
 
 ## Host settings
 
@@ -155,11 +156,13 @@ Pushing each limit until something failed, and what it took:
 
    Admission control let all 24 in: it counts what VMs use now (the children shared almost everything), and allows guests to promise up to four times the host's memory (`--overcommit`). At 512 MiB each, 12 GiB in all, the host had 2 GiB left and everything still ran. At 640 MiB, the kernel reclaimed until nothing was left, a round took 6 to 16 s instead of 4, and its OOM killer killed whole VMs: 2 to 5 of the 24 in each of the four runs. tined saw their Firecrackers die and marked them failed; the others kept running. The limit is the overcommit setting: children that will really change their memory need it lower, or KSM.
 
-2. **Nested virtualization's guest limit.** Past about 60 guest vCPUs, EC2's nested virtualization refuses to enter more guests (found in step 3), so tine's vCPU limit stops the nested host at 32, and 31 children. Bare metal doesn't have it.
+   Bare metal did the same at four times the scale. 96 children of a 2.5 GiB VM each changed up to 1,792 MiB, 168 GiB in all, with 10 GiB left and every round under a second. At 1,920 MiB the OOM killer killed 1 to 3 of the 96 in each run, and tined marked them failed. It's the host's memory running out, not an artifact of nested virtualization.
 
-3. **The page cache under pressure.** If memory pressure pushes a fork's memory file out of the page cache, its children read their parent's memory from the disk. `fork-evict` drops the page cache before children read 128 MiB they share, but the reads stayed fast: 146 ns a page against 137 ns with nothing dropped (`share`), 205 against 190 ns (`uffd`). At 4 KiB per page, that's far faster than the EBS volume can read, so dropping the cache didn't evict those pages, and this run doesn't show the cliff. A check afterwards showed why: of a fork's 256 MiB memory file, 102 MiB stayed in the page cache after `drop_caches`, which can't drop pages a process has mapped, and each child maps about 100 MiB of its parent's memory as it restores (its RSS). Real eviction needs real memory pressure, which reclaims mapped pages too; the pressure run above ran out of memory before it showed.
+2. **Nested virtualization's guest limit.** Past about 60 guest vCPUs, EC2's nested virtualization refuses to enter more guests (found in step 3), so tine's vCPU limit stops the nested host at 32, and 31 children. Bare metal doesn't have it: 551 VMs ran there at once.
 
-4. **Snapshots of big VMs.** A 4 GiB snapshot is 4 GiB of new dirty pages at once. Past the kernel's dirty limits it's written at the disk's speed, and the VM stays paused: 22 s with the default `vm.dirty_ratio` of 20, 4.2 s at the p99 with 60. Diff snapshots avoid it for VMs that change little.
+3. **The page cache under pressure.** If memory pressure pushes a fork's memory file out of the page cache, its children read their parent's memory from the disk. `fork-evict` drops the page cache before children read 128 MiB they share, but the reads stayed fast: 146 ns a page against 137 ns with nothing dropped (`share`), 205 against 190 ns (`uffd`). At 4 KiB per page, that's far faster than the EBS volume can read, so dropping the cache didn't evict those pages, and this run doesn't show the cliff. A check afterwards showed why: of a fork's 256 MiB memory file, 102 MiB stayed in the page cache after `drop_caches`, which can't drop pages a process has mapped, and each child maps about 100 MiB of its parent's memory as it restores (its RSS). Real eviction needs real memory pressure, which reclaims mapped pages too; the pressure run above ran out of memory before it showed. Bare metal showed the same: 83 ns a page after the drop against 110 without it (`share`).
+
+4. **Snapshots of big VMs.** A 4 GiB snapshot is 4 GiB of new dirty pages at once. Past the kernel's dirty limits it's written at the disk's speed, and the VM stays paused: 22 s with the default `vm.dirty_ratio` of 20, 4.2 s at the p99 with 60. Diff snapshots avoid it for VMs that change little. On bare metal's local NVMe the same snapshot's p99 is 914 ms.
 
 5. **Back-to-back snapshots.** Right after a snapshot's memory reached the disk, the next snapshot of the same VM paused it for 0.3 to 1.3 s instead of 60 ms: the kernel was still throttling the VM's cgroup, which had just written gigabytes. tined now waits until 2 s after the last flush. That wait is why a fork right after a snapshot takes 3 s.
 
@@ -169,9 +172,41 @@ Pushing each limit until something failed, and what it took:
 
 8. **A guest changing all its memory.** A 256 MiB guest can't hold 256 MiB of new data next to its own kernel and programs: its own OOM killer killed the workload. That's the guest's limit, not the host's.
 
+9. **More VMs than the limit.** On bare metal, with memory and vCPUs far from their limits, the density test reached tined's own limit of 512 VMs, and went past it to 551. Each child of a fork checked the count for itself, before any of them had a record, so dozens saw room for one more at once. The count is now admission control's fourth rule, reserved under the same lock as memory and vCPUs, so a fork past it is refused as a whole, before its parent is paused. The same code had a smaller leak: a create refused for memory or vCPUs kept the network slot it had taken, so enough refusals (16,384) would have left no slots for anyone. It now takes a slot only once it's admitted. Both are fixed in v0.4.0, with tests that fail without the fixes.
+
 ## Nested virtualization against bare metal
 
-The bare-metal run, on a c5d.metal, is next.
+The same suite ran on a c5d.metal, with KVM on the machine itself, forks of up to 100 children and the pressure run on 96. Two things changed at once, though: the nested layer went away, and the CPU is six years older, a 2019 Cascade Lake against a 2025 Granite Rapids. One run can't fully separate the two, but what each host was faster at says which is which.
+
+![The same operations, on each host](../bench/results/compare/compare.png)
+
+- **Bare metal is faster wherever the guest runs or faults.** Under nested virtualization, a guest's exits and its faults on memory go through two hypervisors. Without that, a cold boot takes 803 ms instead of 1.83 s, an exec 1.0 ms instead of 1.9, and a restored guest wakes up and syncs in 8 ms instead of 38. A child's first write to a page it shares with its parent, a copy-on-write fault, costs 7.7 µs instead of 62, and through a page server 21 µs instead of 48.
+- **The older CPU is slower at copying memory.** A snapshot pauses the VM while the host copies its memory into the page cache: 245 ms for 1 GiB instead of 157, and 900 ms for 4 GiB instead of 601. A fork's parent pauses 106 ms instead of 64, `copy` copies a 1 GiB memory file in 361 ms instead of 270, and with 2 MiB huge pages, where a first write is mostly the copy, it costs 1.4 to 1.6 µs per 4 KiB page instead of 1.1. Restoring a snapshot, mapping its memory and setting up KVM, takes 30 ms instead of 12. That's why creating a VM from a template gains least: 47 ms against 57: the guest saves 30 ms, and the host loses 21, restoring and setting up the network.
+- **The local NVMe disk ends the long waits.** A VM's next snapshot waits until the last one reached the disk, and 2 s more: 2.8 s for 1 GiB instead of 9.2, and 6.5 s for 4 GiB instead of 33.
+
+![Forking: total time by number of children, on each host](../bench/results/compare/fork-latency.png)
+
+| Fork of a 256 MiB VM into, on bare metal | 1 | 10 | 30 | 100 | Child's PSS, 100 children |
+|---|---|---|---|---|---|
+| cold (booting that many) | 919 ms | 1.08 s | 1.51 s | 4.02 s | 109 MiB |
+| copy | 256 ms | 365 ms | 559 ms | 1.64 s | 95 MiB |
+| **share** | **168 ms** | **226 ms** | **374 ms** | **998 ms** | **12 MiB** |
+| diff | 168 ms | 228 ms | 386 ms | 1.03 s | 12 MiB |
+| uffd | 191 ms | 259 ms | 442 ms | 1.09 s | 20 MiB |
+| uffd-prefetch | 198 ms | 305 ms | 584 ms | 1.15 s | 20 MiB |
+
+- With 96 CPUs, children restore side by side: 100 take 1.0 s. `share` is still the fastest and the cheapest at every size.
+- Booting is cheap enough here that forking's lead in time shrinks, from 20 times to 4 or 5. Its lead in memory doesn't: a child costs 12 MiB, a booted VM 109.
+- `copy` has room: 100 copies are 25 GiB, which a 188 GiB host's page cache holds, so there's no cliff like the nested host's at 30.
+- `uffd-prefetch` is slower than `uffd` for forks here, the reverse of nested. Its first child restores alone, to record, before the others start; on bare metal, the faults that recording saves are cheap, and waiting for it isn't. It's still the faster way to create from a template (46 ms against 68), where the recording happens once.
+
+![How long a snapshot pauses a VM, on each host](../bench/results/compare/snapshot-paused.png)
+
+Diff snapshots pause a VM for a few ms on both hosts, so they're the fix for the older CPU's slower copies too. Changing a 1 GiB parent's memory before a fork shows the pause growing with what changed: 11 ms with nothing changed, 39 ms with 64 MiB and 104 ms with 256 MiB, against 250 to 270 ms for a full snapshot.
+
+**Limits.** Nested virtualization's limit of about 60 guest vCPUs isn't there: 550 children of one VM ran, with 180 GiB still available, and what stopped them was tined's own VM limit, which they should never have passed ([What breaks](#what-breaks), 9). Running 96 children out of memory failed as 24 did on the nested host. The host settings behaved as they did nested, with one exception: transparent huge pages made 1 GiB snapshots almost twice as slow (466 ms against 245), so `madvise` stays. KSM took 20 idle booted VMs from 109 to 41 MiB each.
+
+Every bare-metal chart is in [`2026-11-08-metal`](../bench/results/2026-11-08-metal/), and the comparisons in [`compare`](../bench/results/compare/).
 
 ## How it was measured
 
@@ -182,6 +217,7 @@ The bare-metal run, on a c5d.metal, is next.
 - **Copy-on-write, one child at a time.** `fork-touch` has four children, one after another, write every page their parent filled. All ten at once, on four CPUs, measured the CPUs being shared as much as the faults: 250 µs a page instead of 60.
 - **One thing at a time.** Each part of `bench/run.sh` changes one setting: a fork strategy, a tined flag, or one host setting, which it puts back afterwards.
 - **Labelled.** Every run carries what tined ran with (`"features"`), and the host line says where it ran. Numbers from the dev server are **nested virtualization**.
+- **Scaled to the host.** On bare metal, forks went to 100 children and the pressure run to 96 children of 2.5 GiB, through `BENCH_FLAGS` ([below](#rerunning-it)); everything else was the same.
 - **Memory.** RSS and PSS are each VM's Firecracker process, from `/proc/<pid>/smaps_rollup`, three seconds after the fork. Memory in huge pages from a reserved pool (hugetlbfs) isn't in either, so the memory chart leaves `+2M` out.
 
 ## Rerunning it
@@ -192,7 +228,7 @@ On any Linux host with KVM, set up with `scripts/host-setup.sh` and with tine in
 bench/run.sh /tmp/tine-bench.jsonl
 ```
 
-That runs every part, about five hours on four CPUs, and puts the host's settings back when it ends. `PARTS="base pages"` runs some parts, `QUICK=1` fewer runs of each, and `BENCH_FLAGS` passes tine-bench flags to every part, such as more children on a bigger host. From a Mac, `make bench-all` does it all on the dev server, fetches the results into `bench/results/<date>-<name>/` and charts them:
+That runs every part, about five hours on four CPUs and three on the bare-metal host, and puts the host's settings back when it ends. `PARTS="base pages"` runs some parts, `QUICK=1` fewer runs of each, and `BENCH_FLAGS` passes tine-bench flags to every part, such as more children on a bigger host. From a Mac, `make bench-all` does it all on the dev server, fetches the results into `bench/results/<date>-<name>/` and charts them:
 
 ```bash
 make bench-all BENCH_NAME=nested
