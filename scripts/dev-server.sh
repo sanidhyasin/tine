@@ -18,6 +18,18 @@
 # The server stops itself after 60 minutes with no SSH connections and no
 # running Firecracker VMs.
 #
+# A second server, such as step 4's bare-metal one, is the same commands with
+# a name of its own:
+#
+#   TINE_NAME=tine-metal TINE_INSTANCE_TYPE=c5d.metal TINE_LOCAL_DATA=1 ./scripts/dev-server.sh up
+#
+# .metal types run Firecracker on KVM directly, without nested virtualization.
+# TINE_LOCAL_DATA=1 puts /srv/tine on the instance's own NVMe disk instead of
+# an EBS volume; that disk is wiped whenever the server stops, so it suits a
+# server that's only up for one run, then terminated with `down`. c5d.metal
+# (96 vCPUs, 192 GiB, 4 x 900 GB NVMe) is $4.752/hour in ap-south-1 (checked
+# 2026-11-07), and needs an on-demand vCPU quota of at least 96.
+#
 # The AWS profile is TINE_AWS_PROFILE: there's no default.
 
 set -euo pipefail
@@ -30,9 +42,15 @@ DISK_GB="${TINE_DISK_GB:-60}"
 DATA_GB="${TINE_DATA_GB:-50}"              # mounted at /srv/tine as XFS by host-setup.sh
 DATA_DEVICE_NAME="/dev/sdf"                # EC2's name for it; Linux sees an NVMe disk
 GP3_PRICE_GB_MONTH="0.0912"                # ap-south-1, checked 2026-11-07
-NAME="tine-dev"
+NAME="${TINE_NAME:-tine-dev}"
+LOCAL_DATA="${TINE_LOCAL_DATA:-}"          # 1: /srv/tine on the instance's own NVMe disk
 SSH_KEY="${TINE_SSH_KEY:-$HOME/.ssh/id_ed25519}"
-KNOWN_HOSTS="$HOME/.ssh/known_hosts_tine"
+KNOWN_HOSTS="$HOME/.ssh/known_hosts_tine"  # tine-dev's; other servers get their own
+[ "$NAME" = "tine-dev" ] || KNOWN_HOSTS="$HOME/.ssh/known_hosts_$NAME"
+case "$TYPE" in
+  *.metal*) CPU_OPTIONS=() ;;                                   # KVM directly
+  *)        CPU_OPTIONS=(--cpu-options NestedVirtualization=enabled) ;;
+esac
 AMI_PARAM="/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id"
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -289,11 +307,15 @@ cmd_up() {
     expect 'subnet-*' "$subnet" "No subnet to launch in"
     ud="$(mktemp)"
     user_data > "$ud"
-    say "Launching $TYPE with nested virtualization in $REGION (AWS profile: $PROFILE)"
+    if [ ${#CPU_OPTIONS[@]} -gt 0 ]; then
+      say "Launching $NAME, $TYPE with nested virtualization, in $REGION (AWS profile: $PROFILE)"
+    else
+      say "Launching $NAME, $TYPE, in $REGION (AWS profile: $PROFILE)"
+    fi
     id="$(aws_ ec2 run-instances \
           --image-id "resolve:ssm:$AMI_PARAM" \
           --instance-type "$TYPE" \
-          --cpu-options NestedVirtualization=enabled \
+          ${CPU_OPTIONS[@]+"${CPU_OPTIONS[@]}"} \
           --key-name "$NAME" \
           --security-group-ids "$sg" \
           --subnet-id "$subnet" \
@@ -310,7 +332,7 @@ cmd_up() {
     say "Launched $id"
   fi
   aws_ ec2 wait instance-running --instance-ids "$id"
-  ensure_data_volume "$id"
+  [ -n "$LOCAL_DATA" ] || ensure_data_volume "$id"
   ip="$(instance_field "$id" PublicIpAddress)"
   expect '[0-9]*.[0-9]*.[0-9]*.[0-9]*' "$ip" "$id has no public IP address"
   wait_for_ssh "$ip"
@@ -321,10 +343,17 @@ cmd_setup() {
   local id ip vol dev
   id="$(require_instance)"
   ip="$(running_ip)"
-  vol="$(data_volume_id "$id")"
-  [ "$vol" != "None" ] || die "$NAME has no data volume yet. Run: $0 up"
-  # On Nitro instances EBS volumes are NVMe disks, and udev names each one after its volume ID.
-  dev="/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_${vol//-/}"
+  if [ -n "$LOCAL_DATA" ]; then
+    # The first of the instance's own NVMe disks (instance store).
+    dev="$(ssh "${SSH_OPTS[@]}" "ubuntu@$ip" \
+           'ls /dev/disk/by-id/nvme-Amazon_EC2_NVMe_Instance_Storage_* 2>/dev/null | grep -v -- -part | sort | head -1')"
+    expect '/dev/disk/by-id/*' "$dev" "$NAME has no local NVMe disk; leave TINE_LOCAL_DATA unset to use an EBS volume"
+  else
+    vol="$(data_volume_id "$id")"
+    [ "$vol" != "None" ] || die "$NAME has no data volume yet. Run: $0 up"
+    # On Nitro instances EBS volumes are NVMe disks, and udev names each one after its volume ID.
+    dev="/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_${vol//-/}"
+  fi
   cmd_sync
   ssh "${SSH_OPTS[@]}" "ubuntu@$ip" "cd ~/tine && TINE_DATA_DEVICE='$dev' ./scripts/host-setup.sh"
 }
@@ -339,7 +368,9 @@ cmd_status() {
   aws_ ec2 describe-instances --instance-ids "$id" --output table \
     --query 'Reservations[0].Instances[0].{Id:InstanceId,State:State.Name,Type:InstanceType,IP:PublicIpAddress,Zone:Placement.AvailabilityZone,NestedVirt:CpuOptions.NestedVirtualization,Launched:LaunchTime}'
   vol="$(data_volume_id "$id")"
-  if [ "$vol" = "None" ]; then
+  if [ -n "$LOCAL_DATA" ]; then
+    echo "Data: the instance's own NVMe disk"
+  elif [ "$vol" = "None" ]; then
     echo "Data volume: none attached (run: $0 up)"
   else
     aws_ ec2 describe-volumes --volume-ids "$vol" --output table \
