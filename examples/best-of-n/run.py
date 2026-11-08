@@ -42,6 +42,7 @@ class Outcome:
     diff: str = ""
     lines_changed: int = 0
     check_seconds: float = 0.0
+    tests: str = ""  # the end of pytest's output, when the tests failed
 
 
 @dataclass
@@ -93,6 +94,8 @@ async def check(sb: AsyncSandbox, task: dict[str, Any], a: Attempt) -> Outcome:
     await sb.write_file(f"{REPO}/tests/test_hidden.py", (task["dir"] / "hidden" / "test_hidden.py").read_text())
     r = await sb.exec(f"cd {REPO} && python3 -m pytest -q -p no:cacheprovider tests", timeout=300)
     out.passed = r.ok and bool(out.diff)
+    if not r.ok:
+        out.tests = (r.stdout + r.stderr)[-3000:]
     out.check_seconds = time.monotonic() - start
     return out
 
@@ -216,6 +219,8 @@ def report(results: list[TaskResult], n: int, args: argparse.Namespace, usage: U
                         "summary": o.attempt.summary,
                         "error": o.attempt.error,
                         "cost_usd": o.attempt.usage.cost(args.model),
+                        "diff": o.diff,
+                        "tests": o.tests,
                     }
                     for o in r.outcomes
                 ],
