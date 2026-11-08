@@ -366,8 +366,10 @@ def chart_fork(sets: list[Results], out: Path, key: str, filename: str, title: s
         ax.set_ylabel(ylabel)
     if len(lines) <= MAX_LABELS and not log:
         label_ends(ax, ends)
-    if len(lines) > 1:  # one series needs no legend: the title names it
-        ax.legend(loc=legend, fontsize=8 if len(sets) > 1 else 9)
+    if len(sets) > 1:  # a line per strategy and host: too many to fit inside
+        legend_below(fig, ax, len(sets), fontsize=8)  # a column per host
+    elif len(lines) > 1:  # one series needs no legend: the title names it
+        ax.legend(loc=legend, fontsize=9)
     finish(fig, ax, out / filename, title, subtitle)
 
 
@@ -393,15 +395,24 @@ def chart_snapshot(sets: list[Results], out: Path):
         c = color(SNAPSHOT_COLORS[mode]) if mode in SNAPSHOT_COLORS else SLOTS[6]
         name = mode if len(sets) == 1 else f"{mode}, {sets[h].label}"
         ax.plot(xs, ys, marker="o", color=c, linestyle=["-", "--", ":"][h % 3], label=name)
-        label_end(ax, xs[-1], ys[-1], fmt_ms(ys[-1]), c)  # the rest are in the table
+        if len(lines) <= MAX_LABELS:
+            label_end(ax, xs[-1], ys[-1], fmt_ms(ys[-1]), c)  # the rest are in the table
     ax.set_xscale("log", base=2)
     ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v / 1024:g} GiB" if v >= 1024 else f"{v:g} MiB"))
-    ms_axis(ax)
-    ax.set_ylim(bottom=0)
     ax.set_xlabel("VM memory")
-    ax.set_ylabel("VM paused (p50)")
-    if len(lines) > 1:
-        ax.legend(loc="upper left", fontsize=8 if len(sets) > 1 else 9)
+    if len(sets) > 1:
+        # Diff snapshots' few ms and full ones' second, for each host: only
+        # a log scale shows both, and the hosts apart.
+        ax.set_yscale("log")
+        ax.set_ylabel("VM paused (p50), log scale")
+    else:
+        ax.set_ylim(bottom=0)
+        ax.set_ylabel("VM paused (p50)")
+    ms_axis(ax)
+    if len(sets) > 1:
+        legend_below(fig, ax, 3, fontsize=8)
+    elif len(lines) > 1:
+        ax.legend(loc="upper left", fontsize=9)
     finish(fig, ax, out / "snapshot-paused.png", "How long a snapshot pauses a VM",
            "Median pause, by the VM's memory size")
 
