@@ -22,7 +22,7 @@ Forking a VM is three steps:
 
 Then each child is made its own machine again: a new hostname and machine ID, fresh randomness for its kernel, the right time, its own network and disk. It wakes up mid-instruction, exactly where its parent was, with every process still running.
 
-On the dev server, a 4-vCPU cloud VM running Firecracker through nested virtualization, forking a 256 MiB VM into 10 takes 398 ms, and into 30, 1.02 s. Booting 10 or 30 fresh VMs instead takes 7.5 s and 21 s. An idle child costs the host 14 MiB, against 109 MiB for a booted VM: nearly all its memory is its parent's, shared. <!-- METAL-INTRO -->
+On the dev server, a 4-vCPU cloud VM running Firecracker through nested virtualization, forking a 256 MiB VM into 10 takes 398 ms, and into 30, 1.02 s. Booting 10 or 30 fresh VMs instead takes 7.5 s and 21 s. An idle child costs the host 14 MiB, against 109 MiB for a booted VM: nearly all its memory is its parent's, shared. On bare metal, a c5d.metal with 96 CPUs, 100 children take 998 ms, against 4.0 s to boot 100.
 
 ## The ladder
 
@@ -64,7 +64,15 @@ The interesting results are the failures. Each of these cost time to find:
 - **Nested virtualization's limit.** Past about 60 guest vCPUs, EC2's nested virtualization refuses to enter more guests, so the dev server tops out at 31 children of one VM, with 14 GiB of memory still free.
 - **An experiment that didn't evict.** To see what happens when a fork's memory is pushed out of the page cache, the benchmark dropped the cache under children reading their parent's memory. The reads stayed fast. The kernel can't drop pages a process has mapped, and each child maps about 100 MiB of its parent's memory as it wakes. Real eviction takes real memory pressure.
 
-<!-- METAL-WRITEUP -->
+- **A limit that didn't hold.** On bare metal nothing else stopped the density test, so it reached tined's own limit of 512 VMs, and went past it, to 551. Each child of a fork had checked the count for itself, before any of them was recorded, so dozens saw room for one more at once. The count is now reserved under the same lock as memory and CPUs, so a fork past it is refused before its parent pauses.
+
+## Nested against bare metal
+
+Everything above ran on a cloud VM, through nested virtualization, so the same suite ran again on a c5d.metal: 96 CPUs, 192 GiB, and KVM on the machine itself. Two things changed at once, the nesting and the CPU, which is six years older on the bare-metal host. What each host was faster at tells them apart.
+
+Without the nested layer, everything the guest does is faster, as its exits and faults go through one hypervisor instead of two. A cold boot takes 803 ms instead of 1.83 s, a restored guest wakes up and syncs in 8 ms instead of 38, and a child's first write to a shared page costs 7.7 µs instead of 62. What's the host copying memory is slower on the older CPU: a 1 GiB snapshot pauses its VM for 245 ms instead of 157. Diff snapshots don't mind either way, at 4 to 9 ms on both.
+
+With 96 CPUs, a fork into 100 takes 998 ms, against 4.0 s to boot 100. Booting is cheap enough on bare metal that forking's lead in time shrinks, from 20 times to 4 or 5. Its lead in memory doesn't: each idle child costs 12 MiB, a booted VM 109. And 96 children of a 2.5 GiB VM ran the 188 GiB host out of memory the same way 24 did on the cloud VM, so that failure was the memory's, not the nesting's.
 
 ## The demo: best-of-N with forks
 
