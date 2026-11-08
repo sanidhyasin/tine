@@ -22,7 +22,9 @@ The *why* behind the project is in [BRIEF.md](../BRIEF.md). This file is the *ho
 
 ## Where we are
 
-**Step 4 is done, released as v0.4.0.** Every way of giving a VM its memory is measured side by side, on the nested dev server and on bare metal, with what breaks and why: [results.md](results.md). Forks can share the page cache, copy it, or go through a page server with prefetch; diff snapshots pause a VM for 4 to 9 ms at any size; and KSM, the balloon and huge pages are flags. On bare metal, a 256 MiB VM forks into 100 in 998 ms, at 12 MiB per idle child. Next is step 5: the Python SDK, the demo and the writeup.
+**Step 5's code is done, released as v0.5.0.** tine works from Python ([`sdk/python`](../sdk/python)) and from another machine over SSH, copies files into and out of VMs, and builds images from Dockerfiles. The [best-of-N demo](../examples/best-of-n) sets one sandbox up and forks it for five agents at once, in about half a second. Left for v1.0.0: the demo's run with Claude, for best-of-1 against best-of-5 (5.7), the README's GIF (5.9), and publishing [the writeup](writeup.md) (5.10).
+
+Step 4 (v0.4.0) measured every way of giving a VM its memory side by side, on the nested dev server and on bare metal, with what breaks and why: [results.md](results.md). On bare metal, a 256 MiB VM forks into 100 in 998 ms, at 12 MiB per idle child, and diff snapshots pause a VM for 4 to 9 ms at any size.
 
 Step 3 (v0.3.0) forked a running VM into many children that share its memory: 10 children of a 256 MiB VM in 397 ms, each idle child costing 14 MiB.
 

@@ -258,7 +258,7 @@ A create from a snapshot runs the same first stages as a boot, then loads instea
 
 - **The same paths as the original.** A restore needs every device at the path the snapshotted VM had it. Every jail has `/rootfs.ext4` and `/vsock.sock`, and every namespace has `tap0`, so nothing in the guest needs changing.
 - **Out of the way of new snapshots.** The restored files sit under `/restore`, apart from `/snapshot` where Firecracker writes new ones, so a snapshot can never be written over the files a VM runs from. Being read-only, they couldn't be anyway.
-- **Most of the time is first touches of memory.** Restored memory is mapped from the file and loaded page by page as the guest touches it. Each first touch is a page fault, which nested virtualization makes expensive. Bare metal and prefaulting are for step 4.
+- **Most of the time is first touches of memory.** Restored memory is mapped from the file and loaded page by page as the guest touches it. Each first touch is a page fault, which nested virtualization makes expensive: bare metal wakes a restored guest in a fifth of the time, and `uffd-prefetch` copies the pages in before the guest asks ([results.md](results.md#nested-virtualization-against-bare-metal)).
 
 **`/sync` makes a restored guest current and unique.** tined calls it after every create, booted ones included, so every VM is the same in these ways however it started:
 
@@ -761,7 +761,7 @@ The dev server's limits are its own. Its disk is a network volume, at about 150 
 
 ## Known limits
 
-These are known and deliberate for v0.4.0. Most are what the next steps are for.
+These are known and deliberate for v0.5.0. Most are what the next steps are for.
 
 - **Snapshots of one VM wait for the disk.** Back-to-back snapshots, or forks, of one VM wait for the last one to reach the disk, and 2 s more: about 8 s per GiB on the dev server's EBS volume, and 1 s per GiB on local NVMe. The VM runs meanwhile; diff snapshots shorten the pause, not this wait.
 - **Diff snapshots and page servers are opt-in.** Firecracker calls diff snapshots a developer preview, so they're behind `--diff-snapshots`. A VM from before tined restarted gets a full snapshot first, as tined can't know since when its pages are tracked.

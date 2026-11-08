@@ -82,12 +82,12 @@ The ones worth knowing:
 |---|---|
 | `tine` says tined isn't running | `systemctl status tined`, `journalctl -u tined -n 50`. tined won't start without its data volume (`RequiresMountsFor=/srv/tine`). |
 | `permission denied` on the socket | Your user needs the `tine` group: `sudo usermod -aG tine $USER`, then log in again. |
-| Creates refused with `no_memory` or `no_cpu` | Admission control: the message has the numbers. Destroy VMs, or raise `--overcommit` / `--cpu-overcommit` if the host really has room. |
+| Creates refused with `no_memory`, `no_cpu` or `capacity` | Admission control: the message has the numbers. Destroy VMs, or raise `--overcommit`, `--cpu-overcommit` or `--max-vms` if the host really has room. |
 | Creates boot instead of restoring (slow) | `tine images`: the image's template is missing or out of date. tined warms `--warm-images` by itself; others need `tine image warm IMAGE`. |
 | A VM is `failed` | `tine inspect VM` has the reason; its console log has the guest's side. |
 | Guests fail to start beyond about 60 on a nested host | EC2's nested virtualization refusing guest entries (`KVM_EXIT_FAIL_ENTRY`): lower `--cpu-overcommit`. |
 | Snapshots pause VMs for seconds | `vm.dirty_ratio` too low (tined warns at startup), or a slow disk: the VM's previous snapshot is still being written. |
-| A fork's children run slowly at first | Expected: each first write to a page copies it (about 60 µs on the dev server). `--strategy uffd-prefetch` trades memory for fewer faults. |
+| A fork's children run slowly at first | Expected: each first write to a page copies it (about 60 µs on the nested dev server, 8 µs on bare metal). `--strategy uffd-prefetch` trades memory for fewer faults. |
 
 After a crash, tined reconciles on start: VMs whose Firecracker died are marked failed and cleaned up, half-made ones are undone, and anything on the host it has no record of (namespaces, jails, cgroups) is removed.
 
