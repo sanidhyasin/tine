@@ -97,10 +97,11 @@ bench: deploy ## Benchmark on the dev server, fetch and chart the results (serve
 # All of step 4's benchmarks, in one run of bench/run.sh on the dev server.
 PARTS ?=
 QUICK ?=
+BENCH_FLAGS ?=
 
 .PHONY: bench-all
-bench-all: bench-image ## Every benchmark of step 4 on the dev server, fetched and charted (about 3 hours; PARTS= picks some, QUICK=1 tries it)
-	./scripts/dev-server.sh ssh 'cd ~/tine && PARTS="$(PARTS)" QUICK="$(QUICK)" bench/run.sh /tmp/tine-bench.jsonl'
+bench-all: bench-image ## Every benchmark of step 4 on the dev server, fetched and charted (about 5 hours; PARTS= picks some, QUICK=1 tries it)
+	./scripts/dev-server.sh ssh 'cd ~/tine && PARTS="$(PARTS)" QUICK="$(QUICK)" BENCH_FLAGS="$(BENCH_FLAGS)" bench/run.sh /tmp/tine-bench.jsonl'
 	@dir="bench/results/$$(date -u +%Y-%m-%d)-$(BENCH_NAME)"; mkdir -p "$$dir"; \
 		./scripts/dev-server.sh ssh 'cat /tmp/tine-bench.jsonl' > "$$dir/results.jsonl"; \
 		echo "results in $$dir"; uv run bench/analyze.py "$$dir"

@@ -4,9 +4,12 @@
 # installed (`make deploy bench-image`); `make bench-all` runs it from a Mac
 # and charts the results.
 #
-#   bench/run.sh [OUT.jsonl]          every part, about 3 hours on 4 CPUs
+#   bench/run.sh [OUT.jsonl]          every part, about 5 hours on 4 CPUs
 #   PARTS="base pages" bench/run.sh    only some parts
 #   QUICK=1 bench/run.sh               fewer runs of each, to try it out
+#   BENCH_FLAGS="-children 1,10,30,100" bench/run.sh
+#                                      tine-bench flags for every part, such as
+#                                      more children on a bigger host
 #
 # Each part runs tine-bench against tined as it's installed, or restarted with
 # a feature turned on through a systemd drop-in. Host settings a part changes
@@ -63,7 +66,9 @@ tined_with() {
 	exit 1
 }
 
-bench() { sudo tine-bench -out "$out" -append "${runs[@]}" "$@"; }
+# A part's own flags come last, so they win over BENCH_FLAGS.
+read -r -a flags <<<"${BENCH_FLAGS:-}"
+bench() { sudo tine-bench -out "$out" -append "${runs[@]}" "${flags[@]}" "$@"; }
 
 thp_was=$(sed 's/.*\[\(.*\)\].*/\1/' "$thp")
 ksm_was=$(cat "$ksm/run")
