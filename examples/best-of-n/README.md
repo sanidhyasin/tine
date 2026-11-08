@@ -50,3 +50,7 @@ Claude needs an Anthropic API key (`ANTHROPIC_API_KEY`, or `ant auth login`). Th
 `--scripted` replaces the model with a scripted stand-in that writes the reference fix in two attempts out of three: it checks forking, the attempts, the hidden tests and the report, without a model. Its success rates mean nothing.
 
 `--compare-setup` also times the other way of getting N sandboxes: creating N and setting each up.
+
+## Results
+
+On the nested dev server, five attempts per task: with Claude Sonnet 5.5, one attempt fixed 88% of the bugs and the best of five 9 of the 10 tasks, for $0.43; with Claude Haiku 5.5, 90% and all 10, for $0.04. [`results/`](results) has every attempt, with its diff and, when it failed, the tests' output, and [results.md](../../docs/results.md#the-demo-best-of-n) what they show.

@@ -211,26 +211,36 @@ Every bare-metal chart is in [`2026-11-08-metal`](../bench/results/2026-11-08-me
 
 ## The demo: best-of-N
 
-Step 5's [demo](../examples/best-of-n) is the use case in miniature: for each of ten small Python repositories with a bug, set one sandbox up from the `python` image (2 vCPUs, 1 GiB), fork it five times, let five agents try to fix the bug at once, run hidden tests in each fork, and keep the smallest passing fix. With a scripted stand-in for the model (`make demo DEMO_ARGS="--scripted --compare-setup"`), on the nested dev server, the pipeline's own times were:
+Step 5's [demo](../examples/best-of-n) is the use case in miniature: for each of ten small Python repositories with a bug, set one sandbox up from the `python` image (2 vCPUs, 1 GiB), fork it five times, let five agents try to fix the bug at once, run hidden tests in each fork, and keep the smallest passing fix. It ran on the nested dev server with Claude Sonnet 5.5, the demo's default, and again with Claude Haiku 5.5, five attempts per task each (`make demo DEMO_ARGS="--compare-setup"`):
 
-| Task | Set up | Fork into 5 | Attempts and checks |
+| | One attempt fixed the bug (best of 1) | Five attempts fixed it (best of 5) | Cost of the run |
 |---|---|---|---|
-| bisect | 1.3 s | 0.46 s | 0.5 s |
-| businessdays | 1.9 s | 0.56 s | 0.5 s |
-| csvline | 3.1 s | 0.55 s | 0.4 s |
-| intervals | 3.1 s | 0.49 s | 0.5 s |
-| lru | 4.7 s | 0.55 s | 0.6 s |
-| matrix | 3.8 s | 0.49 s | 0.5 s |
-| roman | 3.1 s | **21.7 s** | 0.7 s |
-| semver | 1.0 s | 0.48 s | 0.5 s |
-| tokenbucket | 3.3 s | 0.58 s | 0.7 s |
-| wordfreq | 3.4 s | 0.51 s | 0.5 s |
+| Claude Sonnet 5.5 | 88% (44 of 50) | 9 of 10 tasks | $0.43 |
+| Claude Haiku 5.5 | 90% (45 of 50) | **10 of 10 tasks** | $0.04 |
 
-- **Forking the set-up sandbox into five took about half a second**, where setting it up took 1 to 5 s for these tiny repositories. For `bisect`, setting it up once and forking took 1.8 s, and setting up five sandboxes instead, at once, 4.9 s. A real repository, with dependencies to install, takes minutes to set up, and the fork still takes half a second.
-- **One fork took 21.7 s.** The tasks run one after another, a few seconds each, so ten 1 GiB sandboxes were forked within a minute, each fork writing 1.3 GiB of memory to the EBS volume. Those writes overlapped, and each took 23 to 31 s to reach the disk. By `roman`'s fork, what was waiting to be written was past the kernel's dirty-page limits, and its children's agents didn't answer until the earlier snapshots had reached the disk, 21 s later. A local NVMe disk, or fewer forks of big VMs at once, avoids it; it's in the [known limits](architecture.md#known-limits).
-- The whole run, 50 attempts, took 77 s. Its report is in [`examples/best-of-n/results`](../examples/best-of-n/results/2026-11-08-scripted.json).
+| Task | Sonnet's attempts that passed | Haiku's | Set up | Fork into 5 |
+|---|---|---|---|---|
+| bisect | 5 | 5 | 0.9 s | 0.47 s |
+| businessdays | **0** | **1** | 0.9 s | 0.65 s |
+| csvline | 5 | 5 | 0.9 s | 0.49 s |
+| intervals | 5 | 5 | 0.9 s | 0.54 s |
+| lru | 5 | 5 | 0.9 s | 0.56 s |
+| matrix | 5 | 5 | 0.9 s | 0.51 s |
+| roman | 5 | 5 | 1.5 s | **7.66 s** |
+| semver | 4 | 5 | 1.0 s | 0.47 s |
+| tokenbucket | 5 | 5 | 1.0 s | 0.48 s |
+| wordfreq | 5 | 4 | 1.0 s | 0.61 s |
 
-The scripted stand-in writes the reference fix in two attempts out of three, so its success rates (58% for one attempt, 100% for the best of five) only check the pipeline. **The comparison the demo is for, how many bugs one Claude attempt fixes against the best of five, needs a run with the model** (`make demo`), which isn't in this version.
+Times are from the Sonnet run. Haiku's were within a few tenths of a second, but for two forks: 7.66 s and 1.43 s.
+
+- **One attempt usually fixed these bugs.** Both models fixed nearly every bug on the first try, in about three turns and six seconds. These ten repositories are small and their bugs plain, so they show the mechanism more than the gain: on harder tasks, where one attempt fails more often, the best of five has more to win.
+- **Where it helped, it was the difference.** `businessdays`' hidden tests count a range given backwards as no days. Its issue doesn't say so, though its docstring (`[start, end)`) implies it. One of Haiku's five attempts handled it, so one Haiku attempt fixes `businessdays` one time in five, and five attempts did; Sonnet's five all missed it. One of Haiku's `wordfreq` fixes dropped the apostrophe in "don't", and one of Sonnet's `semver` fixes got pre-release order wrong, and the other attempts covered for both. The results keep every attempt's diff and the tests' output, so each of these can be checked.
+- **The smallest fix wins.** Passing fixes to one bug differed: Haiku's `matrix` fixes changed 9 to 13 lines, its `semver` fixes 37 to 50. The demo keeps the smallest.
+- **Cost.** An attempt cost under a cent with Sonnet (151 requests in all, two-thirds of their input read from the prompt cache) and a tenth of that with Haiku. Five attempts cost five times one; the fork costs nothing on the API.
+- **Time.** Forking the set-up sandbox into five took about half a second (0.52 s, the median of 20 forks), and each run of 50 attempts under two minutes. Setting these tiny repositories up took only 0.9 to 1.5 s, so here forking saves little time: for `bisect`, setting it up once and forking took 1.4 s, and setting up five sandboxes at once 1.5 s. A real repository, with dependencies to install, takes minutes to set up, and the fork still takes half a second; and forks share their parent's memory.
+- **Slow forks.** Two of the 20 forks took 7.7 s: their children finished restoring only once their parent's 1.3 GiB snapshot had reached the EBS volume, 7.4 s after it was taken. A run with a scripted stand-in instead of the model, forking ten 1 GiB sandboxes within a minute, had one fork wait 21.7 s behind the others' snapshots. Local NVMe, where a snapshot reaches the disk in about a second, avoids it; it's in the [known limits](architecture.md#known-limits).
+
+The reports, with every attempt, are in [`examples/best-of-n/results`](../examples/best-of-n/results/): [Sonnet](../examples/best-of-n/results/2026-11-08-sonnet-5-5.json), [Haiku](../examples/best-of-n/results/2026-11-08-haiku-5-5.json) and [the scripted run](../examples/best-of-n/results/2026-11-08-scripted.json).
 
 ## How it was measured
 

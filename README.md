@@ -18,7 +18,7 @@ with Sandbox.create(image="python") as sb:
     forks = sb.fork(5)                                                    # five running copies
 ```
 
-> **Status: v0.5.0, step 5 done.** tined runs isolated microVMs, and the `tine` command creates them, runs commands in them, copies files in and out, snapshots them, rolls them back, **forks them into many running copies that share their memory**, and destroys them, on the server or from your laptop over SSH, and so does a Python SDK. New VMs start from pre-booted templates in about a twentieth of a second. Every way of giving a VM its memory was measured side by side, on nested virtualization and on bare metal, with what breaks: [docs/results.md](docs/results.md). The [best-of-N demo](examples/best-of-n) shows what it's for. Next is running the demo with Claude for its numbers, and the writeup ([draft](docs/writeup.md)). The step-by-step build plan is in [docs/PLAN.md](docs/PLAN.md), and the reasons behind the project are in [BRIEF.md](BRIEF.md).
+> **Status: v0.5.0, step 5 done.** tined runs isolated microVMs, and the `tine` command creates them, runs commands in them, copies files in and out, snapshots them, rolls them back, **forks them into many running copies that share their memory**, and destroys them, on the server or from your laptop over SSH, and so does a Python SDK. New VMs start from pre-booted templates in about a twentieth of a second. Every way of giving a VM its memory was measured side by side, on nested virtualization and on bare metal, with what breaks: [docs/results.md](docs/results.md). The [best-of-N demo](examples/best-of-n) shows what it's for. Next is the writeup ([draft](docs/writeup.md)). The step-by-step build plan is in [docs/PLAN.md](docs/PLAN.md), and the reasons behind the project are in [BRIEF.md](BRIEF.md).
 
 ## How it works
 
@@ -206,6 +206,8 @@ make demo DEMO_ARGS="--scripted"        # no model: a scripted stand-in checks t
 ```
 
 The agents run on your machine and only the sandboxes on the server, so the key never leaves it. `--budget` caps what a run may spend.
+
+With Claude Haiku 5.5, one attempt fixed 90% of the bugs and the best of five all ten, for $0.04 in all; with Sonnet 5.5, 88% and nine, for $0.43. The fork took about half a second. [results.md](docs/results.md#the-demo-best-of-n) has the details.
 
 When you're done for the day, stop the server from your Mac:
 
