@@ -56,7 +56,7 @@ type Server struct {
 	metrics *metrics.Metrics
 	started time.Time
 	mux     *http.ServeMux
-	// features are reported by GET /v1/health.
+	// features are reported by GET /healthz.
 	features []string
 }
 
@@ -66,7 +66,7 @@ type Option func(*Server)
 // WithMetrics serves GET /metrics and records every request in m.
 func WithMetrics(m *metrics.Metrics) Option { return func(s *Server) { s.metrics = m } }
 
-// WithFeatures lists optional behaviours tined runs with in GET /v1/health.
+// WithFeatures lists optional behaviours tined runs with in GET /healthz.
 func WithFeatures(f ...string) Option { return func(s *Server) { s.features = f } }
 
 // RequestIDHeader carries a request's ID: tined answers with it, and uses

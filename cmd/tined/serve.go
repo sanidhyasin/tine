@@ -247,7 +247,7 @@ func notifySystemd(msg string) {
 	_, _ = conn.Write([]byte(msg))
 }
 
-// features are the optional behaviours GET /v1/health reports.
+// features are the optional behaviours GET /healthz reports.
 func features(c vm.Config) []string {
 	var f []string
 	if c.DiffSnapshots {
