@@ -112,13 +112,16 @@ systemd service): images/python shows how.`,
 			}
 			opts.SizeBytes = n
 			opts.Log = slog.New(slog.NewTextHandler(cmd.ErrOrStderr(), nil))
+			start := time.Now()
 			img, err := image.Build(cmd.Context(), opts)
 			if err != nil {
 				return err
 			}
+			// The whole build: docker's, then the import (which is all
+			// BuildSeconds in image.json counts).
 			out := cmd.OutOrStdout()
 			_, _ = fmt.Fprintf(out, "built %s in %.1fs: kernel %s, %s disk, agent %s\n  %s\n",
-				img.Name, img.Meta.BuildSeconds, img.Meta.Kernel.Source, formatSize(img.Meta.Rootfs.SizeBytes),
+				img.Name, time.Since(start).Seconds(), img.Meta.Kernel.Source, formatSize(img.Meta.Rootfs.SizeBytes),
 				orUnknown(img.Meta.Agent.Version), img.Dir)
 			if !warm {
 				return nil
