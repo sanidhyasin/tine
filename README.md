@@ -4,12 +4,9 @@ Fork a running microVM into many copies in milliseconds. Built on [Firecracker](
 
 An AI agent fixing a bug needs a computer with the repository cloned, its dependencies installed and its tests warmed up. That takes minutes to set up. Five attempts at once need five such computers, and reinforcement learning wants thousands, each from the same starting point. tine sets one up once, then **forks the running VM** into as many copies as you need, in a fraction of a second, every one of them mid-flight, with its processes still running, sharing its parent's memory until it changes it.
 
-```
-$ tine fork yxr4 -n 10
-forked vm-yxr4tliv4w into 10 in 398ms (parent paused 64ms; snapshot 67ms · children 332ms)
-  vm-bspt6ta7eb  running  (122ms)
-  …
-```
+![tine on a Mac: a VM restored from a template in 66 ms, set up, forked into 10 running copies in 0.6 s, each sharing its parent's memory](docs/tine.gif)
+
+*`tine` on a Mac, driving the dev server over SSH ([`docs/tine.tape`](docs/tine.tape) records it).*
 
 ```python
 with Sandbox.create(image="python") as sb:

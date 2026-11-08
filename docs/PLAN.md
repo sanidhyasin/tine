@@ -22,7 +22,7 @@ The *why* behind the project is in [BRIEF.md](../BRIEF.md). This file is the *ho
 
 ## Where we are
 
-**Step 5's code is done, released as v0.5.0.** tine works from Python ([`sdk/python`](../sdk/python)) and from another machine over SSH, copies files into and out of VMs, and builds images from Dockerfiles. The [best-of-N demo](../examples/best-of-n) sets one sandbox up and forks it for five agents at once, in about half a second: with Claude Haiku 5.5, one attempt fixed 90% of the bugs, and the best of five all ten. Left for v1.0.0: the README's GIF (5.9), and publishing [the writeup](writeup.md) (5.10).
+**Step 5's code is done, released as v0.5.0.** tine works from Python ([`sdk/python`](../sdk/python)) and from another machine over SSH, copies files into and out of VMs, and builds images from Dockerfiles. The [best-of-N demo](../examples/best-of-n) sets one sandbox up and forks it for five agents at once, in about half a second: with Claude Haiku 5.5, one attempt fixed 90% of the bugs, and the best of five all ten. Left for v1.0.0: publishing [the writeup](writeup.md) (5.10).
 
 Step 4 (v0.4.0) measured every way of giving a VM its memory side by side, on the nested dev server and on bare metal, with what breaks and why: [results.md](results.md). On bare metal, a 256 MiB VM forks into 100 in 998 ms, at 12 MiB per idle child, and diff snapshots pause a VM for 4 to 9 ms at any size.
 
@@ -699,8 +699,8 @@ with Sandbox.create(image="python") as sb:            # destroyed automatically 
 - [x] **5.6 Demo agent:** tool-use loop, fork N, parallel attempts, pick the winner, report. *`examples/best-of-n`: Claude (the latest Sonnet, with prompt caching) with tools to run commands and read and write files, a budget in dollars, and `--scripted`, a stand-in that checks the pipeline without a model. `make demo` runs it from the Mac against the dev server; the API key stays on the Mac.*
 - [x] **5.7 Demo results:** best-of-1 vs. best-of-5, fork vs. re-setup, written into `docs/results.md`. *With Claude Sonnet 5.5, one attempt fixed 88% of the bugs and the best of five 9 of 10 tasks, for $0.43; with Claude Haiku 5.5, 90% and all 10, for $0.04. The bugs are small, so one attempt was usually enough; where it wasn't, five were the difference. Forking a set-up sandbox into 5 takes about half a second, but these tiny repositories set up in about a second, so forking saved little time here. Forks of 1 GiB sandboxes can wait seconds for their parent's snapshot to reach the EBS volume.*
 - [x] **5.8 Fork-tree view** (optional): `tine top`. *Every VM as a live tree of forks, with its memory, redrawn every second: new VMs yellow, failed ones red.*
-- [ ] **5.9 Polish:** README, GIF, docs, license. *Done but the GIF: the README says what tine is and why, with the CLI, the SDK and the demo; `docs/api.md` and `docs/operations.md`; Apache 2.0. The GIF wants `vhs` and a real demo run.*
-- [ ] **5.10 Writeup:** the blog post. Tag `v1.0.0`. *Drafted in [writeup.md](writeup.md), with every number. Step 5 is released as v0.5.0; v1.0.0 waits for the GIF and the published post.*
+- [x] **5.9 Polish:** README, GIF, docs, license. *The README says what tine is and why, with the CLI, the SDK and the demo, and opens with a GIF of `tine` on a Mac creating, setting up and forking a VM on the dev server (`vhs docs/tine.tape` records it again); `docs/api.md` and `docs/operations.md`; Apache 2.0.*
+- [ ] **5.10 Writeup:** the blog post. Tag `v1.0.0`. *Drafted in [writeup.md](writeup.md), with every number. Step 5 is released as v0.5.0; v1.0.0 waits for the published post.*
 
 ### Done when
 
