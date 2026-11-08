@@ -324,8 +324,8 @@ type Manager struct {
 	diffBases map[string]string
 	// admitMu guards admission control's reservations: what's held for VMs
 	// being made.
-	admitMu                                          sync.Mutex
-	reservedCommitMiB, reservedUseMiB, reservedVCPUs int
+	admitMu                                                       sync.Mutex
+	reservedCommitMiB, reservedUseMiB, reservedVCPUs, reservedVMs int
 }
 
 type tracked struct {
@@ -502,17 +502,8 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (state.VM, erro
 			m.log.WarnContext(ctx, "booting instead of restoring", "image", req.Image, "because", coldBecause)
 		}
 	}
-	live, err := m.store.ListVMs(ctx, state.ListOptions{})
-	if err != nil {
-		return state.VM{}, err
-	}
-	if len(live) >= m.cfg.MaxVMs {
-		return state.VM{}, fmt.Errorf("%w: %d VMs exist, the limit is %d", ErrCapacity, len(live), m.cfg.MaxVMs)
-	}
-	slot, err := m.slots.Allocate()
-	if err != nil {
-		return state.VM{}, fmt.Errorf("%w: %w", ErrCapacity, err)
-	}
+	// Admission (which checks the VM limit too) first: a refused request
+	// holds nothing.
 	res := req.admitted
 	if res == nil {
 		if res, err = m.admit(ctx, 1, req.VCPUs, req.MemoryMiB, m.expectedUseMiB(req.SnapshotID != "")); err != nil {
@@ -521,6 +512,10 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (state.VM, erro
 		defer res.release()
 	}
 	defer res.made()
+	slot, err := m.slots.Allocate()
+	if err != nil {
+		return state.VM{}, fmt.Errorf("%w: %w", ErrCapacity, err)
+	}
 
 	// With a SnapshotID, this also claims the snapshot: it can't be deleted
 	// from now on, while the VM lives.

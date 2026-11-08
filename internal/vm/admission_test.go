@@ -14,8 +14,9 @@ func (f *fixture) reservedNothing(t *testing.T) {
 	t.Helper()
 	f.m.admitMu.Lock()
 	defer f.m.admitMu.Unlock()
-	if f.m.reservedCommitMiB != 0 || f.m.reservedUseMiB != 0 || f.m.reservedVCPUs != 0 {
-		t.Errorf("still reserved: %d MiB committed, %d MiB of use, %d vCPUs", f.m.reservedCommitMiB, f.m.reservedUseMiB, f.m.reservedVCPUs)
+	if f.m.reservedCommitMiB != 0 || f.m.reservedUseMiB != 0 || f.m.reservedVCPUs != 0 || f.m.reservedVMs != 0 {
+		t.Errorf("still reserved: %d MiB committed, %d MiB of use, %d vCPUs, %d VMs",
+			f.m.reservedCommitMiB, f.m.reservedUseMiB, f.m.reservedVCPUs, f.m.reservedVMs)
 	}
 }
 
@@ -134,6 +135,78 @@ func TestAdmissionLimitsVCPUs(t *testing.T) {
 	}
 	if _, err := f.m.Create(ctx, CreateRequest{VCPUs: 1}); !errors.Is(err, ErrNoCPU) {
 		t.Errorf("one more = %v, want ErrNoCPU", err)
+	}
+	f.reservedNothing(t)
+}
+
+// The VM limit holds for requests at once: on bare metal, the children of a
+// fork, each checking the count before any had a record, once made 551 VMs
+// under a limit of 512.
+func TestConcurrentCreatesShareTheVMLimit(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, func(c *Config) { c.MaxVMs = 3 })
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	made, refused := 0, 0
+	for range 6 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := f.m.Create(ctx, CreateRequest{})
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case err == nil:
+				made++
+			case errors.Is(err, ErrCapacity):
+				refused++
+			default:
+				t.Errorf("Create: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+	if made != 3 || refused != 3 {
+		t.Errorf("made %d and refused %d, want 3 and 3", made, refused)
+	}
+	f.reservedNothing(t)
+}
+
+// A fork past the VM limit is refused as a whole, before the parent is
+// paused, like one past the other rules.
+func TestForkIsHeldToTheVMLimit(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, func(c *Config) { c.MaxVMs = 4 })
+	parent := f.running(t)
+	f.host.takeCalls()
+	if _, err := f.m.Fork(ctx, parent.ID, ForkRequest{Count: 4}); !errors.Is(err, ErrCapacity) || !strings.Contains(err.Error(), "limit of 4") {
+		t.Fatalf("a fork of 4 more = %v, want ErrCapacity naming the limit", err)
+	}
+	if calls := f.host.takeCalls(); len(calls) != 0 {
+		t.Errorf("a refused fork touched the host: %v", calls)
+	}
+	if res, err := f.m.Fork(ctx, parent.ID, ForkRequest{Count: 3}); err != nil || res.Failed() != 0 {
+		t.Errorf("a fork that fills it: %v", err)
+	}
+	if _, err := f.m.Create(ctx, CreateRequest{}); !errors.Is(err, ErrCapacity) {
+		t.Errorf("one more = %v, want ErrCapacity", err)
+	}
+	f.reservedNothing(t)
+}
+
+// A refused create holds nothing afterwards, a network slot included.
+func TestRefusedCreatesKeepNoSlot(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, func(c *Config) { c.OvercommitRatio = 1 })
+	f.host.mem = hostMemory{TotalMiB: 1024, AvailableMiB: 8192}
+	before := f.m.slots.InUse()
+	for range 3 {
+		if _, err := f.m.Create(ctx, CreateRequest{MemoryMiB: 2048}); !errors.Is(err, ErrNoMemory) {
+			t.Fatalf("Create past the limit = %v, want ErrNoMemory", err)
+		}
+	}
+	if after := f.m.slots.InUse(); after != before {
+		t.Errorf("slots in use went from %d to %d after refusals", before, after)
 	}
 	f.reservedNothing(t)
 }
