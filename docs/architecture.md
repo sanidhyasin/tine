@@ -1,8 +1,8 @@
 # tine architecture
 
-This is how tine works as of **v0.3.0**, the end of step 3: one service on a Linux server that creates microVMs, runs commands in them, snapshots them, rolls them back, starts new ones from pre-booted templates in about a tenth of a second, **forks running VMs into many copies that share their memory**, and destroys them, safely and without leaking anything.
+This is how tine works as of **v0.4.0**, the end of step 4: one service on a Linux server that creates microVMs, runs commands in them, snapshots them, rolls them back, starts new ones from pre-booted templates in about a twentieth of a second, **forks running VMs into many copies that share their memory**, and destroys them, safely and without leaking anything. Step 4 added the other ways to do it, to measure them side by side: diff snapshots, and page servers that load a VM's memory on demand or in advance. How they compare, and what breaks, is in [results.md](results.md).
 
-Each section starts in plain words and then gives the detail. The *why* of the project is in [BRIEF.md](../BRIEF.md), and the step-by-step plan, including what comes after v0.3.0, is in [PLAN.md](PLAN.md).
+Each section starts in plain words and then gives the detail. The *why* of the project is in [BRIEF.md](../BRIEF.md), and the step-by-step plan, including what comes after v0.4.0, is in [PLAN.md](PLAN.md).
 
 ## Contents
 
@@ -35,9 +35,9 @@ Each section starts in plain words and then gives the detail. The *why* of the p
                                                    ▼
 ┌─────────────────────────────── tined ─────────────────────────────────────┐
 │ api      HTTP routes, errors, request IDs, /metrics                       │
-│ vm       create: boot or restore (with undo) · snapshot · rollback ·      │
-│          fork · admission control · destroy · exec · templates ·          │
-│          reconcile · reaper and snapshot GC                               │
+│ vm       create: boot or restore (with undo) · snapshot, full or diff ·   │
+│          rollback · fork · admission control · destroy · exec ·           │
+│          templates · page servers · reconcile · reaper and snapshot GC    │
 │ state    SQLite: VMs, images, snapshots, every state change               │
 └──────┬──────────────────┬─────────────────────┬───────────────────────────┘
        │ netns            │ jailer               │ firecracker + agentproto
@@ -46,7 +46,8 @@ Each section starts in plain words and then gives the detail. The *why* of the p
  │ network namespace tine-<id>   tap0 ─ veth ─ host, nftables rules       │
  │ jail /srv/tine/jail/firecracker/<id>/root   own uid, own cgroup        │
  │   firecracker ── KVM ── guest Linux                                    │
- │                           └─ tine-agent (vsock port 1024)              │
+ │      │                    └─ tine-agent (vsock port 1024)              │
+ │      └─ tine-uffd: serves its memory, with the uffd strategies         │
  └────────────────────────────────────────────────────────────────────────┘
  /srv/tine/snapshots/<snap-id>/   vmstate, memory, rootfs.ext4: read-only,
                                   hard-linked into the jails of VMs restored from it
@@ -62,13 +63,16 @@ Some properties that hold throughout:
 
 ## The code
 
-Three binaries, all Go, built on the Mac (or in CI) for linux/amd64 and run on the server:
+The binaries, all Go, built on the Mac (or in CI) for linux/amd64 and run on the server:
 
 | Binary | What it is |
 |---|---|
 | `cmd/tined` | The service. `tined serve` runs under systemd; `tined image import` builds images. |
 | `cmd/tine` | The CLI: `create`, `ls` (and `ls --tree`), `inspect`, `exec`, `snapshot` (and `snapshot ls`, `inspect`, `rm`), `rollback`, `fork`, `destroy`, `images`, `image warm`, `version`. |
 | `cmd/tine-agent` | Runs inside every guest and serves `/health`, `/exec` and `/sync` over vsock. |
+| `cmd/tine-uffd` | A page server: serves one VM's memory from a snapshot, page by page, through userfaultfd (see [Fork strategies and page servers](#fork-strategies-and-page-servers)). |
+| `cmd/tine-bench` | The benchmark harness: drives tined's API through every scenario of step 4 and writes a JSON line per run (see [results.md](results.md)). |
+| `cmd/tine-touch`, `cmd/tine-dirty` | Benchmark workloads, baked into the `bench` image: time each page a guest touches, and change a given amount of memory. |
 
 The packages under `internal/`:
 
@@ -84,7 +88,9 @@ The packages under `internal/`:
 | `agent` | The server inside the guest | `agentproto` |
 | `image` | Builds and reads images | none |
 | `snapshot` | The snapshot store: files, metadata, compatibility checks | none |
-| `storage` | Reflink copies and hard links | none |
+| `storage` | Reflink copies, hard links, plain copies, and merging a diff onto its base | none |
+| `uffd` | The page server behind `tine-uffd`, and the working-set format | none |
+| `workload` | What `tine-touch` and `tine-dirty` do to memory | none |
 | `idalloc` | Allocates network slots | none |
 | `metrics`, `logging` | Prometheus metrics; structured logs with request and VM IDs | none |
 | `testenv` | Helpers that find test artifacts and skip tests that can't run | none |
@@ -171,7 +177,7 @@ tine ──HTTP──► tined ──vsock──► tine-agent ──► the com
 
 | Stage | What happens | p50 |
 |---|---|---|
-| wait | The VM's previous snapshot must be on disk first (see below) | 0 to 8 s |
+| wait | The VM's previous snapshot must be on disk first, and for 2 s (see below) | 0 to 10 s |
 | prepare | Give the jail an empty `/snapshot` directory for Firecracker to write into | under 0.1 ms |
 | pause | `PATCH /vm {"state": "Paused"}`: the vCPUs stop | 0.3 ms |
 | memory | `PUT /snapshot/create`: Firecracker writes `vmstate` and `memory`, without waiting for the disk (`sync_snapshot_files: false`) | about 160 ms |
@@ -194,7 +200,21 @@ A snapshot is refused (409 `busy`) while commands run in the VM, because the vso
 
 On this EBS volume a flush takes about 8 s per GiB, so back-to-back snapshots of one VM go at the disk's speed. That wait comes before the pause, not during it.
 
+4. Then it waits until that flush is 2 s old. Started just after a big flush, a snapshot's writes were throttled to the disk's speed, pausing a 256 MiB VM for 340 ms to 1.3 s instead of 50 ms, in one or two of every three back-to-back snapshots. It wasn't the cgroup's room or the page cache: two seconds after the flush, every snapshot paused for about 50 ms, whether the previous snapshot's pages were still cached or not. With the wait, nine back-to-back snapshots all paused it for 48 to 51 ms. Step 3's measurements missed this, because they deleted each snapshot straight away.
+
 **The kernel's dirty-page limit.** Until those pages are on disk they're dirty, and the kernel throttles anything that writes more when a cgroup has too many. At the default `vm.dirty_ratio` of 20%, that held a 4 GiB VM's snapshot to the disk's write speed, pausing the VM for 22 s. It also throttled a fork's parent: Firecracker handles disk and vsock on one thread, so the parent's agent stopped answering for seconds while its fork's snapshot was written out. `scripts/host-setup.sh` sets 60% in `/etc/sysctl.d/90-tine.conf`, and tined warns at startup when the setting is lower. The 4 GiB pause is now about 0.6 s (p50), and the parent no longer stalls. Background writeback still starts at `dirty_background_ratio` (10%).
+
+### Diff snapshots
+
+**In plain words:** a full snapshot writes all of a VM's memory, so the pause grows with the VM. A diff snapshot writes only the memory that changed since the VM's last save point, then builds the full memory file afterwards, once the VM is running again.
+
+With `--diff-snapshots`, every Firecracker tined starts tracks the pages its guest writes (KVM's dirty log). Each VM has a *base*: the snapshot its memory has changed from. That's the snapshot it was restored from (a template, say), and then each snapshot taken of it.
+
+1. **Before the pause**, tined hard-links the base's memory file into the new snapshot's directory, so the base can't be deleted from under it.
+2. **Paused**, Firecracker writes a `Diff`: a sparse file the size of the memory, with only the changed pages written and holes for the rest. The dirty log starts again.
+3. **Running again**, tined makes the new snapshot's memory: the base's, with the diff's data written over it at the same offsets (`storage.ApplyDiff`, which finds the data with `SEEK_DATA` and `SEEK_HOLE`). For a snapshot kept for later, the base is a reflink, which shares the unchanged pages with it on disk. For a fork, whose children restore from it at once, the base is copied through the page cache instead: a reflink's pages aren't in the cache, and the children would read them from the disk. `--diff-merge` picks one for both.
+
+The result is a whole memory file, like any other, so restoring, forking and deleting work as before, and the two snapshots are independent. A VM gets a full snapshot when it has no base: it was booted, it ran before tined restarted (tined can't know since when its pages are tracked), or its last snapshot failed after Firecracker began writing, which may have reset the tracking. Firecracker calls diff snapshots a developer preview, hence the flag. tined checks at startup that the snapshot store's filesystem reports holes: one that doesn't would make the holes read as zeros, and the merge would write them over the base.
 
 ### The snapshot store
 
@@ -244,7 +264,7 @@ What `/sync` can't change is anything a program worked out before the snapshot, 
 
 ### Templates
 
-- **Warming** (`tine image warm IMAGE`, `POST /v1/images/{name}/warm`): tined boots the image, waits for `systemctl is-system-running --wait` so every service has started, snapshots it as a `template`, and destroys the VM. It takes about 6.5 s. A snapshot fixes a VM's size, so a template is for one image at one size.
+- **Warming** (`tine image warm IMAGE`, `POST /v1/images/{name}/warm`): tined boots the image, waits for `systemctl is-system-running --wait` so every service has started, waits 2 s more, snapshots it as a `template`, and destroys the VM. It takes about 8.5 s. The 2 s matter: systemd says the boot is finished as it starts its last units, so a template saved at once had every restore finish that work, and creates took 125 ms instead of 62 ms. A snapshot fixes a VM's size, so a template is for one image at one size.
 - **Choosing.** `tine create` uses the newest template for its image and size, if this host can restore it and the image hasn't been imported again since. Otherwise it boots, and notes why on the VM. `--cold` always boots. Each VM records how it started: `cold`, `template` or `snapshot`.
 - **Keeping them usable.** tined keeps the images in `--warm-images` (default `base`) warm by itself. At startup and every 15 s, a missing or unusable template is warmed again in the background, so templates come back after a Firecracker upgrade, a kernel upgrade or a re-import. After a failure it waits 10 minutes, and warms of one image and size never overlap.
 
@@ -306,6 +326,31 @@ vm-xqqe5fhgxj                  running  base   1 GiB   1 GiB    1 GiB   2s
 
 Each of 30 idle children of a 256 MiB VM has an RSS of 100 MiB but a PSS of 14 MiB. The parent's RSS is its whole memory just after a fork, because taking the snapshot made Firecracker read every page. For a parent restored from a template, those are mostly the template's file in the page cache, which the kernel can reclaim.
 
+### Fork strategies and page servers
+
+**In plain words:** sharing the parent's memory file is one way to give children their memory, and step 4 measures it against the others. Creates from a template choose the same way. `--strategy` on `tine fork` and `tine create` picks one:
+
+| Strategy | The child's memory | Shared between children |
+|---|---|---|
+| `share` (the default) | Maps the snapshot's memory file privately: pages load from the page cache on first touch, and a write makes a private copy | Yes, until a child writes |
+| `copy` | Its own full copy of the memory file, made before it starts: the naive way, kept to compare against | No |
+| `uffd` | Anonymous memory, filled by a page server, a page at a time as the guest touches it | No |
+| `uffd-prefetch` | As `uffd`, and the pages a restore of this snapshot touched before are copied in before the guest asks | No |
+
+Rung 1 of the ladder, booting each VM, isn't a strategy: it's `tine create --cold`.
+
+**Page servers.** With `uffd`, Firecracker restores with its `Uffd` memory backend. It maps the guest's memory as empty anonymous memory, registers it with a userfaultfd, connects to a Unix socket in the jail, and sends the memory's layout with the userfaultfd attached. The page server, `tine-uffd`, maps the snapshot's memory file read-only and shared (one copy in the page cache, whatever the number of VMs), and answers each fault by copying the page in with `UFFDIO_COPY`. Firecracker resumes the VM straight away; pages arrive as they're needed. Pages the guest gives back through the balloon (`UFFD_EVENT_REMOVE`) read as zeros afterwards.
+
+tined starts one page server per VM, once the VM's Firecracker is up:
+
+- **As the VM's user, in the VM's cgroup** (`clone3` with `CgroupFD`), so its memory and threads count against the VM's limits, and stopping the VM stops it.
+- **With open files, not paths:** the listening socket, the memory file, a control socket to tined, and maybe a working set. The VM's user can't reach tined's directories.
+- **In its own session**, so it outlives tined restarting, as the VM does. It exits when Firecracker does.
+
+**Working sets.** A page server records which pages the guest faulted on. With `uffd-prefetch`, the first restore of a snapshot asks for them once the VM is synced, and tined saves them next to the snapshot's files as `workingset`, a bitmap of the memory file's pages. Later restores hand it to their page server, which copies those pages in, a few MiB per ioctl, while it serves faults. A fork with `uffd-prefetch` restores its first child alone, to record, then the rest; a template records on its first create. The idea is from the REAP paper.
+
+**The trade-off.** A page server copies every page the guest touches into memory of the VM's own, where `share` maps the page cache. So children cost the host their whole touched memory, not a share of it, but a child's first write to a page is an ordinary write, not a copy-on-write fault. `--page-server-huge-pages 2M` backs that memory with 2 MiB pages from the host's hugetlbfs pool (Firecracker allows them only with `Uffd`), and `--page-cluster` copies more than one page per fault.
+
 ### Admission control
 
 Before a create or a fork touches the host, three rules must hold for the VMs it would add:
@@ -337,6 +382,7 @@ limit of 62804 MiB (4.0 times the host's 15701 MiB); the VMs there now commit 10
 | Jail: uid | Each VM's Firecracker runs as its own unprivileged user, `200000 + slot`. The jail's files belong to it with mode 0700. |
 | Jail: cgroup | `cpu.max` (the VM's vCPUs), `memory.max` (twice the guest's memory plus 256 MiB, with room for one snapshot's memory in the page cache) and `pids.max` (128) for each Firecracker. |
 | Snapshot files | Read-only and owned by root. A restored VM's jail has hard links to them that its Firecracker can read but not write. |
+| Page server | Runs as the VM's user, in the VM's cgroup, with only the files tined handed it: the VM's own socket, the snapshot's memory (read-only) and its control socket. It holds the VM's userfaultfd, and nothing of any other VM. |
 | Network namespace | Each VM has its own network stack. Its only way out is the veth to the host, through the firewall below. |
 | Firewall | VMs reach the internet, and nothing else: not each other, not the host, not private addresses, not the EC2 metadata service. |
 | API socket | `/run/tine/tine.sock` is mode 0660, `root:tine`. Anyone else can't talk to tined at all. |
@@ -576,6 +622,15 @@ tined runs as `deploy/tined.service`, which `make deploy` installs:
 | `RuntimeDirectory=tine`, `StateDirectory=tine` | `/run/tine` for the socket, `/var/lib/tine` (0700) for the database |
 | `LimitNOFILE=1048576` | Each VM holds a few file descriptors |
 
+Optional behaviours, each off by default, are flags on `tined serve`, and `GET /healthz` lists the ones on as `features`. `bench/run.sh` turns them on one at a time with a systemd drop-in.
+
+| Flag | What it does |
+|---|---|
+| `--diff-snapshots`, `--diff-merge` | [Diff snapshots](#diff-snapshots) |
+| `--page-server`, `--page-cluster`, `--page-server-huge-pages 2M` | The page server binary, pages per fault, and huge pages for VMs it serves |
+| `--balloon` | Booted VMs get a balloon with free page reporting: the guest reports free pages, and Firecracker gives them back to the host |
+| `--ksm` | tined marks its memory mergeable (`PR_SET_MEMORY_MERGE`), which every Firecracker it starts inherits, so KSM can merge identical pages across VMs |
+
 ## Testing
 
 **In plain words:** the fast tests run anywhere in seconds, using fakes. The slow tests run on the real server, against real Firecracker and real VMs, and the last of them checks that nothing at all is left behind.
@@ -583,9 +638,10 @@ tined runs as `deploy/tined.service`, which `make deploy` installs:
 | Level | Command | Runs where | What it covers |
 |---|---|---|---|
 | Unit | `make check` (also CI on every push) | Mac, CI | Every package, with the race detector. Fakes: a fake Firecracker socket, a fake host that fails each create, snapshot and rollback stage in turn or holds one to catch the manager in the middle, and the real agent and client over Unix sockets. |
-| Integration | `make test-integration` | Dev server, as root | Each low-level package against the real thing: Firecracker (a snapshot loaded into a new process), the jailer, namespaces and nftables, reflinks, image import, and the VM manager booting, snapshotting, restoring and rolling back real VMs. |
+| Integration | `make test-integration` | Dev server, as root | Each low-level package against the real thing: Firecracker (a snapshot loaded into a new process), the jailer, namespaces and nftables, reflinks and diff merges on XFS, image import, the page server against a real userfaultfd, and the VM manager booting, snapshotting, restoring, rolling back and forking real VMs: through diff snapshots, checking a restore from a merged file byte for byte, and through page servers. |
 | End to end | `make e2e` | Dev server, real tined under systemd | Black-box through the API (list below), ending in a strict leak check |
-| Measure | `make measure` | Dev server | The numbers below |
+| Measure | `make measure` | Dev server | Quick numbers for each feature |
+| Benchmark | `make bench-all` (`bench/run.sh` on any KVM host) | Dev server, or a bare-metal host | Every scenario of step 4: see [results.md](results.md) |
 
 The e2e suite:
 
@@ -623,27 +679,33 @@ Bugs these tests caught before release:
 
 ## Measured numbers
 
-From `make measure` and `make e2e` on the dev server: an AWS m8i.xlarge (4 vCPUs, 16 GiB) in ap-south-1, running the VMs through **nested virtualization**, which adds overhead. Bare-metal numbers come in step 4. The setup was Firecracker v1.17.0, guest kernel 6.18.56, and the Ubuntu 24.04 base image, with VMs at the default 2 vCPUs and 1 GiB unless noted.
+Step 4's benchmarks, every way of giving a VM its memory side by side, the host settings and what breaks, are in [results.md](results.md), on the dev server and on bare metal. The dev server is an AWS m8i.xlarge (4 vCPUs, 16 GiB) in ap-south-1, running the VMs through **nested virtualization**, which adds overhead; the setup was Firecracker v1.17.0, guest kernel 6.18.56, and the Ubuntu 24.04 base image, with VMs at the default 2 vCPUs and 1 GiB unless noted. Its headline numbers (p50):
 
 | What | Result |
 |---|---|
-| Create from the template, one at a time (n=100) | p50 **111 ms**, p99 145 ms |
-| … restore (load and resume), agent answers, sync | 13 ms, 61 ms, 32 ms (p50) |
-| Cold-boot create, one at a time (n=100) | p50 **1.84 s**, p99 1.91 s |
-| … of which tine's own work (allocate to configure) | about **27 ms**; the rest is the guest booting |
-| Rollback (n=20) | p50 **127 ms**, p99 183 ms |
-| Snapshot pause: 256 MiB, 1 GiB, 4 GiB VMs (n=5 each) | p50 **68 ms**, **158 ms**, **602 ms** (4 GiB p99 4.2 s); 22 s at 4 GiB before `vm.dirty_ratio` was raised |
-| Fork of a 256 MiB VM into 1, 10, 30 | p50 **136 ms**, **397 ms**, **1.02 s**, with the parent paused 62 to 64 ms |
-| Fork of a 1 GiB VM into 10 (e2e) | about 870 ms, the parent paused about 230 ms |
-| Each of 30 idle fork children | RSS **100 MiB**, PSS **14 MiB** |
-| Most idle children on the dev server | **30**, set by the vCPU limit; they used 946 MiB of PSS, with 14 GiB still available |
-| A VM's next snapshot waits for the last to reach the disk | about 8 s per GiB |
-| Create with 5 at once (n=50, e2e) | p50 2.8 s, p99 3.2 s |
+| Create from the template, one at a time (n=100) | **57 ms** (p99 69 ms); 41 ms with `--strategy uffd-prefetch` |
+| … setup, restore (load and resume), agent answers, sync | 5 ms, 12 ms, 20 ms, 18 ms |
+| Cold-boot create, one at a time (n=100) | **1.83 s**, of which tine's own work is about 32 ms; the rest is the guest booting |
+| Fork of a 256 MiB VM into 1, 10, 30 | **138 ms**, **398 ms**, **1.02 s**, with the parent paused 64 ms |
+| Booting 1, 10, 30 VMs instead | 1.90 s, 7.49 s, 21.3 s |
+| Each of 30 idle fork children | RSS **105 MiB**, PSS **14 MiB**, against 109 MiB for a booted VM |
+| Snapshot pause: 256 MiB, 1 GiB, 4 GiB | **48 ms**, **157 ms**, **601 ms** (4 GiB p99 4.2 s); 4 to 6 ms with diff snapshots |
+| A VM's next snapshot waits for the last to reach the disk | about 8 s per GiB, and 2 s more |
+| Rollback (n=100) | **66 ms** |
+| Exec `true` through the API (n=200) | **1.9 ms**; about 1 ms of it inside the guest |
+| A fork child's first write to a page it shares | 62 µs; 1.1 µs per 4 KiB page with 2 MiB huge pages |
+| Most idle children of one 256 MiB VM | **31**, set by the vCPU limit, with 14.4 GiB still available |
+
+Measured earlier, with `make measure` and `make e2e`:
+
+| What | Result |
+|---|---|
 | Destroy (n=100) | p50 **32 ms**, p99 42 ms |
-| Exec `true` through the API (n=200) | p50 **1.8 ms**, p99 3.3 ms; about 1 ms of it inside the guest |
 | Exec `true` with the `tine` CLI (n=50) | about 6 ms, including starting the CLI |
 | Host memory per idle VM, booted (n=5, after 30 s) | Firecracker RSS **127 MiB** (124 MiB private); 168 MiB charged to its cgroup, including page cache |
 | Host memory per idle VM, from the template (n=5) | RSS 127 MiB, but only **19 MiB private**: 108 MiB is the template's memory file, shared; 24 MiB charged to its cgroup |
+| Fork of a 1 GiB VM into 10 (e2e) | about 870 ms, the parent paused about 230 ms |
+| Create with 5 at once (n=50, e2e) | p50 2.8 s, p99 3.2 s |
 | tined restart with VMs running | 41 ms; the VMs keep running |
 | tined back after `SIGKILL` | 2.2 s (systemd waits 2 s before restarting it) |
 | Image import (4 GiB disk) | about 2.6 s |
@@ -651,13 +713,17 @@ From `make measure` and `make e2e` on the dev server: an AWS m8i.xlarge (4 vCPUs
 
 A guest with 1 GiB uses about 127 MiB on the host when idle, because memory is only handed out when the guest touches it. A guest restored from a template uses less still, because most of its memory is the template's, shared through the page cache by every VM restored from it. Forks go further: an idle child of a 256 MiB VM costs 14 MiB, because nearly all its memory is its parent's, shared.
 
-The dev server's limits are its own. Its disk is a network volume, at about 150 MB/s for writes, which the snapshots' flushes and big snapshots run into. And its VMs run through nested virtualization, which limits how many guests it can run at once and makes every first touch of a guest page slow. Step 4 measures on bare metal.
+The dev server's limits are its own. Its disk is a network volume, at about 150 MB/s for writes, which the snapshots' flushes and big snapshots run into. And its VMs run through nested virtualization, which limits how many guests it can run at once and makes every first touch of a guest page slow. [results.md](results.md#nested-virtualization-against-bare-metal) compares it with bare metal.
 
 ## Known limits
 
-These are known and deliberate for v0.3.0. Most are what the next steps are for.
+These are known and deliberate for v0.4.0. Most are what the next steps are for.
 
-- **Snapshots of one VM wait for the disk.** Back-to-back snapshots, or forks, of one VM wait about 8 s per GiB for the last one to reach the disk, and a 4 GiB VM's snapshot pause varies (0.6 s at p50, 4.2 s at p99). Step 4 attacks this: diff snapshots, and local NVMe on bare metal.
+- **Snapshots of one VM wait for the disk.** Back-to-back snapshots, or forks, of one VM wait about 8 s per GiB for the last one to reach the disk, and 2 s more. The VM runs meanwhile; diff snapshots shorten the pause, not this wait.
+- **Diff snapshots and page servers are opt-in.** Firecracker calls diff snapshots a developer preview, so they're behind `--diff-snapshots`. A VM from before tined restarted gets a full snapshot first, as tined can't know since when its pages are tracked.
+- **Page-server VMs don't share memory.** Each VM restored through a page server has its own copy of every page it touched, where `share` maps the page cache. It needs its page server for as long as it runs: if the page server dies, the guest hangs at its next untouched page.
+- **A working set is recorded once.** A snapshot's working set is what its first restore through a page server touched by the time it was synced. It isn't refreshed, and a restore that then does something else gets those pages on demand.
+- **`--ksm` relies on Linux 6.7 or later**, where a process's mergeable setting survives exec, and on KSM running (`/sys/kernel/mm/ksm/run`).
 - **A fork's shared memory counts against its parent's cgroup.** The parent wrote the fork's memory file, so the kernel charges its pages to the parent. The parent has room for one fork's worth, so forking it again while the first fork's children run makes the kernel reclaim pages they share, which pauses the parent for longer (1.4 s seen for 256 MiB).
 - **Density on the dev server is set by nested virtualization.** About 60 guest vCPUs are the most it runs before KVM fails, so tine's vCPU limit stops at 32. Memory would allow far more children. Forks of 50 and 100 children wait for bare metal.
 - **A template is for one size.** A create of another size boots, unless that size is warmed too (`tine image warm --vcpus N --memory M`), and only `--warm-images` at the default size are kept warm by themselves.

@@ -2,7 +2,7 @@
 
 Fork a running microVM into many copies in milliseconds. Built on [Firecracker](https://github.com/firecracker-microvm/firecracker).
 
-> **Status: v0.3.0, step 3 done.** tined runs isolated microVMs, and the `tine` command creates them, runs commands in them, snapshots them, rolls them back, **forks them into many running copies that share their memory**, and destroys them. New VMs start from pre-booted templates in about a tenth of a second. Step 4 measures and speeds it all up on bare metal. The step-by-step build plan is in [docs/PLAN.md](docs/PLAN.md), and the reasons behind the project are in [BRIEF.md](BRIEF.md).
+> **Status: v0.4.0, step 4 done.** tined runs isolated microVMs, and the `tine` command creates them, runs commands in them, snapshots them, rolls them back, **forks them into many running copies that share their memory**, and destroys them. New VMs start from pre-booted templates in about a twentieth of a second. Step 4 measured every way of giving a VM its memory side by side, on nested virtualization and on bare metal, and what breaks: [docs/results.md](docs/results.md). Step 5 is a Python SDK and an AI agent demo. The step-by-step build plan is in [docs/PLAN.md](docs/PLAN.md), and the reasons behind the project are in [BRIEF.md](BRIEF.md).
 
 ## How it works
 
@@ -12,21 +12,20 @@ A snapshot freezes a VM for a moment and saves its memory, devices and disk, rea
 
 A fork restores one snapshot of a running VM many times at once. The VM is paused only for the snapshot, and every child starts where it was, programs and all, sharing its memory until it changes a page. Admission control refuses any create or fork the host hasn't the memory or CPUs for.
 
-Measured on the dev server (an m8i.xlarge, through nested virtualization):
+Measured on the dev server (an m8i.xlarge, through nested virtualization; [results.md](docs/results.md) has bare metal too):
 
-| What | Result |
+| What | p50 |
 |---|---|
-| Create from a template, to a VM that runs commands | 111 ms p50, 145 ms p99 |
-| Create by booting | 1.84 s p50, 1.91 s p99 |
-| Fork a VM into 10 running copies | 397 ms p50 for a 256 MiB VM, paused 62 ms; about 870 ms for a 1 GiB VM, paused about 230 ms |
-| Host memory for an idle fork child | 14 MiB (PSS), though its RSS is 100 MiB |
-| Roll a VM back to a snapshot | 127 ms p50 |
-| Snapshot: how long a 1 GiB VM is paused | 158 ms p50 (68 ms at 256 MiB; 602 ms at 4 GiB) |
-| Run `true` in a VM, through the API | 1.8 ms p50 |
-| Destroy | 32 ms p50 |
-| Host memory for an idle 1 GiB VM | 127 MiB booted; only 19 MiB of it its own when restored from a template |
+| Create from a template, to a VM that runs commands | 57 ms (41 ms through a page server with prefetch) |
+| Create by booting | 1.83 s |
+| Fork a 256 MiB VM into 10 running copies | 398 ms, the parent paused 64 ms (booting 10 instead: 7.5 s) |
+| Fork it into 30 | 1.02 s (booting 30: 21 s) |
+| Host memory for an idle fork child, one of 30 | 14 MiB (PSS), against 109 MiB for a booted VM |
+| Snapshot: how long a VM is paused | 48 ms at 256 MiB, 157 ms at 1 GiB, 601 ms at 4 GiB; 4 to 6 ms with diff snapshots |
+| Roll a VM back to a snapshot | 66 ms |
+| Run `true` in a VM, through the API | 1.9 ms |
 
-The full design, with the numbers and the known limits, is in [docs/architecture.md](docs/architecture.md).
+The full design and the known limits are in [docs/architecture.md](docs/architecture.md); every benchmark, and what breaks, in [docs/results.md](docs/results.md).
 
 ## Layout
 
@@ -35,11 +34,13 @@ The full design, with the numbers and the known limits, is in [docs/architecture
 | `BRIEF.md` | Project brief: goals, design, build order, reading list |
 | `docs/PLAN.md` | The build plan: every step, its design, tasks, and "done when" checks |
 | `docs/architecture.md` | How tine works: every part, snapshots and templates, the isolation, recovery, tests and measured numbers |
+| `docs/results.md` | Step 4's benchmarks: every way of giving VMs their memory, measured side by side, and what breaks |
 | `docs/` | Also the step-by-step walkthroughs |
-| `cmd/`, `internal/` | The Go code: `tine` (CLI), `tined` (service), `tine-agent` (runs in each VM) |
+| `cmd/`, `internal/` | The Go code: `tine` (CLI), `tined` (service), `tine-agent` (runs in each VM), `tine-uffd` (a page server), `tine-bench` (the benchmarks) and its workloads |
+| `bench/` | `run.sh`, every benchmark in one command; `analyze.py`, the charts; `results/`, the measured runs |
 | `deploy/` | `tined.service`, the systemd unit `make deploy` installs |
 | `e2e/` | End-to-end tests against the real tined: `make e2e` |
-| `Makefile` | `make build`, `make check`, `make deploy`, `make e2e`, `make measure`. Run `make` to list them all. |
+| `Makefile` | `make build`, `make check`, `make deploy`, `make e2e`, `make measure`, `make bench-all`. Run `make` to list them all. |
 | `scripts/dev-server.sh` | Create, start, stop and SSH into the AWS dev server. Runs on your Mac. |
 | `scripts/host-setup.sh` | Prepares the server: KVM, the `/srv/tine` data volume, Firecracker, a guest kernel and disk image |
 | `scripts/measure.sh` | Measures creates, execs, memory, snapshots and rollbacks against the running tined (`make measure`) |
@@ -120,13 +121,17 @@ More:
 
 - `tine create --vcpus 4 --memory 2G --ttl 30m`. VMs are destroyed automatically when their time is up, after 1 hour by default. `tine create -q` prints just the ID, for scripts.
 - `tine create --cold` boots instead of restoring. A template is for one size, so other sizes boot unless you warm one: `tine image warm base --vcpus 4 --memory 2G`. `tine images` shows each image's templates. tined keeps `base` warm at the default size by itself, even after an upgrade.
-- `tine fork VM -n N` makes N children; `-q` prints just their IDs, for scripts. `tine ls --tree` shows who was forked from whom, with each VM's RSS and PSS (PSS splits shared pages between the VMs sharing them, so it's what each really costs).
+- `tine fork VM -n N` makes N children; `-q` prints just their IDs, for scripts. `--strategy` picks how they get their memory: `share` (the default), `copy`, `uffd` (a page server copies each page in as it's touched) or `uffd-prefetch` (and copies in, before they ask, the pages the first child touched). `tine create --strategy` does the same for a VM restored from a template. `tine ls --tree` shows who was forked from whom, with each VM's RSS and PSS (PSS splits shared pages between the VMs sharing them, so it's what each really costs).
 - `tine snapshot ls` lists snapshots and the VMs running from each, `tine snapshot inspect` shows one, and `tine snapshot rm` deletes them. A snapshot that VMs run from can't be deleted, and a destroyed VM's snapshots go by themselves.
 - `tine exec` takes `-e KEY=VALUE`, `-w DIR`, `--timeout 30s`, and `-i` to pipe stdin in. Output streams as it happens, and Ctrl+C stops the command in the VM too.
 - `tine inspect VM` shows everything, including how the VM started and where each step's time went. `tine version` also shows tined's version.
 - Every command takes `--json`.
 
 tined's API is plain HTTP on `/run/tine/tine.sock` (see `internal/api`), so `curl --unix-socket /run/tine/tine.sock http://tined/v1/vms` works too.
+
+Some of what step 4 measured is off by default, as flags on `tined serve`: `--diff-snapshots` (a snapshot after a VM's first writes only the memory it changed), `--balloon` (booted VMs give their free pages back), `--ksm` (identical pages are merged across VMs) and `--page-server-huge-pages 2M`. [docs/architecture.md](docs/architecture.md#running-it-systemd) has them all.
+
+To rerun the benchmarks, see [docs/results.md](docs/results.md#rerunning-it): `bench/run.sh` on any KVM host, or `make bench-all` from a Mac against the dev server.
 
 To boot a VM by hand instead, without tined, follow [docs/step-0-boot-one-vm.md](docs/step-0-boot-one-vm.md).
 
