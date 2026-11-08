@@ -689,21 +689,21 @@ with Sandbox.create(image="python") as sb:            # destroyed automatically 
 
 ### Tasks
 
-- [ ] **5.1 Image builder:** `tine image build` from a Dockerfile, plus `images/python`.
-- [ ] **5.2 Files:** agent and API endpoints for reading, writing and uploading files.
-- [ ] **5.3 Remote access:** `tine dial-stdio` and `--host ssh://…`.
-- [ ] **5.4 Python SDK:** sync and async clients, the `Sandbox` class, tests, and a README with examples.
-- [ ] **5.5 Demo tasks:** 10 small repos with bugs, failing tests and hidden tests.
-- [ ] **5.6 Demo agent:** tool-use loop, fork N, parallel attempts, pick the winner, report.
-- [ ] **5.7 Demo results:** best-of-1 vs. best-of-5, fork vs. re-setup, written into `docs/results.md`.
-- [ ] **5.8 Fork-tree view** (optional): `tine top`.
-- [ ] **5.9 Polish:** README, GIF, docs, license.
-- [ ] **5.10 Writeup:** the blog post. Tag `v1.0.0`.
+- [x] **5.1 Image builder:** `tine image build` from a Dockerfile, plus `images/python`. *It's `tined image build NAME -f Dockerfile` on the server: Docker builds the image on the host's network, its filesystem is exported as a tar stream, and the import installs tine-agent, packs the disk and warms a template, as for `base`. `images/python` is Ubuntu 24.04 with systemd, Python 3, pip, pytest and git; it builds in about 34 s. `host-setup.sh` installs Docker with its iptables and bridge off, so it leaves tine's nftables rules alone.*
+- [x] **5.2 Files:** agent and API endpoints for reading, writing and uploading files. *Agent protocol version 3: `GET` and `PUT /files` (written to a temporary file and renamed into place) and `PUT /archive` (a tar stream, gzipped or not, that can't write outside its directory or through a symlink), up to 8 GiB each. tined passes them through as `/v1/vms/{id}/files` and `/archive`, holding off snapshots meanwhile, and `tine cp` copies either way. An image with an older agent gets a clear error saying to import it again.*
+- [x] **5.3 Remote access:** `tine dial-stdio` and `--host ssh://…`. *`--host` (or `TINE_HOST`) runs `ssh HOST tine dial-stdio` and speaks the API over its stdin and stdout; `TINE_SSH` replaces the `ssh` command, and `dev-server.sh ssh-config` writes an SSH config for the dev server.*
+- [x] **5.4 Python SDK:** sync and async clients, the `Sandbox` class, tests, and a README with examples. *`sdk/python`, on httpx: `Client`, `AsyncClient`, `Sandbox` and `AsyncSandbox`, reaching another host through an SSH tunnel to tined's socket. Tested against a fake tined, in CI too.*
+- [x] **5.5 Demo tasks:** 10 small repos with bugs, failing tests and hidden tests. *Each has a visible failing test, hidden tests that check the fix is general, and a reference fix; `check_tasks.py` checks all ten.*
+- [x] **5.6 Demo agent:** tool-use loop, fork N, parallel attempts, pick the winner, report. *`examples/best-of-n`: Claude (the latest Sonnet, with prompt caching) with tools to run commands and read and write files, a budget in dollars, and `--scripted`, a stand-in that checks the pipeline without a model. `make demo` runs it from the Mac against the dev server; the API key stays on the Mac.*
+- [ ] **5.7 Demo results:** best-of-1 vs. best-of-5, fork vs. re-setup, written into `docs/results.md`. *Fork against re-setup is measured, with the scripted stand-in: forking a set-up sandbox into 5 takes about half a second, against 1 to 5 s to set up each tiny repository. It also found forks of 1 GiB sandboxes stalling for 21 s behind other snapshots' writes on the EBS volume. Best-of-1 against best-of-5 needs a run with Claude (`make demo`).*
+- [x] **5.8 Fork-tree view** (optional): `tine top`. *Every VM as a live tree of forks, with its memory, redrawn every second: new VMs yellow, failed ones red.*
+- [ ] **5.9 Polish:** README, GIF, docs, license. *Done but the GIF: the README says what tine is and why, with the CLI, the SDK and the demo; `docs/api.md` and `docs/operations.md`; Apache 2.0. The GIF wants `vhs` and a real demo run.*
+- [ ] **5.10 Writeup:** the blog post. Tag `v1.0.0`. *Drafted in [writeup.md](writeup.md), with every number but the demo's results with Claude. Step 5's code is released as v0.5.0; v1.0.0 waits for those results and the published post.*
 
 ### Done when
 
 - [ ] `python examples/best-of-n/run.py` solves the tasks with forks and prints a clear comparison.
-- [ ] Someone new can read the README and understand what tine is, why it's fast, and how to run it.
+- [x] Someone new can read the README and understand what tine is, why it's fast, and how to run it.
 - [ ] The writeup is published.
 
 ---
