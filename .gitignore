@@ -17,3 +17,6 @@ guest_key.pub
 
 # make demo writes the dev server SSH config here.
 .tine-ssh-config
+
+# The AWS profile dev-server.sh uses.
+.tine-aws-profile

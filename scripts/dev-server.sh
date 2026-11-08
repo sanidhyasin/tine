@@ -34,11 +34,18 @@
 # (96 vCPUs, 192 GiB, 4 x 900 GB NVMe) is $4.752/hour in ap-south-1 (checked
 # 2026-11-07), and needs an on-demand vCPU quota of at least 96.
 #
-# The AWS profile is TINE_AWS_PROFILE: there's no default.
+# The AWS profile is TINE_AWS_PROFILE, or the name in the file .tine-aws-profile
+# at the repository's root (git ignores it). There's no default: the script
+# won't fall back to whatever AWS profile happens to be the default.
 
 set -euo pipefail
 
-PROFILE="${TINE_AWS_PROFILE:?set TINE_AWS_PROFILE to the AWS profile to use}"
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PROFILE="${TINE_AWS_PROFILE:-$(cat "$REPO_DIR/.tine-aws-profile" 2>/dev/null || true)}"
+if [ -z "$PROFILE" ]; then
+  echo "dev-server.sh: set TINE_AWS_PROFILE, or write the AWS profile's name into .tine-aws-profile" >&2
+  exit 1
+fi
 REGION="$(aws configure get region --profile "$PROFILE" 2>/dev/null || true)"
 REGION="${REGION:-ap-south-1}"
 TYPE="${TINE_INSTANCE_TYPE:-m8i.xlarge}"   # 4 vCPU, 16 GiB. c8i/m8i/r8i support nested virtualization.
@@ -56,7 +63,6 @@ case "$TYPE" in
   *)        CPU_OPTIONS=(--cpu-options NestedVirtualization=enabled) ;;
 esac
 AMI_PARAM="/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id"
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 SSH_OPTS=(-i "$SSH_KEY" -o "UserKnownHostsFile=$KNOWN_HOSTS" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5)
 

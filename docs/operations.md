@@ -93,7 +93,7 @@ After a crash, tined reconciles on start: VMs whose Firecracker died are marked 
 
 ## The dev server
 
-`scripts/dev-server.sh` manages the AWS dev server, in the AWS profile named by `TINE_AWS_PROFILE`:
+`scripts/dev-server.sh` manages the AWS dev server, in the AWS profile named by `TINE_AWS_PROFILE` or in the file `.tine-aws-profile` (git ignores it):
 
 ```bash
 ./scripts/dev-server.sh up        # create or start it (under a minute)
