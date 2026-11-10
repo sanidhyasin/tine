@@ -477,3 +477,25 @@ func TestStoredTimesSortChronologically(t *testing.T) {
 		t.Errorf("%v stored as %q, want %q", base.In(ist), got, formatTime(base))
 	}
 }
+
+func TestVMNetwork(t *testing.T) {
+	s, _ := openTest(t)
+	ctx := context.Background()
+	if got := mustCreate(t, s, newVM("vm-online", 0)); got.Network != NetworkDefault {
+		t.Errorf("a VM with no network given has %q, want %q", got.Network, NetworkDefault)
+	}
+	offline := newVM("vm-offline", 1)
+	offline.Network = NetworkNone
+	mustCreate(t, s, offline)
+	if got, err := s.GetVM(ctx, "vm-offline"); err != nil || got.Network != NetworkNone {
+		t.Errorf("GetVM = %+v, %v; want network none", got, err)
+	}
+	bad := newVM("vm-bad", 2)
+	bad.Network = "bridged"
+	if _, err := s.CreateVM(ctx, bad); err == nil {
+		t.Error("CreateVM with an unknown network: want an error")
+	}
+	if _, err := s.UpdateVM(ctx, "vm-offline", "", func(v *VM) error { v.Network = NetworkDefault; return nil }); err == nil {
+		t.Error("changing a VM's network: want an error")
+	}
+}

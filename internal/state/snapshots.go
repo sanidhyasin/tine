@@ -15,7 +15,8 @@ type SnapshotKind string
 
 const (
 	// SnapshotKindVM is a save point of a VM, taken on request. It belongs to
-	// that VM, and goes when the VM does, unless VMs still run from it.
+	// that VM, and goes when the VM does, unless VMs still run from it or
+	// it's retained.
 	SnapshotKindVM SnapshotKind = "vm"
 	// SnapshotKindTemplate is an image booted once and saved when ready, so
 	// new VMs can start from it instead of booting. Only the newest template
@@ -53,6 +54,9 @@ type Snapshot struct {
 	MemoryMiB int
 	// SizeBytes is how much disk its files take.
 	SizeBytes int64
+	// Retained snapshots are kept until they're deleted, even once their VM
+	// is destroyed. Only a VM's snapshot (SnapshotKindVM) can be retained.
+	Retained bool
 	// Metadata is its snapshot.json, set when it becomes ready.
 	Metadata json.RawMessage
 
@@ -68,14 +72,17 @@ func (s *Store) CreateSnapshot(ctx context.Context, snap Snapshot) (Snapshot, er
 	if snap.Kind != SnapshotKindVM && snap.Kind != SnapshotKindTemplate && snap.Kind != SnapshotKindFork {
 		return Snapshot{}, fmt.Errorf("create snapshot %s: bad kind %q", snap.ID, snap.Kind)
 	}
+	if snap.Retained && snap.Kind != SnapshotKindVM {
+		return Snapshot{}, fmt.Errorf("create snapshot %s: only a VM's snapshot can be retained, not a %s", snap.ID, snap.Kind)
+	}
 	now := s.now()
 	snap.State = SnapshotCreating
 	snap.CreatedAt, snap.UpdatedAt = now, now
 	snap.SizeBytes, snap.Metadata = 0, nil
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO snapshots (id, kind, state, vm_id, image, vcpus, memory_mib, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		snap.ID, snap.Kind, snap.State, nullString(snap.VMID), snap.Image, snap.VCPUs, snap.MemoryMiB,
+		INSERT INTO snapshots (id, kind, state, vm_id, image, vcpus, memory_mib, retained, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		snap.ID, snap.Kind, snap.State, nullString(snap.VMID), snap.Image, snap.VCPUs, snap.MemoryMiB, snap.Retained,
 		formatTime(now), formatTime(now))
 	if err != nil {
 		if isConstraint(err) {
@@ -225,7 +232,7 @@ func (s *Store) LatestTemplate(ctx context.Context, image string, vcpus, memoryM
 // GarbageSnapshots returns the snapshots nothing needs any more, oldest
 // first: ready snapshots that no live VM runs from and that are either
 //
-//   - a VM's snapshot, whose VM is destroyed or gone,
+//   - a VM's snapshot that isn't retained, whose VM is destroyed or gone,
 //   - a fork's snapshot, or
 //   - a template that a newer one has replaced.
 //
@@ -242,7 +249,7 @@ func (s *Store) GarbageSnapshots(ctx context.Context) ([]Snapshot, error) {
 		   OR (s.state = 'ready'
 		       AND NOT EXISTS (SELECT 1 FROM vms v WHERE v.snapshot_id = s.id AND v.state != 'destroyed')
 		       AND (s.kind = 'fork'
-		         OR (s.kind = 'vm'
+		         OR (s.kind = 'vm' AND s.retained = 0
 		             AND NOT EXISTS (SELECT 1 FROM vms v WHERE v.id = s.vm_id AND v.state != 'destroyed'))
 		         OR (s.kind = 'template'
 		             AND EXISTS (SELECT 1 FROM snapshots n
@@ -254,7 +261,7 @@ func (s *Store) GarbageSnapshots(ctx context.Context) ([]Snapshot, error) {
 
 // --- row mapping ---
 
-const snapshotColumns = "id, kind, state, vm_id, image, vcpus, memory_mib, size_bytes, metadata, created_at, updated_at"
+const snapshotColumns = "id, kind, state, vm_id, image, vcpus, memory_mib, size_bytes, retained, metadata, created_at, updated_at"
 
 func getSnapshot(ctx context.Context, q querier, id string) (Snapshot, error) {
 	snap, err := scanSnapshot(q.QueryRowContext(ctx, "SELECT "+snapshotColumns+" FROM snapshots WHERE id = ?", id))
@@ -289,7 +296,7 @@ func scanSnapshot(row scanner) (Snapshot, error) {
 		created, updated string
 	)
 	if err := row.Scan(&snap.ID, &kind, &st, &vmID, &snap.Image, &snap.VCPUs, &snap.MemoryMiB,
-		&snap.SizeBytes, &metadata, &created, &updated); err != nil {
+		&snap.SizeBytes, &snap.Retained, &metadata, &created, &updated); err != nil {
 		return Snapshot{}, err
 	}
 	snap.Kind, snap.State, snap.VMID = SnapshotKind(kind), SnapshotState(st), vmID.String

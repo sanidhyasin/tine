@@ -313,7 +313,12 @@ func TestMigrationToForksKeepsSnapshots(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mustSnapshot(t, old, template("snap-tmpl", "base", 1024), true)
+	// Written as that version of tine wrote it: its table has fewer columns.
+	if _, err := old.db.ExecContext(ctx, `INSERT INTO snapshots (id, kind, state, image, vcpus, memory_mib, size_bytes, metadata, created_at, updated_at)
+		VALUES ('snap-tmpl', 'template', 'ready', 'base', 2, 1024, 1073741824, ?, ?, ?)`,
+		string(testMetadata), formatTime(time.Now()), formatTime(time.Now())); err != nil {
+		t.Fatal(err)
+	}
 	_ = old.Close()
 
 	s, err := Open(ctx, path)
@@ -353,5 +358,106 @@ func TestForkSnapshotsAreGarbageOnceUnused(t *testing.T) {
 	}
 	if _, err := s.UpdateVM(ctx, "vm-child", "", func(v *VM) error { v.ParentID = "vm-other"; return nil }); err == nil {
 		t.Error("changing a VM's parent: want an error")
+	}
+}
+
+// A retained snapshot outlives its VM: it's never garbage, only deleted on
+// request, and still not while a VM runs from it.
+func TestRetainedSnapshotsOutliveTheirVM(t *testing.T) {
+	ctx := context.Background()
+	s, _ := openTest(t)
+	mustCreate(t, s, newVM("vm-agent", 0))
+	kept := vmSnapshot("snap-kept", "vm-agent")
+	kept.Retained = true
+	if got := mustSnapshot(t, s, kept, true); !got.Retained {
+		t.Errorf("CreateSnapshot dropped Retained: %+v", got)
+	}
+	mustSnapshot(t, s, vmSnapshot("snap-plain", "vm-agent"), true)
+	if got, err := s.GetSnapshot(ctx, "snap-kept"); err != nil || !got.Retained {
+		t.Errorf("GetSnapshot = %+v, %v; want it retained", got, err)
+	}
+	if got, err := s.GetSnapshot(ctx, "snap-plain"); err != nil || got.Retained {
+		t.Errorf("GetSnapshot = %+v, %v; want it not retained", got, err)
+	}
+
+	destroy(t, s, "vm-agent")
+	if g, _ := s.GarbageSnapshots(ctx); len(g) != 1 || g[0].ID != "snap-plain" {
+		t.Errorf("garbage once the VM is destroyed = %+v, want only the snapshot that isn't retained", g)
+	}
+
+	// A VM restored from it after its VM is gone holds it, as any other.
+	child := newVM("vm-step-7", 1)
+	child.SnapshotID, child.Source = "snap-kept", SourceSnapshot
+	mustCreate(t, s, child)
+	if _, err := s.MarkSnapshotDeleting(ctx, "snap-kept"); !errors.Is(err, ErrInUse) {
+		t.Errorf("deleting a retained snapshot a VM runs from = %v, want ErrInUse", err)
+	}
+	destroy(t, s, "vm-step-7")
+	if g, _ := s.GarbageSnapshots(ctx); len(g) != 1 || g[0].ID != "snap-plain" {
+		t.Errorf("garbage once nothing runs from it = %+v, still want only snap-plain", g)
+	}
+	if _, err := s.MarkSnapshotDeleting(ctx, "snap-kept"); err != nil {
+		t.Fatalf("deleting it on request: %v", err)
+	}
+	if err := s.DeleteSnapshotRecord(ctx, "snap-kept"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestOnlyAVMsSnapshotCanBeRetained(t *testing.T) {
+	ctx := context.Background()
+	s, _ := openTest(t)
+	for _, snap := range []Snapshot{
+		{ID: "snap-fork", Kind: SnapshotKindFork, VMID: "vm-p", Image: "base", VCPUs: 2, MemoryMiB: 1024, Retained: true},
+		{ID: "snap-tmpl", Kind: SnapshotKindTemplate, Image: "base", VCPUs: 2, MemoryMiB: 1024, Retained: true},
+	} {
+		if _, err := s.CreateSnapshot(ctx, snap); err == nil {
+			t.Errorf("a retained %s snapshot: want an error", snap.Kind)
+		}
+	}
+}
+
+// Migration 4 adds snapshots' retained and VMs' network: the rows already
+// there get the old behaviour.
+func TestMigrationToRetainKeepsRows(t *testing.T) {
+	ctx := context.Background()
+	path := t.TempDir() + "/tine.db"
+	upTo3 := fstest.MapFS{}
+	for _, name := range []string{"migrations/0001_init.sql", "migrations/0002_snapshots.sql", "migrations/0003_forks.sql"} {
+		data, err := fs.ReadFile(migrationFiles, name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		upTo3[name] = &fstest.MapFile{Data: data}
+	}
+	old, err := open(ctx, path, upTo3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := formatTime(time.Now())
+	for _, q := range []string{
+		`INSERT INTO vms (id, state, image, vcpus, memory_mib, slot, uid, created_at, updated_at) VALUES ('vm-old', 'running', 'base', 2, 1024, 0, 200000, '` + now + `', '` + now + `')`,
+		`INSERT INTO snapshots (id, kind, state, vm_id, image, vcpus, memory_mib, created_at, updated_at) VALUES ('snap-old', 'vm', 'ready', 'vm-old', 'base', 2, 1024, '` + now + `', '` + now + `')`,
+	} {
+		if _, err := old.db.ExecContext(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = old.Close()
+
+	s, err := Open(ctx, path)
+	if err != nil {
+		t.Fatalf("migrating to 4: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+	if vm, err := s.GetVM(ctx, "vm-old"); err != nil || vm.Network != NetworkDefault {
+		t.Errorf("an old VM after the migration = %+v, %v; want the default network", vm, err)
+	}
+	if snap, err := s.GetSnapshot(ctx, "snap-old"); err != nil || snap.Retained {
+		t.Errorf("an old snapshot after the migration = %+v, %v; want it not retained", snap, err)
+	}
+	destroy(t, s, "vm-old")
+	if g, _ := s.GarbageSnapshots(ctx); len(g) != 1 || g[0].ID != "snap-old" {
+		t.Errorf("garbage = %+v, want the old snapshot of the destroyed VM", g)
 	}
 }
