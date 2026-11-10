@@ -199,7 +199,7 @@ tine ──HTTP──► tined ──vsock──► tine-agent ──► the com
 
 The manager runs each step itself through small host calls, so unit tests can fail each step in turn. Whatever fails after the pause, the VM is resumed, and a VM that can't be resumed is marked `failed`. Once the VM is paused, the snapshot runs to the end even if the client hangs up.
 
-A snapshot is refused (409 `busy`) while commands run in the VM, because the vsock reset would cut them off. A command that arrives during a snapshot waits for it. A VM may have 16 snapshots, and a snapshot must leave 2 GiB of disk free (507 `no_space`).
+A snapshot is refused (409 `busy`) while commands run in the VM, because the vsock reset would cut them off. A command that arrives during a snapshot waits for it. A VM may have 16 snapshots, and 256 retained ones besides (see [Retained snapshots](#retained-snapshots)), and a snapshot must leave 2 GiB of disk free (507 `no_space`).
 
 **Snapshots and the page cache.** Firecracker writes the memory file through the page cache, and Linux charges those pages to the writer's cgroup, which is the VM's. With the step 1 limit (memory plus 256 MiB), a second snapshot made the kernel write the first one's dirty pages to disk while the VM was paused, which took 11.7 s, or kill Firecracker for running out of memory. The real-VM test found this. Now:
 
@@ -239,7 +239,7 @@ The result is a whole memory file, like any other, so restoring, forking and del
 - **Atomic.** A snapshot is gathered in `.new-<id>` and renamed into place when it's complete, so a directory named after a snapshot always holds a whole one.
 - **Read-only, owned by root.** Restored VMs get hard links to `vmstate` and `memory`, which they can read but not write. Firecracker requires the memory file to stay unchanged while any VM runs from it.
 - **Compatibility.** `snapshot.json` records the Firecracker version, CPU model and host kernel. Firecracker only restores a snapshot on the same software and hardware it was taken on, so all three must match (409 `incompatible`). It also records which build of the image the VM ran, with the size, the bytes of each file and the stage timings.
-- **Records.** The `snapshots` table holds each snapshot's kind (`vm` or `template`) and state (`creating`, `ready`, `deleting`). Each VM's `snapshot_id` names the snapshot it runs from. "In use" is a query, the live VMs with that `snapshot_id`, rather than a counter that could drift. Claiming a snapshot for a restore and marking it for deletion are each one transaction, so they can't race; a test runs them against each other 20 times.
+- **Records.** The `snapshots` table holds each snapshot's kind (`vm`, `template` or `fork`), state (`creating`, `ready`, `deleting`), and whether it's retained. Each VM's `snapshot_id` names the snapshot it runs from. "In use" is a query, the live VMs with that `snapshot_id`, rather than a counter that could drift. Claiming a snapshot for a restore and marking it for deletion are each one transaction, so they can't race; a test runs them against each other 20 times.
 
 ### Restoring
 
@@ -291,7 +291,18 @@ The VM keeps its ID, network namespace, slot, uid, hostname and machine ID; ever
 
 - `DELETE /v1/snapshots/{id}`, or `tine snapshot rm`, is refused (409 `in_use`) while any live VM runs from the snapshot, and while it's still being taken.
 - Every 15 s the reaper deletes what nothing needs any more, once no VM runs from it: the snapshots of destroyed VMs, and templates that a newer one replaced or whose image is gone from the disk. Whether an image is gone is checked on disk, because the images table only knows the images registered at startup; a test caught the first version deleting a newly imported image's template.
-- So snapshots never outlive their VMs, whose time to live is an hour by default.
+- So snapshots never outlive their VMs, whose time to live is an hour by default, unless they're retained.
+
+### Retained snapshots
+
+**In plain words:** a retained snapshot is a save point kept until someone deletes it. An agent can take one before each of its steps, finish, and have its VM destroyed; later, any step can be restored, many times over, to try it again another way.
+
+- `POST /v1/vms/{id}/snapshots {"retain": true}`, or `tine snapshot --retain VM`, takes an ordinary snapshot of the kind `vm`, marked retained in its record (migration 4). Only a VM's snapshot can be retained; a fork's or a template's can't.
+- **Garbage collection skips it.** A VM's snapshot is garbage once its VM is gone, unless it's retained. The record is in SQLite and the files in the snapshot store, so it survives tined restarting like anything else: reconcile keeps every ready snapshot that has a record.
+- **Deleting it is the usual delete:** `DELETE /v1/snapshots/{id}`, refused (409 `in_use`) while VMs run from it, and (409 `busy`) while a fork is restoring from it.
+- **One before every step.** The e2e test takes 40 of a 256 MiB VM, one after each command, as an agent would before each model call. Each took 3.1 s, nearly all of it waiting for the last one to reach the disk and then 2 s more (see [above](#taking-a-snapshot)), with the VM running; it was paused for 50 ms (p50, 64 ms at most). Any of the 40 could be restored once the VM was gone.
+- **Its own limit.** Retained snapshots don't count against a VM's 16 snapshots (`--max-snapshots-per-vm`). They have a limit of their own, 256 per VM (`--max-retained-snapshots-per-vm`), as a backstop against a loop gone wrong. The disk is the real limit: each holds up to the VM's memory, plus a reflink of its disk that shares most blocks with the image, and every snapshot must leave 2 GiB free.
+- **Restoring one** is a [fork of a snapshot](#forking-a-snapshot). Its VM's record may be gone by then (destroyed VMs' records are purged after 7 days); the snapshot doesn't need it.
 
 ## Forks
 
@@ -316,7 +327,30 @@ The answer is 201 if any child was made, with each child's VM or error. Once the
 
 The parent's pause doesn't grow with the number of children; restoring them goes at about 32 ms per child, four at a time. A fork of 10 of a 1 GiB, 2-vCPU VM takes about 870 ms, with the parent paused about 230 ms.
 
+The children have the default network unless the fork asks for `"network": "none"` (see [Offline VMs](#offline-vms)). They don't inherit the parent's: a fork of an offline VM is online unless it says otherwise.
+
 **A fork's snapshot** is garbage as soon as no child runs from it, even while its parent lives, so forking one VM again and again doesn't pile snapshots up. Between being written and being claimed by its first child, it would look like garbage, so the fork *pins* it: the reaper skips pinned snapshots, and deleting one is 409 `busy`. A child can roll back to its fork's snapshot, back to the moment it was made.
+
+### Forking a snapshot
+
+`POST /v1/snapshots/{id}/fork {"count": 10, "network": "none"}`, or `tine fork SNAPSHOT -n 10`, is a fork without its snapshot: it restores `count` children from a snapshot that's already there, such as a retained one. It takes the same request and gives the same answer as a fork of a VM.
+
+1. **Pin the snapshot**, so that neither the reaper nor a delete (409 `busy`) can take it away before the children claim it, then check it's ready, that this host can restore it (409 `incompatible`), and that its image is still installed.
+2. **Admit** all the children at once, at the snapshot's size.
+3. **Restore the children** with the fork's own code, `--fork-parallelism` at a time, each through the usual create path. Each child's `parent_id` is the VM the snapshot was taken of (none for a template), even if that VM is gone.
+
+Nothing is paused, so the timings are `check`, `children` and `total`, recorded in `tine_vm_snapshot_fork_stage_seconds`. Any ready snapshot can be forked this way: a VM's, a fork's or a template.
+
+On the dev server, from a retained snapshot of a 2-vCPU, 1 GiB VM that had been destroyed:
+
+| Children | Total (p50) | Range | Each child (p50) |
+|---|---|---|---|
+| 1 | 75 ms | 66 to 96 ms (n=10) | 75 ms |
+| 1, offline | 66 ms | 61 to 74 ms (n=3) | 62 ms |
+| 10 | 433 ms | 402 to 495 ms (n=5) | 150 to 186 ms |
+| 10, offline | | 330 and 422 ms (n=2) | 121 to 144 ms |
+
+`check` is 0.3 ms; the rest is restoring the children, as for a fork of a VM. An offline child is a few milliseconds quicker, having no veth to make. A child has the snapshot's files, its files in memory (tmpfs) and its running processes, as the e2e test checks after destroying the VM and restarting tined.
 
 ### Sharing memory
 
@@ -473,6 +507,39 @@ chain postrouting {
 
 One implementation detail: Linux creates a tap device in the network namespace of the *thread* that asks for it, so `netns` does that work on a goroutine locked to one OS thread that has switched into the VM's namespace, and switches back before releasing the thread.
 
+### Offline VMs
+
+**In plain words:** a VM created or forked with `"network": "none"` has loopback and nothing else. Its programs can't reach the internet, the host or other VMs, but tined still runs its commands and moves its files, over vsock.
+
+The guest is the same as any other: the same `eth0`, address and gateway, set on its kernel command line or restored from its snapshot. Only the namespace around it differs:
+
+```
+ namespace tine-<id> (offline)
+ ┌──────────────────────────────────────┐
+ │ lo                                   │
+ │ tap0  172.16.0.1/30 ◄──► guest eth0  │      no veth, no route out, no NAT
+ │                          172.16.0.2  │
+ └──────────────────────────────────────┘
+```
+
+- **No veth pair, so no way out.** The namespace has `lo` and `tap0` with its usual address and MAC, and no other link and no default route. The VM's slot still picks its uid; its `tine<slot>` veth just doesn't exist.
+- **tap0 stays** because the guest's network device needs it: Firecracker reattaches a restored guest's device to its tap by name. Keeping the guest the same means any snapshot, of an online VM or an offline one, can be restored either way, and one agent run can be replayed offline from a snapshot taken online.
+- **It fails fast.** Forwarding is on in the namespace, though nothing can be forwarded: then the namespace's kernel answers the guest's packets for anywhere else with ICMP "network unreachable" at once (`ip_error`), and the guest's `connect` fails straight away instead of timing out: in 10 to 70 ms for `1.1.1.1:443` and `8.8.8.8:53` on the dev server. The guest sends link-local traffic (`169.254.169.254`) straight onto `eth0`, and nothing answers it, so that times out, as does a connection to `172.16.0.1`, which the firewall drops.
+- **Its firewall** is the online namespace's `input` chain (the guest can't reach the namespace itself), a `forward` chain that drops everything, and no NAT:
+
+```
+chain input {
+    iifname "tap0" ct state established,related accept
+    iifname "tap0" meta l4proto icmp accept
+    iifname "tap0" drop comment "the guest can't reach anything in its namespace"
+}
+chain forward {                       # policy drop
+    counter comment "an offline VM's traffic goes nowhere"
+}
+```
+
+A VM's network is in its record (`network`, migration 4), so a restart, a destroy and a rollback all plan the same namespace again. A rollback keeps it, and forks choose their own.
+
 ## Talking to the guest: vsock and tine-agent
 
 **In plain words:** vsock is a direct pipe between the host and the guest. It works even if the guest's network is broken or firewalled, and nothing on the network can reach it. tine-agent listens on it and runs commands for tined.
@@ -556,7 +623,7 @@ The SDK is a thin layer over the API, sync (`Client`, `Sandbox`) and async (`Asy
 
 **The store** is SQLite (`modernc.org/sqlite`, pure Go, no CGO) in WAL mode:
 
-- **Tables:** `images`, `vms` (each VM's `snapshot_id`, `source` and `parent_id` too), `snapshots` (of three kinds: `vm`, `template` and `fork`), and `vm_events`: a history of every state change with its reason, and notes such as "snapshot taken", "guest synced: its clock was 3.4s behind" or "booted, not restored: template … was imported again since".
+- **Tables:** `images`, `vms` (each VM's `snapshot_id`, `source`, `parent_id` and `network` too), `snapshots` (of three kinds: `vm`, `template` and `fork`, and whether each is retained), and `vm_events`: a history of every state change with its reason, and notes such as "snapshot taken", "guest synced: its clock was 3.4s behind" or "booted, not restored: template … was imported again since".
 - **Uniqueness:** a network slot and a uid can each belong to only one VM that isn't destroyed (partial unique indexes).
 - **Migrations:** numbered SQL files embedded in the binary, each run in a transaction. tined refuses a database written by a newer version.
 - **Times** are stored fixed-width (`2006-01-02T15:04:05.000000000Z`), because SQLite compares them as text, and RFC 3339's variable-length fractions sort wrongly.
@@ -587,19 +654,20 @@ It logs a one-line report, for example `kept 1; cleaned 1; orphans removed 2; er
 
 | Method and path | What it does |
 |---|---|
-| `POST /v1/vms` | Create a VM: `{"image", "vcpus", "memory_mib", "ttl_seconds", "cold"}`, each optional |
+| `POST /v1/vms` | Create a VM: `{"image", "vcpus", "memory_mib", "ttl_seconds", "cold", "strategy", "network"}`, each optional |
 | `GET /v1/vms` | List VMs (`?all=true` includes destroyed ones, `?memory=true` adds each one's RSS and PSS) |
 | `GET /v1/vms/{id}` | One VM, with its timings, lineage and memory |
 | `POST /v1/vms/{id}/exec` | Run a command; the response streams NDJSON frames |
 | `GET /v1/vms/{id}/files?path=`, `PUT /v1/vms/{id}/files?path=&mode=` | Read a file out of a VM; write one into it |
 | `PUT /v1/vms/{id}/archive?path=` | Unpack a tar stream into a directory in the VM |
 | `DELETE /v1/vms/{id}` | Destroy a VM (idempotent) |
-| `POST /v1/vms/{id}/snapshots` | Snapshot a running VM |
+| `POST /v1/vms/{id}/snapshots` | Snapshot a running VM; `{"retain": true}` keeps it until it's deleted |
 | `GET /v1/vms/{id}/snapshots` | A VM's snapshots |
 | `POST /v1/vms/{id}/rollback` | Roll a VM back: `{"snapshot_id"}` |
-| `POST /v1/vms/{id}/fork` | Fork a VM: `{"count", "ttl_seconds"}`; each child's VM or error, the snapshot, and the timings |
+| `POST /v1/vms/{id}/fork` | Fork a VM: `{"count", "ttl_seconds", "strategy", "network"}`; each child's VM or error, the snapshot, and the timings |
 | `GET /v1/snapshots` | List snapshots (`?vm=`, `?kind=`, `?image=`), with the VMs that run from each |
 | `GET /v1/snapshots/{id}`, `DELETE /v1/snapshots/{id}` | One snapshot; delete one |
+| `POST /v1/snapshots/{id}/fork` | Restore VMs from a snapshot that's already there: the same request and answer as a fork |
 | `GET /v1/images` | List images, with their templates and whether each is usable |
 | `POST /v1/images/{name}/warm` | Warm a template: `{"vcpus", "memory_mib"}`, each optional |
 | `GET /healthz` | tined's version, uptime and VM count |
@@ -616,10 +684,10 @@ Unknown JSON fields are rejected, so a typo like `"cpus"` fails loudly instead o
 | 400 | `invalid_request` | Bad JSON, an unknown field, an impossible size |
 | 404 | `not_found`, `image_not_found` | No such VM, image or endpoint |
 | 409 | `not_running`, `conflict` | Exec in a VM that isn't running; a change the state machine refuses |
-| 409 | `busy` | A snapshot or rollback while commands run in the VM |
+| 409 | `busy` | A snapshot or rollback while commands run in the VM; deleting a snapshot a fork is restoring from |
 | 409 | `in_use` | Deleting a snapshot that VMs run from |
 | 409 | `incompatible` | A snapshot taken with another Firecracker, CPU or host kernel |
-| 503 | `capacity` | The VM limit (`--max-vms`, 512 by default), every network slot, or a VM's 16 snapshots are taken |
+| 503 | `capacity` | The VM limit (`--max-vms`, 512 by default), every network slot, or a VM's 16 snapshots (or 256 retained ones) are taken |
 | 503 | `no_memory`, `no_cpu` | Admission control: the host hasn't room for the VMs asked for |
 | 507 | `no_space` | A snapshot wouldn't leave 2 GiB of disk free |
 | 500 | `internal` | Anything else; tined logs it with the request ID |
@@ -633,7 +701,7 @@ Every response carries an `X-Request-Id` header, which is also on every log line
   - `tine_vm_create_stage_seconds{source,stage}`, `tine_vm_creates_total{result}`, `tine_vm_create_failures_total{stage}`
   - `tine_snapshot_stage_seconds{stage}` (with `paused` and the background `flush`), `tine_snapshots_total{kind,result}`, `tine_snapshot_failures_total{stage}`, `tine_snapshot_bytes`, `tine_snapshots_deleted_total{reason}`
   - `tine_vm_rollback_stage_seconds{stage}`
-  - `tine_vm_fork_stage_seconds{stage}` (snapshot, paused, children, total), `tine_vm_fork_children_total{result}`
+  - `tine_vm_fork_stage_seconds{stage}` (snapshot, paused, children, total), `tine_vm_snapshot_fork_stage_seconds{stage}` (check, children, total, for forks of a saved snapshot), `tine_vm_fork_children_total{result}`
   - `tine_vm_destroy_seconds`, `tine_vm_destroys_total{result}`
   - `tine_exec_seconds`, `tine_execs_total{result}`
   - `tine_firecracker_api_seconds{endpoint}`, `tine_firecracker_api_errors_total{endpoint}`
@@ -779,7 +847,8 @@ These are known and deliberate for v0.5.0. Most are what the next steps are for.
 - **Files move whole.** A file or archive is at most 8 GiB, sent in one request, and a transfer holds off snapshots of its VM until it's done.
 - **`tined image build` needs Docker** on the host, and an image whose init is systemd.
 - **A VM that dies after a tined restart isn't noticed straight away.** tined watches the Firecracker processes it started. One started by an earlier tined is only checked at the next restart, or when something touches it: an exec then fails, and a destroy cleans it up. A periodic liveness check would close this.
-- **No IPv6 for VMs**, and outbound traffic is otherwise unrestricted (no egress allow-list or rate limits yet).
+- **No IPv6 for VMs**, and outbound traffic is otherwise unrestricted (no egress allow-list or rate limits yet): a VM has the internet, or with `"network": "none"` nothing at all.
+- **Retained snapshots are full snapshots.** Each holds the VM's whole memory unless diff snapshots are on, so one before each of 40 steps of a 1 GiB VM is up to 40 GiB of disk, and back-to-back ones wait for the disk (above).
 - **Access is all or nothing.** Anyone in the `tine` group can create, use and destroy every VM. There are no per-user quotas or ownership.
 - **Destroy kills the guest** without asking it to shut down. The disk is thrown away, so nothing is lost that matters.
 - **The base image's disk is a fixed 4 GiB**, and there's one image so far.

@@ -53,6 +53,7 @@ The ones worth knowing:
 | `--default-ttl` | 1h | How long VMs live when a request doesn't say. The reaper destroys expired VMs every 15 s. |
 | `--warm-images` | `base` | Images tined keeps a template of, at the default size. |
 | `--max-snapshots-per-vm`, `--min-free-mib` | 16, 2048 | Snapshots per VM, and disk a snapshot must leave free. |
+| `--max-retained-snapshots-per-vm` | 256 | Retained snapshots per VM, which are kept until they're deleted and don't count against `--max-snapshots-per-vm`. |
 | `--diff-snapshots`, `--balloon`, `--ksm`, `--page-server-huge-pages` | off | Optional behaviours, measured in [results.md](results.md). |
 
 ## Watching it
