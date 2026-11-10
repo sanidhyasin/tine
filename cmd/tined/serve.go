@@ -60,6 +60,8 @@ its own cgroup, outside tined's.`,
 	f.StringVar(&opts.vm.ChrootBaseDir, "jail-dir", opts.vm.ChrootBaseDir, "where VM jails are built (same filesystem as --images-dir)")
 	f.StringVar(&opts.vm.SnapshotsDir, "snapshots-dir", opts.vm.SnapshotsDir, "where snapshots are stored (same filesystem as --images-dir)")
 	f.IntVar(&opts.vm.MaxSnapshotsPerVM, "max-snapshots-per-vm", opts.vm.MaxSnapshotsPerVM, "how many snapshots one VM may have")
+	f.IntVar(&opts.vm.MaxRetainedSnapshotsPerVM, "max-retained-snapshots-per-vm", opts.vm.MaxRetainedSnapshotsPerVM,
+		"how many retained snapshots (kept until deleted) one VM may have")
 	f.IntVar(&opts.vm.MinFreeMiB, "min-free-mib", opts.vm.MinFreeMiB, "disk space, in MiB, that taking a snapshot must leave free")
 	f.StringSliceVar(&opts.vm.WarmImages, "warm-images", opts.vm.WarmImages,
 		"images to keep a template of at the default size, warming it again when it's out of date (empty: none)")

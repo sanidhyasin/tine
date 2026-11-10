@@ -32,7 +32,10 @@ type fakeBackend struct {
 	next    int
 	err     error // returned by every call, when set
 	lastReq vm.CreateRequest
-	panicOn string
+	// lastFork and lastSnap are the last fork's and snapshot's requests.
+	lastFork vm.ForkRequest
+	lastSnap vm.SnapshotRequest
+	panicOn  string
 	// lastAttrs are the log attributes the context of the last Get carried.
 	lastAttrs []slog.Attr
 }
@@ -107,6 +110,7 @@ func (f *fakeBackend) DeleteSnapshot(ctx context.Context, id string) (state.Snap
 func (f *fakeBackend) Fork(_ context.Context, id string, req vm.ForkRequest) (vm.ForkResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.lastFork = req
 	parent, ok := f.vms[id]
 	if !ok {
 		return vm.ForkResult{}, fmt.Errorf("VM %s: %w", id, state.ErrNotFound)
@@ -137,6 +141,30 @@ func (f *fakeBackend) Fork(_ context.Context, id string, req vm.ForkRequest) (vm
 	return res, nil
 }
 
+// ForkSnapshot makes Count children of a snapshot that Snapshots lists.
+func (f *fakeBackend) ForkSnapshot(ctx context.Context, snapID string, req vm.ForkRequest) (vm.ForkResult, error) {
+	info, err := f.GetSnapshot(ctx, snapID)
+	if err != nil {
+		return vm.ForkResult{}, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lastFork = req
+	if req.Count < 1 {
+		return vm.ForkResult{}, fmt.Errorf("%w: count", vm.ErrInvalidRequest)
+	}
+	res := vm.ForkResult{Snapshot: info.Snapshot, Timings: map[string]float64{"check": 0.8, "children": 70, "total": 71}}
+	for range req.Count {
+		f.next++
+		c := state.VM{ID: fmt.Sprintf("vm-%010d", f.next), State: state.StateRunning, Image: info.Image, VCPUs: info.VCPUs,
+			MemoryMiB: info.MemoryMiB, ParentID: info.VMID, SnapshotID: snapID, Source: state.SourceSnapshot, Network: req.Network,
+			CreatedAt: time.Now()}
+		f.vms[c.ID] = c
+		res.Children = append(res.Children, vm.ForkChild{VM: c})
+	}
+	return res, nil
+}
+
 func (f *fakeBackend) Memory(_ context.Context, id string) (vm.Memory, error) {
 	if strings.HasPrefix(id, "vm-") {
 		return vm.Memory{RSS: 116 << 20, PSS: 56 << 20, Private: 18 << 20, Shared: 98 << 20}, nil
@@ -159,19 +187,20 @@ func (f *fakeBackend) Rollback(_ context.Context, id, snapID string) (state.VM, 
 	return v, nil
 }
 
-func (f *fakeBackend) Snapshot(_ context.Context, id string) (state.Snapshot, error) {
+func (f *fakeBackend) Snapshot(_ context.Context, id string, req vm.SnapshotRequest) (state.Snapshot, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.err != nil {
 		return state.Snapshot{}, f.err
 	}
+	f.lastSnap = req
 	v, ok := f.vms[id]
 	if !ok {
 		return state.Snapshot{}, fmt.Errorf("VM %s: %w", id, state.ErrNotFound)
 	}
 	return state.Snapshot{
 		ID: "snap-0000000001", Kind: state.SnapshotKindVM, State: state.SnapshotReady, VMID: id, Image: v.Image,
-		VCPUs: v.VCPUs, MemoryMiB: v.MemoryMiB, SizeBytes: 1 << 30, CreatedAt: time.Now(),
+		VCPUs: v.VCPUs, MemoryMiB: v.MemoryMiB, SizeBytes: 1 << 30, Retained: req.Retain, CreatedAt: time.Now(),
 		Metadata: json.RawMessage(`{"host":{"firecracker_version":"1.17.0"},"timings_ms":{"paused":120.5,"total":150}}`),
 	}, nil
 }
@@ -188,7 +217,7 @@ func (f *fakeBackend) Create(_ context.Context, req vm.CreateRequest) (state.VM,
 	f.lastReq = req
 	f.next++
 	v := state.VM{ID: fmt.Sprintf("vm-%010d", f.next), State: state.StateRunning, Image: "base", VCPUs: 2, MemoryMiB: 1024,
-		CreatedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour), Timings: map[string]float64{"total": 1869.1}}
+		CreatedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour), Network: req.Network, Timings: map[string]float64{"total": 1869.1}}
 	f.vms[v.ID] = v
 	return v, nil
 }
@@ -392,6 +421,106 @@ func TestSnapshotAPI(t *testing.T) {
 	var apiErr *Error
 	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusNotFound {
 		t.Errorf("snapshot of a missing VM = %#v, want 404", err)
+	}
+}
+
+// POST /v1/vms/{id}/snapshots takes an optional body: none, {}, or retain.
+func TestRetainedSnapshotAPI(t *testing.T) {
+	ctx := context.Background()
+	b := newFakeBackend()
+	c, sock := serve(t, b)
+	v, err := c.CreateVM(ctx, CreateVMRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap, err := c.CreateSnapshotWith(ctx, v.ID, SnapshotRequest{Retain: true})
+	if err != nil || !snap.Retained || !b.lastSnap.Retain {
+		t.Errorf("a retained snapshot = %+v, %v; the backend got %+v", snap, err, b.lastSnap)
+	}
+	if snap, err := c.CreateSnapshot(ctx, v.ID); err != nil || snap.Retained || b.lastSnap.Retain {
+		t.Errorf("a plain snapshot = %+v, %v; the backend got %+v", snap, err, b.lastSnap)
+	}
+	for body, want := range map[string]int{
+		"":                  http.StatusCreated, // as from curl -X POST, before the body had a field
+		"{}":                http.StatusCreated,
+		`{"retain": true}`:  http.StatusCreated,
+		`{"retian": true}`:  http.StatusBadRequest, // a typo isn't silently a snapshot that goes with its VM
+		`{"retain": "yes"}`: http.StatusBadRequest,
+	} {
+		if status, _, _ := rawStatus(t, sock, http.MethodPost, "/v1/vms/"+v.ID+"/snapshots", body); status != want {
+			t.Errorf("POST snapshots %q = %d, want %d", body, status, want)
+		}
+	}
+	if body := rawBody(t, sock, http.MethodPost, "/v1/vms/"+v.ID+"/snapshots", `{"retain": true}`); !strings.Contains(body, `"retained":true`) {
+		t.Errorf("a retained snapshot's JSON lacks retained: %s", body)
+	}
+	if body := rawBody(t, sock, http.MethodPost, "/v1/vms/"+v.ID+"/snapshots", ""); strings.Contains(body, `"retained"`) {
+		t.Errorf("a plain snapshot's JSON has retained: %s", body)
+	}
+}
+
+// network reaches the backend from creates and both kinds of fork, and
+// every VM says which it has.
+func TestNetworkAPI(t *testing.T) {
+	ctx := context.Background()
+	b := newFakeBackend()
+	c, sock := serve(t, b)
+	online, err := c.CreateVM(ctx, CreateVMRequest{})
+	if err != nil || b.lastReq.Network != "" || online.Network != "default" {
+		t.Errorf("a create without a network = %+v, %v; the backend got %q; want the default", online, err, b.lastReq.Network)
+	}
+	offline, err := c.CreateVM(ctx, CreateVMRequest{Network: "none"})
+	if err != nil || b.lastReq.Network != state.NetworkNone || offline.Network != "none" {
+		t.Errorf("an offline create = %+v, %v; the backend got %q", offline, err, b.lastReq.Network)
+	}
+	if _, err := c.Fork(ctx, online.ID, ForkRequest{Count: 1, Network: "none"}); err != nil || b.lastFork.Network != state.NetworkNone {
+		t.Errorf("an offline fork: %v; the backend got %+v", err, b.lastFork)
+	}
+	if _, err := c.Fork(ctx, offline.ID, ForkRequest{Count: 1}); err != nil || b.lastFork.Network != "" {
+		t.Errorf("a fork without a network: %v; the backend got %+v", err, b.lastFork)
+	}
+	if body := rawBody(t, sock, http.MethodGet, "/v1/vms/"+online.ID, ""); !strings.Contains(body, `"network":"default"`) {
+		t.Errorf("a VM's JSON lacks its network: %s", body)
+	}
+}
+
+func TestSnapshotForkAPI(t *testing.T) {
+	ctx := context.Background()
+	b := newFakeBackend()
+	c, sock := serve(t, b)
+	res, err := c.ForkSnapshot(ctx, "snap-aaaaaaaaaa", ForkRequest{Count: 3, TTLSeconds: 600, Strategy: "share", Network: "none"})
+	if err != nil {
+		t.Fatalf("ForkSnapshot: %v", err)
+	}
+	if res.Snapshot.ID != "snap-aaaaaaaaaa" || len(res.Children) != 3 || res.TimingsMs["children"] != 70 {
+		t.Errorf("ForkSnapshot = %+v", res)
+	}
+	for i, ch := range res.Children {
+		if ch.VM == nil || ch.VM.SnapshotID != "snap-aaaaaaaaaa" || ch.VM.ParentID != "vm-1" || ch.VM.Network != "none" || ch.VM.Source != "snapshot" {
+			t.Errorf("child %d = %+v", i+1, ch)
+		}
+	}
+	if got := b.lastFork; got.Count != 3 || got.TTL != 10*time.Minute || got.Strategy != vm.ForkShare || got.Network != state.NetworkNone {
+		t.Errorf("the backend got %+v", got)
+	}
+	var apiErr *Error
+	if _, err := c.ForkSnapshot(ctx, "snap-nope", ForkRequest{Count: 1}); !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusNotFound {
+		t.Errorf("a fork of a missing snapshot = %#v, want 404", err)
+	}
+	if _, err := c.ForkSnapshot(ctx, "snap-aaaaaaaaaa", ForkRequest{Count: 0}); !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusBadRequest {
+		t.Errorf("count 0 = %#v, want 400", err)
+	}
+	for _, tt := range []struct {
+		method, body string
+		status       int
+	}{
+		{http.MethodGet, "", http.StatusMethodNotAllowed},
+		{http.MethodPost, `{"count": 1, "ttl_seconds": -5}`, http.StatusBadRequest},
+		{http.MethodPost, `{"count": 1, "offline": true}`, http.StatusBadRequest},
+	} {
+		if status, _, _ := rawStatus(t, sock, tt.method, "/v1/snapshots/snap-aaaaaaaaaa/fork", tt.body); status != tt.status {
+			t.Errorf("%s %s = %d, want %d", tt.method, tt.body, status, tt.status)
+		}
 	}
 }
 

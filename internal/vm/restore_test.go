@@ -20,7 +20,7 @@ func (f *fixture) snapshotted(t *testing.T, req CreateRequest) (state.VM, state.
 	if err != nil {
 		t.Fatal(err)
 	}
-	snap, err := f.m.Snapshot(ctx, vm.ID)
+	snap, err := f.m.Snapshot(ctx, vm.ID, SnapshotRequest{})
 	if err != nil {
 		t.Fatal(err)
 	}

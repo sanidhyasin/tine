@@ -19,7 +19,7 @@ import (
 const snapshotTimeout = 5 * time.Minute
 
 func newSnapshotCmd(g *globals) *cobra.Command {
-	var quiet bool
+	var quiet, retain bool
 	cmd := &cobra.Command{
 		Use:   "snapshot VM",
 		Short: "Save a running VM's memory, devices and disk; list and delete snapshots",
@@ -27,11 +27,14 @@ func newSnapshotCmd(g *globals) *cobra.Command {
 paused while its memory and disk are copied, then carries on.
 
 A snapshot belongs to its VM, and is deleted when nothing needs it any more:
-once the VM is destroyed and no VM runs from it.
+once the VM is destroyed and no VM runs from it. With --retain, it's kept until
+'tine snapshot rm', even once the VM is gone, to fork from later with
+'tine fork SNAPSHOT'.
 
 Snapshot IDs, like VM IDs, can be shortened to any unique prefix.`,
 		Example: `  tine snapshot vm-7f3k
   SNAP=$(tine snapshot -q vm-7f3k)
+  tine snapshot --retain vm-7f3k
   tine snapshot ls
   tine snapshot rm snap-q2w9`,
 		Args: cobra.ExactArgs(1),
@@ -43,7 +46,7 @@ Snapshot IDs, like VM IDs, can be shortened to any unique prefix.`,
 			if err != nil {
 				return err
 			}
-			snap, err := c.CreateSnapshot(ctx, id)
+			snap, err := c.CreateSnapshotWith(ctx, id, api.SnapshotRequest{Retain: retain})
 			if err != nil {
 				return err
 			}
@@ -54,12 +57,17 @@ Snapshot IDs, like VM IDs, can be shortened to any unique prefix.`,
 			case quiet:
 				_, err = fmt.Fprintln(out, snap.ID)
 			default:
-				_, err = fmt.Fprintf(out, "%s  of %s  %s  (%s)\n", snap.ID, snap.VMID, formatBytes(snap.SizeBytes), describeSnapshotTimings(snap))
+				kept := ""
+				if snap.Retained {
+					kept = "  retained"
+				}
+				_, err = fmt.Fprintf(out, "%s  of %s  %s%s  (%s)\n", snap.ID, snap.VMID, formatBytes(snap.SizeBytes), kept, describeSnapshotTimings(snap))
 			}
 			return err
 		},
 	}
 	cmd.Flags().BoolVarP(&quiet, "quiet", "q", false, "print only the snapshot's ID")
+	cmd.Flags().BoolVar(&retain, "retain", false, "keep the snapshot until 'tine snapshot rm', even once the VM is destroyed")
 	cmd.AddCommand(newSnapshotListCmd(g), newSnapshotInspectCmd(g), newSnapshotRemoveCmd(g))
 	return cmd
 }
@@ -94,8 +102,15 @@ func newSnapshotListCmd(g *globals) *cobra.Command {
 			_, _ = fmt.Fprintln(w, "ID\tKIND\tVM\tIMAGE\tVCPUS\tMEMORY\tDISK\tAGE\tPAUSED\tUSED BY")
 			for _, s := range snaps {
 				kind := s.Kind
+				var notes []string
+				if s.Retained {
+					notes = append(notes, "retained")
+				}
 				if s.State != "ready" {
-					kind += " (" + s.State + ")"
+					notes = append(notes, s.State)
+				}
+				if len(notes) > 0 {
+					kind += " (" + strings.Join(notes, ", ") + ")"
 				}
 				paused := "-"
 				if v, ok := s.TimingsMs["paused"]; ok {

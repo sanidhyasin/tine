@@ -181,7 +181,7 @@ func TestRealSnapshot(t *testing.T) {
 	execOut(t, m, vm.ID, "sh", "-c", "echo before > /root/marker")
 
 	for i := range 2 {
-		snap, err := m.Snapshot(ctx, vm.ID)
+		snap, err := m.Snapshot(ctx, vm.ID, SnapshotRequest{})
 		if err != nil {
 			t.Fatalf("Snapshot %d: %v", i+1, err)
 		}
@@ -234,7 +234,7 @@ func TestRealRestore(t *testing.T) {
 	}
 	t.Cleanup(func() { _, _ = m.Destroy(context.Background(), parent.ID) })
 	execOut(t, m, parent.ID, "sh", "-c", "echo before > /root/marker; setsid sleep 100000 >/dev/null 2>&1 < /dev/null & echo $! > /root/sleeper")
-	snap, err := m.Snapshot(ctx, parent.ID)
+	snap, err := m.Snapshot(ctx, parent.ID, SnapshotRequest{})
 	if err != nil {
 		t.Fatalf("Snapshot: %v", err)
 	}
@@ -308,7 +308,7 @@ func TestRealRollbackToSnapshot(t *testing.T) {
 	t.Cleanup(func() { _, _ = m.Destroy(context.Background(), vm.ID) })
 	execOut(t, m, vm.ID, "sh", "-c", "echo v1 > /root/data")
 	machineID := execOut(t, m, vm.ID, "cat", "/etc/machine-id")
-	snap, err := m.Snapshot(ctx, vm.ID)
+	snap, err := m.Snapshot(ctx, vm.ID, SnapshotRequest{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -484,7 +484,7 @@ func TestRealRestoreClock(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			snap, err := m.Snapshot(ctx, parent.ID)
+			snap, err := m.Snapshot(ctx, parent.ID, SnapshotRequest{})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -717,12 +717,12 @@ func TestRealDiffSnapshot(t *testing.T) {
 	}
 	t.Cleanup(func() { _, _ = m.Destroy(context.Background(), vm.ID) })
 	a := shaOfRandom(t, m, vm.ID, "a", 96)
-	first, err := m.Snapshot(ctx, vm.ID)
+	first, err := m.Snapshot(ctx, vm.ID, SnapshotRequest{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	b := shaOfRandom(t, m, vm.ID, "b", 64)
-	second, err := m.Snapshot(ctx, vm.ID)
+	second, err := m.Snapshot(ctx, vm.ID, SnapshotRequest{})
 	if err != nil {
 		t.Fatal(err)
 	}

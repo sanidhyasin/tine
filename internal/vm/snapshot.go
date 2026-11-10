@@ -39,16 +39,25 @@ const (
 // the slow part.
 const snapshotTimeout = 5 * time.Minute
 
+// SnapshotRequest says how to snapshot a VM.
+type SnapshotRequest struct {
+	// Retain keeps the snapshot until it's deleted, even once its VM is
+	// destroyed and across restarts, for VMs to be restored from later. It
+	// counts against MaxRetainedSnapshotsPerVM instead of MaxSnapshotsPerVM.
+	Retain bool
+}
+
 // Snapshot saves a running VM: its memory, its devices and its disk. The VM
 // is paused while its memory and disk are copied, then carries on. The
 // snapshot belongs to the VM, and is garbage once the VM is destroyed and no
-// VM runs from it.
+// VM runs from it, unless it's retained.
 //
 // It's refused with ErrBusy while commands run in the VM (taking a snapshot
 // resets the guest's vsock connections, which would cut them off), with
-// ErrCapacity when the VM has MaxSnapshotsPerVM already, and with ErrNoSpace
-// when the disk is short of room for it.
-func (m *Manager) Snapshot(ctx context.Context, id string) (state.Snapshot, error) {
+// ErrCapacity when the VM has MaxSnapshotsPerVM already (or, retained,
+// MaxRetainedSnapshotsPerVM), and with ErrNoSpace when the disk is short of
+// room for it.
+func (m *Manager) Snapshot(ctx context.Context, id string, req SnapshotRequest) (state.Snapshot, error) {
 	ctx = logging.WithVM(ctx, id)
 	unlock := m.locks.lock(id)
 	defer unlock()
@@ -63,15 +72,19 @@ func (m *Manager) Snapshot(ctx context.Context, id string) (state.Snapshot, erro
 	if err != nil {
 		return state.Snapshot{}, err
 	}
-	if n := countLive(existing); n >= m.cfg.MaxSnapshotsPerVM {
+	switch n := countLive(existing, req.Retain); {
+	case req.Retain && n >= m.cfg.MaxRetainedSnapshotsPerVM:
+		return state.Snapshot{}, fmt.Errorf("%w: VM %s has %d retained snapshots, the most it may have; delete some first", ErrCapacity, id, n)
+	case !req.Retain && n >= m.cfg.MaxSnapshotsPerVM:
 		return state.Snapshot{}, fmt.Errorf("%w: VM %s has %d snapshots, the most it may have; delete some first", ErrCapacity, id, n)
 	}
-	return m.takeSnapshot(ctx, vm, state.SnapshotKindVM)
+	return m.takeSnapshot(ctx, vm, state.SnapshotKindVM, req.Retain)
 }
 
 // takeSnapshot snapshots vm, which the caller has locked and checked is
-// running. Whatever happens, a VM it paused is resumed.
-func (m *Manager) takeSnapshot(ctx context.Context, vm state.VM, kind state.SnapshotKind) (state.Snapshot, error) {
+// running, retaining the snapshot if retain is set. Whatever happens, a VM
+// it paused is resumed.
+func (m *Manager) takeSnapshot(ctx context.Context, vm state.VM, kind state.SnapshotKind, retain bool) (state.Snapshot, error) {
 	leave, err := m.gate.enterExclusive(vm.ID, "snapshot")
 	if err != nil {
 		return state.Snapshot{}, err
@@ -106,7 +119,7 @@ func (m *Manager) takeSnapshot(ctx context.Context, vm state.VM, kind state.Snap
 	}
 
 	rec, err := m.store.CreateSnapshot(ctx, state.Snapshot{
-		ID: newSnapshotID(), Kind: kind, VMID: vm.ID, Image: vm.Image, VCPUs: vm.VCPUs, MemoryMiB: vm.MemoryMiB,
+		ID: newSnapshotID(), Kind: kind, VMID: vm.ID, Image: vm.Image, VCPUs: vm.VCPUs, MemoryMiB: vm.MemoryMiB, Retained: retain,
 	})
 	if err != nil {
 		return state.Snapshot{}, err
@@ -242,8 +255,12 @@ func (m *Manager) takeSnapshot(ctx context.Context, vm state.VM, kind state.Snap
 	m.cfg.Metrics.SnapshotTaken(string(kind), timings, size)
 	m.rebase(vm.ID, ready.ID)
 	m.flushInBackground(vm.ID, ready.ID)
-	_ = m.store.Note(ctx, vm.ID, fmt.Sprintf("%s snapshot %s taken (paused %.0fms)", kind, ready.ID, timings["paused"]))
-	log.InfoContext(ctx, "snapshot taken", "kind", kind, "bytes", size, "timings_ms", timings)
+	retained := ""
+	if retain {
+		retained = ", retained"
+	}
+	_ = m.store.Note(ctx, vm.ID, fmt.Sprintf("%s snapshot %s taken (paused %.0fms%s)", kind, ready.ID, timings["paused"], retained))
+	log.InfoContext(ctx, "snapshot taken", "kind", kind, "retained", retain, "bytes", size, "timings_ms", timings)
 	return ready, nil
 }
 
@@ -329,11 +346,12 @@ func (m *Manager) removeSnapshot(ctx context.Context, id string) error {
 	return m.store.DeleteSnapshotRecord(ctx, id)
 }
 
-// countLive counts the snapshots that aren't being deleted.
-func countLive(snaps []state.Snapshot) int {
+// countLive counts the snapshots that aren't being deleted, and are
+// retained or not as asked.
+func countLive(snaps []state.Snapshot, retained bool) int {
 	n := 0
 	for _, s := range snaps {
-		if s.State != state.SnapshotDeleting {
+		if s.State != state.SnapshotDeleting && s.Retained == retained {
 			n++
 		}
 	}
@@ -404,9 +422,9 @@ func (m *Manager) DeleteSnapshot(ctx context.Context, id string) (state.Snapshot
 }
 
 // collectGarbage deletes the snapshots nothing needs any more (see
-// state.Store.GarbageSnapshots): those of destroyed VMs, and templates
-// that newer ones replaced or whose image is gone, once no VM runs from
-// them. It returns how many it deleted.
+// state.Store.GarbageSnapshots): those of destroyed VMs, unless they're
+// retained, and templates that newer ones replaced or whose image is gone,
+// once no VM runs from them. It returns how many it deleted.
 func (m *Manager) collectGarbage(ctx context.Context) int {
 	garbage, err := m.store.GarbageSnapshots(ctx)
 	if err != nil {

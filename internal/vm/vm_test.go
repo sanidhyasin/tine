@@ -66,6 +66,8 @@ type fakeHost struct {
 	uffdLoads   int
 	// memoryModes is how each jail got a snapshot's memory file, by VM ID.
 	memoryModes map[string]jailer.FileMode
+	// networks are the networks created, by VM ID.
+	networks map[string]netns.Network
 }
 
 type hold struct {
@@ -252,8 +254,17 @@ func (f *fakeHost) takeCalls() []string {
 }
 
 func (f *fakeHost) setup(context.Context) error { return f.record("setup") }
-func (f *fakeHost) createNetwork(context.Context, netns.Network, netns.Owner) error {
-	return f.record("createNetwork")
+func (f *fakeHost) createNetwork(_ context.Context, n netns.Network, _ netns.Owner) error {
+	if err := f.record("createNetwork"); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.networks == nil {
+		f.networks = map[string]netns.Network{}
+	}
+	f.networks[n.ID] = n
+	return nil
 }
 func (f *fakeHost) destroyNetwork(netns.Network) error { return f.record("destroyNetwork") }
 func (f *fakeHost) prepareJail(j *jailer.Jail) error {

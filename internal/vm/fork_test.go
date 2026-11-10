@@ -200,7 +200,7 @@ func TestPinnedSnapshotsStay(t *testing.T) {
 	parent := f.running(t)
 	// A fork snapshot nobody runs from yet, as during a fork.
 	unlock := f.m.locks.lock(parent.ID)
-	snap, err := f.m.takeSnapshot(ctx, parent, state.SnapshotKindFork)
+	snap, err := f.m.takeSnapshot(ctx, parent, state.SnapshotKindFork, false)
 	unlock()
 	if err != nil {
 		t.Fatal(err)
@@ -322,7 +322,7 @@ func TestCreateWithPrefetch(t *testing.T) {
 	ctx := context.Background()
 	f := newFixture(t, nil)
 	vm := f.running(t)
-	snap, err := f.m.Snapshot(ctx, vm.ID)
+	snap, err := f.m.Snapshot(ctx, vm.ID, SnapshotRequest{})
 	if err != nil {
 		t.Fatal(err)
 	}

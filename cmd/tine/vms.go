@@ -39,10 +39,14 @@ func newCreateCmd(g *globals) *cobra.Command {
 		Long: `Create starts a VM and waits until it's ready to run commands.
 
 If the image has a template of that size (see 'tine image warm'), the VM is
-restored from it, in milliseconds. Otherwise, or with --cold, it boots.`,
+restored from it, in milliseconds. Otherwise, or with --cold, it boots.
+
+--network none leaves the VM with loopback only: no internet, nothing beyond
+itself. Commands and files still reach it, through its agent.`,
 		Example: `  tine create
   tine create --vcpus 4 --memory 2G --ttl 30m
   tine create --cold
+  tine create --network none
   ID=$(tine create -q)`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -81,6 +85,7 @@ restored from it, in milliseconds. Otherwise, or with --cold, it boots.`,
 	f.BoolVarP(&quiet, "quiet", "q", false, "print only the VM's ID")
 	f.BoolVar(&req.Cold, "cold", false, "boot the VM, even if its image has a template to start from")
 	f.StringVar(&req.Strategy, "strategy", "", `how a VM restored from a template gets its memory: "share" (the default), "copy", "uffd" or "uffd-prefetch"`)
+	f.StringVar(&req.Network, "network", "", `"default" (its own network, with the internet) or "none" (loopback only)`)
 	return cmd
 }
 

@@ -26,7 +26,7 @@ func (f *fixture) running(t *testing.T) state.VM {
 func TestSnapshotTakesEveryStepInOrder(t *testing.T) {
 	f := newFixture(t, nil)
 	vm := f.running(t)
-	snap, err := f.m.Snapshot(context.Background(), vm.ID)
+	snap, err := f.m.Snapshot(context.Background(), vm.ID, SnapshotRequest{})
 	if err != nil {
 		t.Fatalf("Snapshot: %v", err)
 	}
@@ -65,7 +65,7 @@ func TestFailedSnapshotsResumeAndCleanUp(t *testing.T) {
 			f := newFixture(t, nil)
 			vm := f.running(t)
 			f.host.fail(stage, errors.New("boom"))
-			if _, err := f.m.Snapshot(context.Background(), vm.ID); err == nil || !strings.Contains(err.Error(), "boom") {
+			if _, err := f.m.Snapshot(context.Background(), vm.ID, SnapshotRequest{}); err == nil || !strings.Contains(err.Error(), "boom") {
 				t.Fatalf("Snapshot = %v, want the failure", err)
 			}
 			calls := strings.Join(f.host.takeCalls(), ",")
@@ -95,14 +95,14 @@ func TestSnapshotWaitsForTheLastOneToReachTheDisk(t *testing.T) {
 	f := newFixture(t, nil)
 	vm := f.running(t)
 	reached, release := f.host.holdAt("flushSnapshot")
-	if _, err := f.m.Snapshot(ctx, vm.ID); err != nil {
+	if _, err := f.m.Snapshot(ctx, vm.ID, SnapshotRequest{}); err != nil {
 		t.Fatal(err)
 	}
 	<-reached
 	f.host.takeCalls()
 
 	done := make(chan error, 1)
-	go func() { _, err := f.m.Snapshot(ctx, vm.ID); done <- err }()
+	go func() { _, err := f.m.Snapshot(ctx, vm.ID, SnapshotRequest{}); done <- err }()
 	time.Sleep(100 * time.Millisecond)
 	for _, c := range f.host.takeCalls() {
 		if c == "pause" {
@@ -119,7 +119,7 @@ func TestSnapshotThatCantResumeFailsTheVM(t *testing.T) {
 	f := newFixture(t, nil)
 	vm := f.running(t)
 	f.host.fail("resume", errors.New("stuck"))
-	if _, err := f.m.Snapshot(context.Background(), vm.ID); err == nil {
+	if _, err := f.m.Snapshot(context.Background(), vm.ID, SnapshotRequest{}); err == nil {
 		t.Fatal("Snapshot: want an error")
 	}
 	got, _ := f.store.GetVM(context.Background(), vm.ID)
@@ -136,10 +136,10 @@ func TestSnapshotLimits(t *testing.T) {
 		if _, err := f.m.Destroy(ctx, vm.ID); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := f.m.Snapshot(ctx, vm.ID); !errors.Is(err, ErrNotRunning) {
+		if _, err := f.m.Snapshot(ctx, vm.ID, SnapshotRequest{}); !errors.Is(err, ErrNotRunning) {
 			t.Errorf("Snapshot of a destroyed VM = %v, want ErrNotRunning", err)
 		}
-		if _, err := f.m.Snapshot(ctx, "vm-nope"); !errors.Is(err, ErrNotFound) {
+		if _, err := f.m.Snapshot(ctx, "vm-nope", SnapshotRequest{}); !errors.Is(err, ErrNotFound) {
 			t.Errorf("Snapshot of no VM = %v, want ErrNotFound", err)
 		}
 	})
@@ -147,18 +147,18 @@ func TestSnapshotLimits(t *testing.T) {
 		f := newFixture(t, func(c *Config) { c.MaxSnapshotsPerVM = 2 })
 		vm := f.running(t)
 		for range 2 {
-			if _, err := f.m.Snapshot(ctx, vm.ID); err != nil {
+			if _, err := f.m.Snapshot(ctx, vm.ID, SnapshotRequest{}); err != nil {
 				t.Fatal(err)
 			}
 		}
-		if _, err := f.m.Snapshot(ctx, vm.ID); !errors.Is(err, ErrCapacity) {
+		if _, err := f.m.Snapshot(ctx, vm.ID, SnapshotRequest{}); !errors.Is(err, ErrCapacity) {
 			t.Errorf("third snapshot = %v, want ErrCapacity", err)
 		}
 	})
 	t.Run("no space", func(t *testing.T) {
 		f := newFixture(t, func(c *Config) { c.MinFreeMiB = 1 << 30 }) // a petabyte
 		vm := f.running(t)
-		if _, err := f.m.Snapshot(ctx, vm.ID); !errors.Is(err, ErrNoSpace) {
+		if _, err := f.m.Snapshot(ctx, vm.ID, SnapshotRequest{}); !errors.Is(err, ErrNoSpace) {
 			t.Errorf("Snapshot = %v, want ErrNoSpace", err)
 		}
 		if calls := f.host.takeCalls(); len(calls) != 0 {
@@ -186,7 +186,7 @@ func TestSnapshotsAndExecsDontOverlap(t *testing.T) {
 		defer f.m.gate.mu.Unlock()
 		return f.m.gate.execs[vm.ID] == 1
 	})
-	if _, err := f.m.Snapshot(ctx, vm.ID); !errors.Is(err, ErrBusy) {
+	if _, err := f.m.Snapshot(ctx, vm.ID, SnapshotRequest{}); !errors.Is(err, ErrBusy) {
 		t.Errorf("Snapshot during an exec = %v, want ErrBusy", err)
 	}
 	if err := <-execDone; err != nil {
@@ -196,7 +196,7 @@ func TestSnapshotsAndExecsDontOverlap(t *testing.T) {
 	// A snapshot is under way, the VM paused: a new command waits for it.
 	reached, release := f.host.holdAt("writeSnapshot")
 	snapDone := make(chan error, 1)
-	go func() { _, err := f.m.Snapshot(ctx, vm.ID); snapDone <- err }()
+	go func() { _, err := f.m.Snapshot(ctx, vm.ID, SnapshotRequest{}); snapDone <- err }()
 	<-reached
 	execStarted := make(chan time.Time, 1)
 	go func() {
@@ -223,7 +223,7 @@ func TestReconcileCleansUpAfterAnInterruptedSnapshot(t *testing.T) {
 	ctx := context.Background()
 	f := newFixture(t, nil)
 	vm := f.running(t)
-	keep, err := f.m.Snapshot(ctx, vm.ID)
+	keep, err := f.m.Snapshot(ctx, vm.ID, SnapshotRequest{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -237,7 +237,7 @@ func TestReconcileCleansUpAfterAnInterruptedSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	// A delete that was interrupted, and a directory nothing knows about.
-	if _, err := f.m.Snapshot(ctx, vm.ID); err != nil {
+	if _, err := f.m.Snapshot(ctx, vm.ID, SnapshotRequest{}); err != nil {
 		t.Fatal(err)
 	}
 	all, _ := f.store.ListSnapshots(ctx, state.SnapshotFilter{})
@@ -414,14 +414,14 @@ func TestSnapshotWaitsForTheFlushToSettle(t *testing.T) {
 	ctx := context.Background()
 	f := newFixture(t, func(c *Config) { c.FlushSettle = 300 * time.Millisecond })
 	vm := f.running(t)
-	first, err := f.m.Snapshot(ctx, vm.ID)
+	first, err := f.m.Snapshot(ctx, vm.ID, SnapshotRequest{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if meta, _ := f.m.snaps.Load(first.ID); meta.TimingsMs["wait"] > 100 {
 		t.Errorf("the first snapshot waited %.0fms, with no flush before it", meta.TimingsMs["wait"])
 	}
-	second, err := f.m.Snapshot(ctx, vm.ID)
+	second, err := f.m.Snapshot(ctx, vm.ID, SnapshotRequest{})
 	if err != nil {
 		t.Fatal(err)
 	}

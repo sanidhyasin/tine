@@ -51,6 +51,7 @@ type Metrics struct {
 	snapshotsDeleted *prometheus.CounterVec
 	rollbackStage    *prometheus.HistogramVec
 	forkStage        *prometheus.HistogramVec
+	snapForkStage    *prometheus.HistogramVec
 	forkChildren     *prometheus.CounterVec
 }
 
@@ -91,7 +92,10 @@ func New(version string) *Metrics {
 		forkStage: f.histogramVec("vm_fork_stage_seconds",
 			"How long each stage of a fork took: snapshot, paused (how long the parent was frozen), children (restoring them all), and the total.",
 			operationBuckets, "stage"),
-		forkChildren: f.counterVec("vm_fork_children_total", "Children forks made, by result (ok or failed).", "result"),
+		snapForkStage: f.histogramVec("vm_snapshot_fork_stage_seconds",
+			"How long each stage of a fork of a saved snapshot took: check (the snapshot and admission), children (restoring them all), and the total.",
+			operationBuckets, "stage"),
+		forkChildren: f.counterVec("vm_fork_children_total", "Children forks made, of VMs and of snapshots, by result (ok or failed).", "result"),
 		rollbackStage: f.histogramVec("vm_rollback_stage_seconds",
 			"How long each stage of rolling a VM back to a snapshot took: stop, jail, start, restore, agent, sync, and the total.",
 			operationBuckets, "stage"),
@@ -204,6 +208,20 @@ func (m *Metrics) Forked(count, failed int, timingsMs map[string]float64) {
 	m.forkChildren.WithLabelValues("failed").Add(float64(failed))
 	for stage, ms := range timingsMs {
 		m.forkStage.WithLabelValues(stage).Observe(ms / 1000)
+	}
+}
+
+// SnapshotForked records a fork of a saved snapshot (no VM was paused) of
+// count children, failed of which couldn't be made, and its stage timings
+// in milliseconds.
+func (m *Metrics) SnapshotForked(count, failed int, timingsMs map[string]float64) {
+	if m == nil {
+		return
+	}
+	m.forkChildren.WithLabelValues("ok").Add(float64(count - failed))
+	m.forkChildren.WithLabelValues("failed").Add(float64(failed))
+	for stage, ms := range timingsMs {
+		m.snapForkStage.WithLabelValues(stage).Observe(ms / 1000)
 	}
 }
 

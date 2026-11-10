@@ -73,7 +73,7 @@ func (m *Manager) WarmTemplate(ctx context.Context, imageName string, vcpus, mem
 	settled := time.Since(start)
 
 	unlock := m.locks.lock(vm.ID)
-	snap, err := m.takeSnapshot(ctx, vm, state.SnapshotKindTemplate)
+	snap, err := m.takeSnapshot(ctx, vm, state.SnapshotKindTemplate, false)
 	unlock()
 	if err != nil {
 		return state.Snapshot{}, fmt.Errorf("warm %s: %w", req.Image, err)

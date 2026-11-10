@@ -27,6 +27,9 @@ type backend struct {
 	vms     []state.VM
 	lastReq vm.CreateRequest
 	lastRun agentproto.ExecRequest
+	// lastFork and lastSnap are the last fork's and snapshot's requests.
+	lastFork vm.ForkRequest
+	lastSnap vm.SnapshotRequest
 	// nextSource, if "template", makes Create look like a restore.
 	nextSource string
 	// files are the VMs' files, by "vmID:path".
@@ -168,7 +171,7 @@ func (b *backend) Snapshots(_ context.Context, flt state.SnapshotFilter) ([]vm.S
 		{Snapshot: state.Snapshot{ID: "snap-abcdefghij", Kind: state.SnapshotKindVM, State: state.SnapshotReady, VMID: "vm-aaaaaaaaab", Image: "base", VCPUs: 2, MemoryMiB: 1024,
 			SizeBytes: 1395864371, CreatedAt: time.Now().Add(-5 * time.Minute), Metadata: json.RawMessage(`{"timings_ms":{"paused":251.2}}`)}, UsedBy: []string{"vm-aaaaaaaaac"}},
 		{Snapshot: state.Snapshot{ID: "snap-abcdzzzzzz", Kind: state.SnapshotKindVM, State: state.SnapshotReady, VMID: "vm-aaaaaaaaab", Image: "base", VCPUs: 2, MemoryMiB: 1024,
-			SizeBytes: 1 << 30, CreatedAt: time.Now().Add(-time.Minute)}},
+			SizeBytes: 1 << 30, Retained: true, CreatedAt: time.Now().Add(-time.Minute)}},
 		{Snapshot: state.Snapshot{ID: "snap-tmplaaaaaa", Kind: state.SnapshotKindTemplate, State: state.SnapshotReady, VMID: "vm-warmwarmwa", Image: "base", VCPUs: 2, MemoryMiB: 1024,
 			SizeBytes: 1 << 30, CreatedAt: time.Now().Add(-time.Hour)}},
 	}
@@ -210,6 +213,7 @@ func (b *backend) Fork(_ context.Context, id string, req vm.ForkRequest) (vm.For
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.lastFork = req
 	res := vm.ForkResult{
 		Snapshot: state.Snapshot{ID: "snap-forkaaaaaa", Kind: state.SnapshotKindFork, State: state.SnapshotReady, VMID: id},
 		Timings:  map[string]float64{"snapshot": 49.1, "paused": 47.5, "children": 212.3, "total": 262.0},
@@ -223,6 +227,27 @@ func (b *backend) Fork(_ context.Context, id string, req vm.ForkRequest) (vm.For
 		c.ID = strings.NewReplacer("0", "f", "1", "g", "2", "h", "3", "i").Replace(fmt.Sprintf("vm-%010d", len(b.vms)+1))
 		c.ParentID, c.SnapshotID, c.Source = id, "snap-forkaaaaaa", state.SourceSnapshot
 		c.Timings = map[string]float64{"restore": 13, "agent": 61, "sync": 32, "total": 110}
+		b.vms = append(b.vms, c)
+		res.Children = append(res.Children, vm.ForkChild{VM: c})
+	}
+	return res, nil
+}
+
+func (b *backend) ForkSnapshot(ctx context.Context, snapID string, req vm.ForkRequest) (vm.ForkResult, error) {
+	info, err := b.GetSnapshot(ctx, snapID)
+	if err != nil {
+		return vm.ForkResult{}, err
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.lastFork = req
+	res := vm.ForkResult{Snapshot: info.Snapshot, Timings: map[string]float64{"check": 0.9, "children": 71.5, "total": 72.4}}
+	for range req.Count {
+		c := state.VM{
+			ID: strings.NewReplacer("0", "s", "1", "t", "2", "u", "3", "v").Replace(fmt.Sprintf("vm-%010d", len(b.vms)+1)), State: state.StateRunning,
+			Image: info.Image, VCPUs: info.VCPUs, MemoryMiB: info.MemoryMiB, ParentID: info.VMID, SnapshotID: snapID, Source: state.SourceSnapshot,
+			Network: req.Network, Timings: map[string]float64{"restore": 13, "agent": 30, "sync": 25, "total": 70},
+		}
 		b.vms = append(b.vms, c)
 		res.Children = append(res.Children, vm.ForkChild{VM: c})
 	}
@@ -251,7 +276,10 @@ func (b *backend) Rollback(_ context.Context, id, snapID string) (state.VM, erro
 	return b.vms[i], nil
 }
 
-func (b *backend) Snapshot(_ context.Context, id string) (state.Snapshot, error) {
+func (b *backend) Snapshot(_ context.Context, id string, req vm.SnapshotRequest) (state.Snapshot, error) {
+	b.mu.Lock()
+	b.lastSnap = req
+	b.mu.Unlock()
 	v, err := b.Get(context.Background(), id)
 	if err != nil {
 		return state.Snapshot{}, err
@@ -261,7 +289,7 @@ func (b *backend) Snapshot(_ context.Context, id string) (state.Snapshot, error)
 	}
 	return state.Snapshot{
 		ID: "snap-abcdefghij", Kind: state.SnapshotKindVM, State: state.SnapshotReady, VMID: id, Image: v.Image,
-		VCPUs: v.VCPUs, MemoryMiB: v.MemoryMiB, SizeBytes: 1 << 30, CreatedAt: time.Now(),
+		VCPUs: v.VCPUs, MemoryMiB: v.MemoryMiB, SizeBytes: 1 << 30, Retained: req.Retain, CreatedAt: time.Now(),
 		Metadata: json.RawMessage(`{"timings_ms":{"prepare":0.1,"pause":0.4,"memory":510.2,"disk":2.3,"resume":0.3,"paused":513.4,"total":520.9}}`),
 	}, nil
 }
@@ -667,5 +695,53 @@ func TestInterruptExitsWith130(t *testing.T) {
 	r := tineCtx(t, ctx, sock, "", "exec", "vm-aaaaaaaaab", "hang")
 	if r.code != 130 || strings.TrimSpace(r.stderr) != "tine: interrupted" {
 		t.Errorf("interrupted exec = exit %d, %q; want 130 and \"tine: interrupted\"", r.code, r.stderr)
+	}
+}
+
+func TestNetworkFlag(t *testing.T) {
+	sock, b := startTined(t)
+	if r := tine(t, sock, "", "create", "--network", "none"); r.code != 0 || b.lastReq.Network != state.NetworkNone {
+		t.Errorf("create --network none = %d %q; tined got %q", r.code, r.stderr, b.lastReq.Network)
+	}
+	parent := strings.TrimSpace(tine(t, sock, "", "create", "-q").stdout)
+	if b.lastReq.Network != "" {
+		t.Errorf("create without --network: tined got %q, want empty (its default)", b.lastReq.Network)
+	}
+	if r := tine(t, sock, "", "fork", parent, "-n", "2", "--network", "none"); r.code != 0 || b.lastFork.Network != state.NetworkNone {
+		t.Errorf("fork --network none = %d %q; tined got %+v", r.code, r.stderr, b.lastFork)
+	}
+}
+
+func TestSnapshotRetain(t *testing.T) {
+	sock, b := startTined(t)
+	id := strings.TrimSpace(tine(t, sock, "", "create", "-q").stdout)
+	r := tine(t, sock, "", "snapshot", "--retain", id)
+	if r.code != 0 || !b.lastSnap.Retain || r.stdout != "snap-abcdefghij  of "+id+"  1 GiB  retained  (paused 513ms: memory 510ms · disk 2.3ms; total 521ms)\n" {
+		t.Errorf("snapshot --retain = %d %q %q; tined got %+v", r.code, r.stdout, r.stderr, b.lastSnap)
+	}
+	if r := tine(t, sock, "", "snapshot", "-q", id); r.code != 0 || b.lastSnap.Retain {
+		t.Errorf("snapshot without --retain: tined got %+v", b.lastSnap)
+	}
+	if r := tine(t, sock, "", "snapshot", "ls"); !strings.Contains(r.stdout, "snap-abcdzzzzzz  vm (retained)") {
+		t.Errorf("snapshot ls doesn't mark the retained one:\n%s", r.stdout)
+	}
+}
+
+func TestForkASnapshot(t *testing.T) {
+	sock, b := startTined(t)
+	r := tine(t, sock, "", "fork", "snap-abcdz", "-n", "2", "--network", "none", "--ttl", "10m")
+	lines := strings.Split(strings.TrimSpace(r.stdout), "\n")
+	if r.code != 0 || len(lines) != 3 || lines[0] != "restored snap-abcdzzzzzz into 2 in 72ms (children 72ms)" ||
+		!strings.HasSuffix(lines[1], "running  (70ms)") {
+		t.Errorf("fork of a snapshot = %d:\n%s%s", r.code, r.stdout, r.stderr)
+	}
+	if got := b.lastFork; got.Count != 2 || got.Network != state.NetworkNone || got.TTL != 10*time.Minute {
+		t.Errorf("tined got %+v", got)
+	}
+	if r := tine(t, sock, "", "fork", "-q", "snap-abcdefghij"); r.code != 0 || !strings.HasPrefix(r.stdout, "vm-") || strings.Count(r.stdout, "\n") != 1 {
+		t.Errorf("fork -q of a snapshot = %d %q %q", r.code, r.stdout, r.stderr)
+	}
+	if r := tine(t, sock, "", "fork", "snap-nope", "-n", "1"); r.code != 1 || !strings.Contains(r.stderr, "no snapshot matches") {
+		t.Errorf("fork of a missing snapshot = %d %q", r.code, r.stderr)
 	}
 }

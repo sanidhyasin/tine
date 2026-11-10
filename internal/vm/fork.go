@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/sanidhyasin/tine/internal/image"
 	"github.com/sanidhyasin/tine/internal/logging"
 	"github.com/sanidhyasin/tine/internal/state"
 )
@@ -16,9 +17,9 @@ import (
 // parent is only paused while the snapshot is taken. Every child's jail has
 // hard links to the same memory file, which Firecracker maps privately, so
 // the host's page cache holds one copy of each page until a child changes
-// it.
+// it. ForkSnapshot does the same from a snapshot that's already there.
 
-// ForkRequest asks for children of a VM.
+// ForkRequest asks for children of a VM, or of a snapshot.
 type ForkRequest struct {
 	// Count is how many children: 1 to Config.MaxForkChildren.
 	Count int
@@ -26,6 +27,9 @@ type ForkRequest struct {
 	TTL time.Duration
 	// Strategy is how the children get their memory. Empty means ForkShare.
 	Strategy ForkStrategy
+	// Network is the children's network: state.NetworkDefault (also when
+	// empty) or state.NetworkNone. Children don't inherit their parent's.
+	Network state.Network
 }
 
 // ForkStrategy is how a fork's children get their memory: one rung of the
@@ -64,13 +68,15 @@ type ForkChild struct {
 
 // ForkResult is what a fork made.
 type ForkResult struct {
-	// Snapshot is the parent's snapshot the children were restored from.
+	// Snapshot is the snapshot the children were restored from: the
+	// parent's, taken for the fork, or the one ForkSnapshot was given.
 	Snapshot state.Snapshot
 	// Children are in the order they were asked for. Each succeeded or
 	// failed on its own; failed ones left nothing behind.
 	Children []ForkChild
 	// Timings: snapshot (the whole snapshot), paused (how long the parent
 	// was frozen), children (restoring them all) and total, in milliseconds.
+	// A fork of a snapshot has no snapshot or paused.
 	Timings map[string]float64
 }
 
@@ -95,14 +101,9 @@ func (r ForkResult) Failed() int {
 // request was bad, the parent isn't running, or the snapshot failed.
 func (m *Manager) Fork(ctx context.Context, parentID string, req ForkRequest) (ForkResult, error) {
 	ctx = logging.WithVM(ctx, parentID)
-	if !validStrategy(req.Strategy) {
-		return ForkResult{}, fmt.Errorf("%w: no fork strategy %q", ErrInvalidRequest, req.Strategy)
-	}
-	if req.Count < 1 || req.Count > m.cfg.MaxForkChildren {
-		return ForkResult{}, fmt.Errorf("%w: a fork makes 1 to %d children, not %d", ErrInvalidRequest, m.cfg.MaxForkChildren, req.Count)
-	}
-	if req.TTL == 0 {
-		req.TTL = m.cfg.DefaultTTL
+	req, err := m.checkFork(req)
+	if err != nil {
+		return ForkResult{}, err
 	}
 	t := newTimer()
 
@@ -118,7 +119,7 @@ func (m *Manager) Fork(ctx context.Context, parentID string, req ForkRequest) (F
 	}
 	// Check every child's request, and that the host has room for them,
 	// before pausing the parent.
-	if _, err := m.normalize(ctx, CreateRequest{TTL: req.TTL, VCPUs: parent.VCPUs, MemoryMiB: parent.MemoryMiB}); err != nil {
+	if _, err := m.normalize(ctx, CreateRequest{TTL: req.TTL, VCPUs: parent.VCPUs, MemoryMiB: parent.MemoryMiB, Network: req.Network}); err != nil {
 		unlock()
 		return ForkResult{}, err
 	}
@@ -128,7 +129,7 @@ func (m *Manager) Fork(ctx context.Context, parentID string, req ForkRequest) (F
 		return ForkResult{}, err
 	}
 	defer res.release()
-	snap, err := m.takeSnapshot(ctx, parent, state.SnapshotKindFork)
+	snap, err := m.takeSnapshot(ctx, parent, state.SnapshotKindFork, false)
 	unlock()
 	if err != nil {
 		return ForkResult{}, err
@@ -138,13 +139,112 @@ func (m *Manager) Fork(ctx context.Context, parentID string, req ForkRequest) (F
 	defer m.unpin(snap.ID)
 	t.mark("snapshot")
 
+	children := m.restoreChildren(ctx, req, CreateRequest{SnapshotID: snap.ID, ParentID: parent.ID, admitted: res}, t)
+	out := ForkResult{Snapshot: snap, Children: children, Timings: t.millis()}
+	if meta, err := m.snaps.Load(snap.ID); err == nil {
+		out.Timings["paused"] = meta.TimingsMs["paused"]
+		if merge, ok := meta.TimingsMs["merge"]; ok {
+			out.Timings["merge"] = merge
+		}
+	}
+	failed := out.Failed()
+	m.cfg.Metrics.Forked(req.Count, failed, out.Timings)
+	_ = m.store.Note(context.WithoutCancel(ctx), parent.ID, fmt.Sprintf("forked %d children (%d failed) from %s in %.0fms, paused %.0fms",
+		req.Count-failed, failed, snap.ID, out.Timings["total"], out.Timings["paused"]))
+	m.log.InfoContext(ctx, "forked", "vm", parent.ID, "snapshot", snap.ID, "children", req.Count, "failed", failed,
+		"network", req.Network, "timings_ms", out.Timings)
+	return out, nil
+}
+
+// ForkSnapshot restores Count children from a ready snapshot, as Fork does
+// from the snapshot it takes, ForkParallelism at a time. Nothing is paused.
+// The snapshot can be any VM's, kept or retained, even once that VM is
+// gone; a template's; or another fork's. Each child's ParentID is the VM
+// the snapshot was taken of, unless it was a template's.
+//
+// The snapshot is pinned while the children are made, so it can't be
+// deleted or collected from under them (DeleteSnapshot is ErrBusy). Once
+// admitted, the fork runs to the end even if the caller gives up. It
+// returns an error only if no child could be attempted.
+func (m *Manager) ForkSnapshot(ctx context.Context, snapID string, req ForkRequest) (ForkResult, error) {
+	req, err := m.checkFork(req)
+	if err != nil {
+		return ForkResult{}, err
+	}
+	t := newTimer()
+	m.pin(snapID)
+	defer m.unpin(snapID)
+	snap, err := m.store.GetSnapshot(ctx, snapID)
+	if err != nil {
+		return ForkResult{}, err
+	}
+	if err := m.checkRestorable(ctx, snapID); err != nil {
+		return ForkResult{}, err
+	}
+	if _, err := image.Open(m.cfg.ImagesDir, snap.Image); err != nil {
+		return ForkResult{}, fmt.Errorf("%w: %s, the image of snapshot %s: %w", ErrImageNotFound, snap.Image, snapID, err)
+	}
+	if _, err := m.normalize(ctx, CreateRequest{SnapshotID: snapID, TTL: req.TTL, Network: req.Network}); err != nil {
+		return ForkResult{}, err
+	}
+	res, err := m.admit(ctx, req.Count, snap.VCPUs, snap.MemoryMiB, m.cfg.RestoreUseMiB)
+	if err != nil {
+		return ForkResult{}, err
+	}
+	defer res.release()
+	t.mark("check")
+
+	parentID := snap.VMID
+	if snap.Kind == state.SnapshotKindTemplate {
+		parentID = "" // the VM booted to make it, destroyed straight after
+	}
+	children := m.restoreChildren(ctx, req, CreateRequest{SnapshotID: snapID, ParentID: parentID, admitted: res}, t)
+	out := ForkResult{Snapshot: snap, Children: children, Timings: t.millis()}
+	failed := out.Failed()
+	m.cfg.Metrics.SnapshotForked(req.Count, failed, out.Timings)
+	if parentID != "" {
+		// The snapshot's VM may be destroyed, or its record purged: then there's no one to tell.
+		_ = m.store.Note(context.WithoutCancel(ctx), parentID, fmt.Sprintf("%d children (%d failed) restored from its snapshot %s in %.0fms",
+			req.Count-failed, failed, snapID, out.Timings["total"]))
+	}
+	m.log.InfoContext(ctx, "forked a snapshot", "snapshot", snapID, "vm", snap.VMID, "children", req.Count, "failed", failed,
+		"network", req.Network, "timings_ms", out.Timings)
+	return out, nil
+}
+
+// checkFork checks a fork's request, and fills in its defaults.
+func (m *Manager) checkFork(req ForkRequest) (ForkRequest, error) {
+	if !validStrategy(req.Strategy) {
+		return req, fmt.Errorf("%w: no fork strategy %q", ErrInvalidRequest, req.Strategy)
+	}
+	if req.Count < 1 || req.Count > m.cfg.MaxForkChildren {
+		return req, fmt.Errorf("%w: a fork makes 1 to %d children, not %d", ErrInvalidRequest, m.cfg.MaxForkChildren, req.Count)
+	}
+	network, err := normalizeNetwork(req.Network)
+	if err != nil {
+		return req, err
+	}
+	req.Network = network
+	if req.TTL == 0 {
+		req.TTL = m.cfg.DefaultTTL
+	}
+	return req, nil
+}
+
+// restoreChildren creates req.Count VMs from child, a create from the
+// fork's snapshot that the fork has admitted, ForkParallelism at a time,
+// and marks the timer's "children" (and "first", for a first child
+// restored alone). The caller must keep the snapshot from being collected:
+// a fork's pinned until its children have claimed it. Once it starts, it
+// runs to the end even if ctx ends.
+func (m *Manager) restoreChildren(ctx context.Context, req ForkRequest, child CreateRequest, t *timer) []ForkChild {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Duration(req.Count)*m.cfg.AgentTimeout+time.Minute)
 	defer cancel()
+	child.TTL, child.Strategy, child.Network = req.TTL, req.Strategy, req.Network
 	children := make([]ForkChild, req.Count)
-	child := CreateRequest{SnapshotID: snap.ID, TTL: req.TTL, ParentID: parent.ID, admitted: res, Strategy: req.Strategy}
 	first := 0
 	if req.Strategy == ForkUffdPrefetch {
-		if child.prefetch = m.workingSetOf(snap.ID); child.prefetch == "" {
+		if child.prefetch = m.workingSetOf(child.SnapshotID); child.prefetch == "" {
 			// The first child alone, recording the pages it touches as it
 			// starts; the others then copy those in.
 			rec := child
@@ -152,7 +252,7 @@ func (m *Manager) Fork(ctx context.Context, parentID string, req ForkRequest) (F
 			vm, err := m.Create(ctx, rec)
 			children[0] = ForkChild{VM: vm, Err: err}
 			first = 1
-			child.prefetch = m.workingSetOf(snap.ID)
+			child.prefetch = m.workingSetOf(child.SnapshotID)
 			t.mark("first")
 		}
 	}
@@ -174,20 +274,7 @@ func (m *Manager) Fork(ctx context.Context, parentID string, req ForkRequest) (F
 	close(jobs)
 	wg.Wait()
 	t.mark("children")
-
-	out := ForkResult{Snapshot: snap, Children: children, Timings: t.millis()}
-	if meta, err := m.snaps.Load(snap.ID); err == nil {
-		out.Timings["paused"] = meta.TimingsMs["paused"]
-		if merge, ok := meta.TimingsMs["merge"]; ok {
-			out.Timings["merge"] = merge
-		}
-	}
-	failed := out.Failed()
-	m.cfg.Metrics.Forked(req.Count, failed, out.Timings)
-	_ = m.store.Note(ctx, parent.ID, fmt.Sprintf("forked %d children (%d failed) from %s in %.0fms, paused %.0fms",
-		req.Count-failed, failed, snap.ID, out.Timings["total"], out.Timings["paused"]))
-	m.log.InfoContext(ctx, "forked", "vm", parent.ID, "snapshot", snap.ID, "children", req.Count, "failed", failed, "timings_ms", out.Timings)
-	return out, nil
+	return children
 }
 
 // pin keeps garbage collection and deletion away from a snapshot, such as

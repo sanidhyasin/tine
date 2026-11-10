@@ -14,13 +14,14 @@
 //	GET    /v1/vms/{id}            VM, with its memory if it's running
 //	DELETE /v1/vms/{id}            VM
 //	POST   /v1/vms/{id}/exec       ExecRequest → a stream of Frames
-//	POST   /v1/vms/{id}/snapshots  Snapshot (201)
+//	POST   /v1/vms/{id}/snapshots  SnapshotRequest (optional) → Snapshot (201)
 //	GET    /v1/vms/{id}/snapshots  ListSnapshotsResponse, the VM's
 //	POST   /v1/vms/{id}/rollback   RollbackRequest → VM
 //	POST   /v1/vms/{id}/fork       ForkRequest → ForkResponse (201)
 //	GET    /v1/snapshots[?vm=&kind=&image=]  ListSnapshotsResponse
 //	GET    /v1/snapshots/{id}      Snapshot
 //	DELETE /v1/snapshots/{id}      Snapshot (409 in_use while VMs run from it)
+//	POST   /v1/snapshots/{id}/fork ForkRequest → ForkResponse (201)
 package api
 
 import (
@@ -50,8 +51,12 @@ type VM struct {
 	// SnapshotID is the snapshot the VM was restored from, and runs from. It's
 	// empty for a VM that was booted from scratch.
 	SnapshotID string `json:"snapshot_id,omitempty"`
-	// ParentID is the VM this one was forked from.
+	// ParentID is the VM this one was forked from, or that the snapshot it
+	// was restored from was taken of.
 	ParentID string `json:"parent_id,omitempty"`
+	// Network is "default", its own network with NAT to the internet, or
+	// "none", loopback only.
+	Network string `json:"network"`
 	// Memory is how much host memory it uses now: on GET /v1/vms/{id}, and
 	// on lists with ?memory=true, for running VMs.
 	Memory *Memory `json:"memory,omitempty"`
@@ -84,7 +89,10 @@ type Snapshot struct {
 	VCPUs     int `json:"vcpus"`
 	MemoryMiB int `json:"memory_mib"`
 	// SizeBytes is the disk space its files take.
-	SizeBytes int64     `json:"size_bytes"`
+	SizeBytes int64 `json:"size_bytes"`
+	// Retained snapshots are kept until they're deleted: they outlive their
+	// VM, which garbage collection otherwise follows.
+	Retained  bool      `json:"retained,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
 	// UsedBy lists the VMs that run from it. It can't be deleted while any do.
 	UsedBy []string `json:"used_by,omitempty"`
@@ -107,6 +115,9 @@ type CreateVMRequest struct {
 	// a fork (ForkRequest.Strategy). With "uffd-prefetch", the template's
 	// first restore records the pages it touches, and later ones copy them in.
 	Strategy string `json:"strategy,omitempty"`
+	// Network is "default" (also when empty), the VM's own network with NAT
+	// to the internet, or "none": loopback only, with nothing beyond it.
+	Network string `json:"network,omitempty"`
 }
 
 // ListVMsResponse is GET /v1/vms's answer.
@@ -137,7 +148,7 @@ type Template struct {
 	Problem string `json:"problem,omitempty"`
 }
 
-// ForkRequest asks for children of a running VM.
+// ForkRequest asks for children of a running VM, or of a snapshot.
 type ForkRequest struct {
 	Count      int `json:"count"`
 	TTLSeconds int `json:"ttl_seconds,omitempty"`
@@ -148,17 +159,32 @@ type ForkRequest struct {
 	// child as it's touched, and "uffd-prefetch" copies in the pages the
 	// first child touched as it started before the others ask.
 	Strategy string `json:"strategy,omitempty"`
+	// Network is the children's network, as for a create
+	// (CreateVMRequest.Network): "default" when empty, not the parent's.
+	Network string `json:"network,omitempty"`
 }
 
 // ForkResponse is what a fork made. It's 201 Created if at least one child
 // was made; each child either has a VM or an error.
 type ForkResponse struct {
-	// Snapshot is the parent's snapshot the children were restored from.
+	// Snapshot is the snapshot the children were restored from: the
+	// parent's, taken for the fork, or the one forked.
 	Snapshot Snapshot    `json:"snapshot"`
 	Children []ForkChild `json:"children"`
 	// TimingsMs: snapshot, paused (how long the parent was frozen),
-	// children (restoring them all) and total.
+	// children (restoring them all) and total. A fork of a snapshot has
+	// check (the snapshot and admission) instead of snapshot and paused.
 	TimingsMs map[string]float64 `json:"timings_ms"`
+}
+
+// SnapshotRequest says how to snapshot a VM. The body is optional: none, or
+// {}, takes a snapshot that goes with its VM.
+type SnapshotRequest struct {
+	// Retain keeps the snapshot until DELETE /v1/snapshots/{id}, even once
+	// its VM is destroyed and across restarts, for VMs to be restored from
+	// it later (POST /v1/snapshots/{id}/fork). Retained snapshots have a
+	// limit per VM of their own (--max-retained-snapshots-per-vm).
+	Retain bool `json:"retain,omitempty"`
 }
 
 // ForkChild is one child of a fork: the VM, or why it couldn't be made.

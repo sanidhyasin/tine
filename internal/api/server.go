@@ -40,12 +40,13 @@ type Backend interface {
 	ReadFile(ctx context.Context, id, path string) (io.ReadCloser, agentproto.FileInfo, error)
 	WriteFile(ctx context.Context, id, path string, mode os.FileMode, r io.Reader) (agentproto.FileInfo, error)
 	PutArchive(ctx context.Context, id, dir string, r io.Reader) (agentproto.ArchiveResult, error)
-	Snapshot(ctx context.Context, id string) (state.Snapshot, error)
+	Snapshot(ctx context.Context, id string, req vm.SnapshotRequest) (state.Snapshot, error)
 	Snapshots(ctx context.Context, f state.SnapshotFilter) ([]vm.SnapshotInfo, error)
 	GetSnapshot(ctx context.Context, id string) (vm.SnapshotInfo, error)
 	DeleteSnapshot(ctx context.Context, id string) (state.Snapshot, error)
 	Rollback(ctx context.Context, id, snapshotID string) (state.VM, error)
 	Fork(ctx context.Context, id string, req vm.ForkRequest) (vm.ForkResult, error)
+	ForkSnapshot(ctx context.Context, snapID string, req vm.ForkRequest) (vm.ForkResult, error)
 	Memory(ctx context.Context, id string) (vm.Memory, error)
 	Images(ctx context.Context) ([]*image.Image, error)
 	Templates(ctx context.Context) ([]vm.Template, error)
@@ -104,6 +105,7 @@ func NewServer(backend Backend, version string, log *slog.Logger, opts ...Option
 	s.mux.HandleFunc("/v1/vms/{id}/fork", s.fork)
 	s.mux.HandleFunc("/v1/snapshots", s.snapshots)
 	s.mux.HandleFunc("/v1/snapshots/{id}", s.oneSnapshot)
+	s.mux.HandleFunc("/v1/snapshots/{id}/fork", s.snapshotFork)
 	s.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, CodeNotFound, "no such endpoint: "+r.Method+" "+r.URL.Path)
 	})
@@ -255,7 +257,7 @@ func (s *Server) vms(w http.ResponseWriter, r *http.Request) {
 		}
 		created, err := s.backend.Create(r.Context(), vm.CreateRequest{
 			Image: req.Image, VCPUs: req.VCPUs, MemoryMiB: req.MemoryMiB, TTL: time.Duration(req.TTLSeconds) * time.Second, Cold: req.Cold,
-			Strategy: vm.ForkStrategy(req.Strategy),
+			Strategy: vm.ForkStrategy(req.Strategy), Network: state.Network(req.Network),
 		})
 		if err != nil {
 			s.fail(w, r, err)
@@ -397,7 +399,13 @@ func (s *Server) vmSnapshots(w http.ResponseWriter, r *http.Request) {
 	ctx := logging.WithVM(r.Context(), r.PathValue("id"))
 	switch r.Method {
 	case http.MethodPost:
-		snap, err := s.backend.Snapshot(ctx, r.PathValue("id"))
+		// The body is optional: clients from before it had a field sent {}
+		// or nothing.
+		var req SnapshotRequest
+		if !decodeOptional(w, r, maxJSONBytes, &req) {
+			return
+		}
+		snap, err := s.backend.Snapshot(ctx, r.PathValue("id"), vm.SnapshotRequest{Retain: req.Retain})
 		if err != nil {
 			s.fail(w, r, err)
 			return
@@ -475,21 +483,48 @@ func (s *Server) rollback(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) fork(w http.ResponseWriter, r *http.Request) {
-	if !allow(w, r, http.MethodPost) {
-		return
-	}
-	var req ForkRequest
-	if !decode(w, r, maxJSONBytes, &req) {
-		return
-	}
-	if req.TTLSeconds < 0 {
-		writeError(w, http.StatusBadRequest, CodeInvalidRequest, "ttl_seconds can't be negative")
+	req, ok := s.forkRequest(w, r)
+	if !ok {
 		return
 	}
 	ctx := logging.WithVM(r.Context(), r.PathValue("id"))
-	res, err := s.backend.Fork(ctx, r.PathValue("id"), vm.ForkRequest{
+	res, err := s.backend.Fork(ctx, r.PathValue("id"), req)
+	s.writeFork(w, r, res, err)
+}
+
+// snapshotFork: POST /v1/snapshots/{id}/fork restores children from a
+// snapshot that's already there, with the same request and answer as a
+// fork of a running VM.
+func (s *Server) snapshotFork(w http.ResponseWriter, r *http.Request) {
+	req, ok := s.forkRequest(w, r)
+	if !ok {
+		return
+	}
+	res, err := s.backend.ForkSnapshot(r.Context(), r.PathValue("id"), req)
+	s.writeFork(w, r, res, err)
+}
+
+// forkRequest reads a fork's request. If it's no good, it has answered.
+func (s *Server) forkRequest(w http.ResponseWriter, r *http.Request) (vm.ForkRequest, bool) {
+	if !allow(w, r, http.MethodPost) {
+		return vm.ForkRequest{}, false
+	}
+	var req ForkRequest
+	if !decode(w, r, maxJSONBytes, &req) {
+		return vm.ForkRequest{}, false
+	}
+	if req.TTLSeconds < 0 {
+		writeError(w, http.StatusBadRequest, CodeInvalidRequest, "ttl_seconds can't be negative")
+		return vm.ForkRequest{}, false
+	}
+	return vm.ForkRequest{
 		Count: req.Count, TTL: time.Duration(req.TTLSeconds) * time.Second, Strategy: vm.ForkStrategy(req.Strategy),
-	})
+		Network: state.Network(req.Network),
+	}, true
+}
+
+// writeFork answers a fork: 201 with its children if any was made.
+func (s *Server) writeFork(w http.ResponseWriter, r *http.Request, res vm.ForkResult, err error) {
 	if err != nil {
 		s.fail(w, r, err)
 		return
@@ -558,7 +593,11 @@ func errorStatus(err error) (int, string) {
 func toAPI(v state.VM) VM {
 	out := VM{
 		ID: v.ID, State: string(v.State), Image: v.Image, VCPUs: v.VCPUs, MemoryMiB: v.MemoryMiB,
-		CreatedAt: v.CreatedAt, Error: v.Error, Source: string(v.Source), SnapshotID: v.SnapshotID, ParentID: v.ParentID, TimingsMs: v.Timings,
+		CreatedAt: v.CreatedAt, Error: v.Error, Source: string(v.Source), SnapshotID: v.SnapshotID, ParentID: v.ParentID,
+		Network: string(v.Network), TimingsMs: v.Timings,
+	}
+	if out.Network == "" {
+		out.Network = string(state.NetworkDefault)
 	}
 	if !v.ExpiresAt.IsZero() {
 		t := v.ExpiresAt
@@ -575,7 +614,7 @@ func toAPI(v state.VM) VM {
 func toAPISnapshot(s state.Snapshot, usedBy []string) Snapshot {
 	out := Snapshot{
 		ID: s.ID, Kind: string(s.Kind), State: string(s.State), VMID: s.VMID, Image: s.Image,
-		VCPUs: s.VCPUs, MemoryMiB: s.MemoryMiB, SizeBytes: s.SizeBytes, CreatedAt: s.CreatedAt, UsedBy: usedBy,
+		VCPUs: s.VCPUs, MemoryMiB: s.MemoryMiB, SizeBytes: s.SizeBytes, Retained: s.Retained, CreatedAt: s.CreatedAt, UsedBy: usedBy,
 	}
 	var meta snapshot.Metadata
 	if len(s.Metadata) > 0 && json.Unmarshal(s.Metadata, &meta) == nil {
@@ -604,6 +643,18 @@ func decode(w http.ResponseWriter, r *http.Request, limit int64, v any) bool {
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, limit))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {
+		writeError(w, http.StatusBadRequest, CodeInvalidRequest, "bad request body: "+err.Error())
+		return false
+	}
+	return true
+}
+
+// decodeOptional is decode for a body that may be left out: an empty one
+// leaves v as it is.
+func decodeOptional(w http.ResponseWriter, r *http.Request, limit int64, v any) bool {
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, limit))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(v); err != nil && !errors.Is(err, io.EOF) {
 		writeError(w, http.StatusBadRequest, CodeInvalidRequest, "bad request body: "+err.Error())
 		return false
 	}

@@ -31,14 +31,14 @@ func TestDiffSnapshots(t *testing.T) {
 		t.Fatalf("a booted VM's base = %q, %v; want tracked, with none", base, ok)
 	}
 
-	first, err := f.m.Snapshot(ctx, vm.ID)
+	first, err := f.m.Snapshot(ctx, vm.ID, SnapshotRequest{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if w := f.host.writes(); w != "writeSnapshot" {
 		t.Errorf("first snapshot: %s, want a full one", w)
 	}
-	second, err := f.m.Snapshot(ctx, vm.ID)
+	second, err := f.m.Snapshot(ctx, vm.ID, SnapshotRequest{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,7 +82,7 @@ func TestDiffSnapshots(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.host.takeCalls()
-	if _, err := f.m.Snapshot(ctx, restored.ID); err != nil {
+	if _, err := f.m.Snapshot(ctx, restored.ID, SnapshotRequest{}); err != nil {
 		t.Fatal(err)
 	}
 	if w, last := f.host.writes(), f.host.merges[len(f.host.merges)-1]; w != "writeSnapshot diff" || last.BaseID != second.ID {
@@ -107,7 +107,7 @@ func TestDiffSnapshotFallsBackToFull(t *testing.T) {
 	ctx := context.Background()
 	f := diffFixture(t, "")
 	vm := f.running(t)
-	first, err := f.m.Snapshot(ctx, vm.ID)
+	first, err := f.m.Snapshot(ctx, vm.ID, SnapshotRequest{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,12 +115,12 @@ func TestDiffSnapshotFallsBackToFull(t *testing.T) {
 	// A snapshot that fails once Firecracker began writing it leaves the
 	// tracking unknown: the next one is full.
 	f.host.fail("cloneDisk", errors.New("disk trouble"))
-	if _, err := f.m.Snapshot(ctx, vm.ID); err == nil {
+	if _, err := f.m.Snapshot(ctx, vm.ID, SnapshotRequest{}); err == nil {
 		t.Fatal("snapshot with a failing disk clone succeeded")
 	}
 	f.host.fail("cloneDisk", nil)
 	f.host.takeCalls()
-	second, err := f.m.Snapshot(ctx, vm.ID)
+	second, err := f.m.Snapshot(ctx, vm.ID, SnapshotRequest{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -132,7 +132,7 @@ func TestDiffSnapshotFallsBackToFull(t *testing.T) {
 	if _, err := f.m.DeleteSnapshot(ctx, second.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.m.Snapshot(ctx, vm.ID); err != nil {
+	if _, err := f.m.Snapshot(ctx, vm.ID, SnapshotRequest{}); err != nil {
 		t.Fatal(err)
 	}
 	if w := f.host.writes(); w != "writeSnapshot" {
@@ -149,7 +149,7 @@ func TestDiffSnapshotsOffAndMergeChoice(t *testing.T) {
 	f := newFixture(t, nil)
 	vm := f.running(t)
 	for range 2 {
-		if _, err := f.m.Snapshot(ctx, vm.ID); err != nil {
+		if _, err := f.m.Snapshot(ctx, vm.ID, SnapshotRequest{}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -164,7 +164,7 @@ func TestDiffSnapshotsOffAndMergeChoice(t *testing.T) {
 	for merge, wantCopy := range map[string]bool{mergeReflink: false, mergeCopy: true} {
 		f := diffFixture(t, merge)
 		vm := f.running(t)
-		if _, err := f.m.Snapshot(ctx, vm.ID); err != nil {
+		if _, err := f.m.Snapshot(ctx, vm.ID, SnapshotRequest{}); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := f.m.Fork(ctx, vm.ID, ForkRequest{Count: 1}); err != nil {

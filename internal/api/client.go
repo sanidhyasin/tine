@@ -151,6 +151,14 @@ func (c *Client) Fork(ctx context.Context, vmID string, req ForkRequest) (ForkRe
 	return res, c.do(ctx, http.MethodPost, "/v1/vms/"+url.PathEscape(vmID)+"/fork", req, http.StatusCreated, &res)
 }
 
+// ForkSnapshot restores children from a snapshot that's already there, such
+// as a retained one. It returns an error only if none could be made;
+// otherwise each child has a VM or an error.
+func (c *Client) ForkSnapshot(ctx context.Context, snapshotID string, req ForkRequest) (ForkResponse, error) {
+	var res ForkResponse
+	return res, c.do(ctx, http.MethodPost, "/v1/snapshots/"+url.PathEscape(snapshotID)+"/fork", req, http.StatusCreated, &res)
+}
+
 // Rollback rolls a VM back to a snapshot.
 func (c *Client) Rollback(ctx context.Context, vmID, snapshotID string) (VM, error) {
 	var v VM
@@ -159,8 +167,13 @@ func (c *Client) Rollback(ctx context.Context, vmID, snapshotID string) (VM, err
 
 // CreateSnapshot snapshots a running VM.
 func (c *Client) CreateSnapshot(ctx context.Context, vmID string) (Snapshot, error) {
+	return c.CreateSnapshotWith(ctx, vmID, SnapshotRequest{})
+}
+
+// CreateSnapshotWith snapshots a running VM, retained if req says so.
+func (c *Client) CreateSnapshotWith(ctx context.Context, vmID string, req SnapshotRequest) (Snapshot, error) {
 	var snap Snapshot
-	return snap, c.do(ctx, http.MethodPost, "/v1/vms/"+url.PathEscape(vmID)+"/snapshots", struct{}{}, http.StatusCreated, &snap)
+	return snap, c.do(ctx, http.MethodPost, "/v1/vms/"+url.PathEscape(vmID)+"/snapshots", req, http.StatusCreated, &snap)
 }
 
 // DestroyVM destroys a VM and returns its final record.

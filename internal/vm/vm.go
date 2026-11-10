@@ -142,8 +142,13 @@ type Config struct {
 	// DestroyedRetention is how long destroyed VMs' records are kept.
 	DestroyedRetention time.Duration
 	// MaxSnapshotsPerVM is how many snapshots one VM may have. A fork's
-	// snapshots don't count.
+	// snapshots don't count, and nor do retained ones, which have their own
+	// limit.
 	MaxSnapshotsPerVM int
+	// MaxRetainedSnapshotsPerVM is how many retained snapshots, kept until
+	// they're deleted, may be taken of one VM and exist at once: enough for
+	// one before every step of a long agent run.
+	MaxRetainedSnapshotsPerVM int
 	// OvercommitRatio bounds the guest memory of all VMs together, as a
 	// multiple of the host's memory (see admission.go).
 	OvercommitRatio float64
@@ -207,18 +212,22 @@ func DefaultConfig() Config {
 		ReaperInterval:     15 * time.Second,
 		DestroyedRetention: 7 * 24 * time.Hour,
 		MaxSnapshotsPerVM:  16,
-		MaxForkChildren:    100,
-		OvercommitRatio:    4,
-		CPUOvercommitRatio: 8,
-		MinFreeMemoryMiB:   1024,
-		BootUseMiB:         192,
-		RestoreUseMiB:      64,
-		ForkParallelism:    runtime.NumCPU(),
-		MinFreeMiB:         2048,
-		WarmImages:         []string{"base"},
-		SettleCommand:      []string{"systemctl", "is-system-running", "--wait"},
-		SettleQuiet:        2 * time.Second,
-		FlushSettle:        2 * time.Second,
+		// A retained snapshot of a 1 GiB VM takes up to 1 GiB of disk, and
+		// every snapshot must leave MinFreeMiB free, so the disk is the
+		// real limit.
+		MaxRetainedSnapshotsPerVM: 256,
+		MaxForkChildren:           100,
+		OvercommitRatio:           4,
+		CPUOvercommitRatio:        8,
+		MinFreeMemoryMiB:          1024,
+		BootUseMiB:                192,
+		RestoreUseMiB:             64,
+		ForkParallelism:           runtime.NumCPU(),
+		MinFreeMiB:                2048,
+		WarmImages:                []string{"base"},
+		SettleCommand:             []string{"systemctl", "is-system-running", "--wait"},
+		SettleQuiet:               2 * time.Second,
+		FlushSettle:               2 * time.Second,
 	}
 }
 
@@ -250,6 +259,7 @@ func (c Config) withDefaults() Config {
 	setInt(&c.MemoryOverheadMiB, d.MemoryOverheadMiB)
 	setInt(&c.MaxPIDs, d.MaxPIDs)
 	setInt(&c.MaxSnapshotsPerVM, d.MaxSnapshotsPerVM)
+	setInt(&c.MaxRetainedSnapshotsPerVM, d.MaxRetainedSnapshotsPerVM)
 	setInt(&c.MaxForkChildren, d.MaxForkChildren)
 	setInt(&c.MinFreeMemoryMiB, d.MinFreeMemoryMiB)
 	setInt(&c.BootUseMiB, d.BootUseMiB)
@@ -415,6 +425,9 @@ type CreateRequest struct {
 	SnapshotID string
 	// Cold boots the VM even if there's a template it could restore from.
 	Cold bool
+	// Network is the network the VM has: state.NetworkDefault (also when
+	// empty), or state.NetworkNone for loopback only.
+	Network state.Network
 	// ParentID is the VM this one is forked from (Fork sets it).
 	ParentID string
 	// admitted is the room Fork already reserved for this VM.
@@ -437,6 +450,11 @@ func (m *Manager) normalize(ctx context.Context, req CreateRequest) (CreateReque
 	if req.SnapshotID != "" && req.Cold {
 		return req, fmt.Errorf("%w: a VM can't be restored from a snapshot and booted cold", ErrInvalidRequest)
 	}
+	network, err := normalizeNetwork(req.Network)
+	if err != nil {
+		return req, err
+	}
+	req.Network = network
 	if req.SnapshotID != "" {
 		snap, err := m.store.GetSnapshot(ctx, req.SnapshotID)
 		if err != nil {
@@ -522,7 +540,7 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (state.VM, erro
 	record := state.VM{
 		ID: newID(), Image: req.Image, VCPUs: req.VCPUs, MemoryMiB: req.MemoryMiB,
 		Slot: slot, UID: m.cfg.UIDBase + slot, ExpiresAt: time.Now().Add(req.TTL),
-		SnapshotID: req.SnapshotID, Source: source, ParentID: req.ParentID,
+		SnapshotID: req.SnapshotID, Source: source, ParentID: req.ParentID, Network: req.Network,
 	}
 	vm, err := res.record(func() (state.VM, error) {
 		vm, err := m.store.CreateVM(ctx, record)
@@ -680,7 +698,7 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (state.VM, erro
 		return fail("record", err)
 	}
 	m.tracking(vm.ID, vm.SnapshotID)
-	log.InfoContext(ctx, "created", "from", vm.Source, "snapshot", vm.SnapshotID, "timings_ms", vm.Timings)
+	log.InfoContext(ctx, "created", "from", vm.Source, "snapshot", vm.SnapshotID, "network", vm.Network, "timings_ms", vm.Timings)
 	m.cfg.Metrics.CreateSucceeded(string(vm.Source), vm.Timings)
 	return vm, nil
 }
@@ -846,7 +864,11 @@ func (m *Manager) resources(vm state.VM) (netns.Network, *jailer.Jail, error) {
 // resourcesFor is resources, placing a restored VM's memory file with
 // memoryMode: shared through a hard link, or copied for the naive fork.
 func (m *Manager) resourcesFor(vm state.VM, memoryMode jailer.FileMode) (netns.Network, *jailer.Jail, error) {
-	n, err := netns.Plan(vm.ID, vm.Slot)
+	plan := netns.Plan
+	if vm.Network == state.NetworkNone {
+		plan = netns.OfflinePlan
+	}
+	n, err := plan(vm.ID, vm.Slot)
 	if err != nil {
 		return netns.Network{}, nil, err
 	}
@@ -875,6 +897,17 @@ func (m *Manager) resourcesFor(vm state.VM, memoryMode jailer.FileMode) (netns.N
 		FirecrackerArgs: []string{"--enable-pci"},
 	})
 	return n, j, err
+}
+
+// normalizeNetwork checks a requested network, and makes empty the default.
+func normalizeNetwork(n state.Network) (state.Network, error) {
+	switch n {
+	case "":
+		return state.NetworkDefault, nil
+	case state.NetworkDefault, state.NetworkNone:
+		return n, nil
+	}
+	return n, fmt.Errorf("%w: no network %q: want %q or %q", ErrInvalidRequest, n, state.NetworkDefault, state.NetworkNone)
 }
 
 // memoryLimit is a VM's cgroup memory limit: its memory, Firecracker's
