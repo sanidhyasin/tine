@@ -21,6 +21,12 @@
 // (which include the EC2 metadata service at 169.254.169.254), and no IPv6.
 // Nothing outside can open connections into a VM.
 //
+// An offline network (Network.Offline) is the namespace and its tap0 alone:
+// no veth pair, no route out and no NAT, so the guest has loopback and
+// nothing else. tap0 stays because the guest's network device needs it to
+// restore: a guest is the same online or offline, and only the namespace
+// around it differs, so a snapshot of either can be restored as either.
+//
 // Everything that runs commands or touches the kernel needs Linux and root.
 package netns
 
@@ -106,6 +112,9 @@ type Network struct {
 	HostVeth string
 	// HostIP and NamespaceIP are the two ends of the veth pair (a /30).
 	HostIP, NamespaceIP netip.Addr
+	// Offline networks have no veth pair: the guest can't reach anything
+	// beyond itself. The slot then only picks the VM's uid.
+	Offline bool
 }
 
 // Plan works out a VM's network from its ID and slot. It doesn't create anything.
@@ -162,6 +171,13 @@ func (n Network) NamespaceCIDR() netip.Prefix { return netip.PrefixFrom(n.Namesp
 func GuestKernelArgs() string {
 	// ip=<client>::<gateway>:<netmask>::<device>:<autoconf>
 	return fmt.Sprintf("ip=%s::%s:255.255.255.252::eth0:off", GuestIP, GatewayIP)
+}
+
+// OfflinePlan is Plan for a VM with no network beyond loopback.
+func OfflinePlan(id string, slot int) (Network, error) {
+	n, err := Plan(id, slot)
+	n.Offline = true
+	return n, err
 }
 
 // HostRuleset is the nftables script for the host's "inet tine" table. It
@@ -223,4 +239,25 @@ func NamespaceRuleset() string {
 	}
 }
 `, TapDevice, NamespaceVeth, GuestIP)
+}
+
+// OfflineRuleset is the nftables script for the "inet tine" table inside an
+// offline VM's namespace. There's no route out of the namespace to begin
+// with; this also keeps the guest from reaching the namespace itself, as in
+// NamespaceRuleset, and forwards nothing, should a route ever appear.
+func OfflineRuleset() string {
+	return fmt.Sprintf(`table inet tine {
+	chain input {
+		type filter hook input priority filter; policy accept;
+		iifname "%[1]s" ct state established,related accept
+		iifname "%[1]s" meta l4proto icmp accept
+		iifname "%[1]s" counter drop comment "the guest can't reach anything in its namespace"
+	}
+
+	chain forward {
+		type filter hook forward priority filter; policy drop;
+		counter comment "an offline VM's traffic goes nowhere"
+	}
+}
+`, TapDevice)
 }

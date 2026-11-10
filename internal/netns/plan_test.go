@@ -150,6 +150,45 @@ func TestNamespaceRuleset(t *testing.T) {
 	}
 }
 
+func TestOfflineRuleset(t *testing.T) {
+	rs := OfflineRuleset()
+	for _, want := range []string{
+		"type filter hook forward priority filter; policy drop;",
+		`iifname "tap0" counter drop`,
+	} {
+		if !strings.Contains(rs, want) {
+			t.Errorf("offline ruleset is missing %q", want)
+		}
+	}
+	// Nothing leaves: no NAT, and nothing forwarded.
+	for _, never := range []string{"masquerade", "veth0", "postrouting"} {
+		if strings.Contains(rs, never) {
+			t.Errorf("offline ruleset has %q:\n%s", never, rs)
+		}
+	}
+	// The input chain's policy, replies, and ICMP to the gateway: as online.
+	if strings.Count(rs, "accept") != 3 {
+		t.Errorf("offline ruleset accepts more than the namespace's input chain does online:\n%s", rs)
+	}
+}
+
+func TestOfflinePlan(t *testing.T) {
+	n, err := OfflinePlan("vm-x", 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	online, _ := Plan("vm-x", 7)
+	if !n.Offline || online.Offline {
+		t.Errorf("Offline = %v, %v; want true for OfflinePlan only", n.Offline, online.Offline)
+	}
+	if n.Namespace != online.Namespace || n.Slot != online.Slot {
+		t.Errorf("an offline network's namespace or slot differ: %+v vs %+v", n, online)
+	}
+	if _, err := OfflinePlan("bad id!", 7); err == nil {
+		t.Error("OfflinePlan with a bad ID: want an error")
+	}
+}
+
 func TestSlotOfVeth(t *testing.T) {
 	for name, want := range map[string]int{"tine0": 0, "tine42": 42, "tine16383": 16383} {
 		if got, ok := SlotOfVeth(name); !ok || got != want {

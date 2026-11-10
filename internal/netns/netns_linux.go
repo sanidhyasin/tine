@@ -43,8 +43,9 @@ func RemoveHostRules(ctx context.Context) error {
 }
 
 // Create builds n: its namespace, the veth pair, the tap device owned by
-// owner, addresses, routes, forwarding and firewall rules. If any step
-// fails, it removes everything it made.
+// owner, addresses, routes, forwarding and firewall rules. An offline n gets
+// the namespace, loopback and the tap device alone (see createOffline). If
+// any step fails, it removes everything it made.
 func Create(ctx context.Context, n Network, owner Owner) (err error) {
 	if owner.UID <= 0 || owner.GID <= 0 {
 		return fmt.Errorf("create network %s: tap owner must not be root, got %d:%d", n.ID, owner.UID, owner.GID)
@@ -63,6 +64,9 @@ func Create(ctx context.Context, n Network, owner Owner) (err error) {
 		return fmt.Errorf("create network %s: open namespace: %w", n.ID, err)
 	}
 	defer func() { _ = ns.Close() }()
+	if n.Offline {
+		return createOffline(ctx, n, ns, owner)
+	}
 
 	// The veth's peer is created straight inside the namespace, so its fixed
 	// name never clashes with another VM's.
@@ -92,24 +96,8 @@ func Create(ctx context.Context, n Network, owner Owner) (err error) {
 		if err := netlink.RouteAdd(&netlink.Route{LinkIndex: veth0.Attrs().Index, Gw: n.HostIP.AsSlice()}); err != nil {
 			return fmt.Errorf("default route: %w", err)
 		}
-		// A tap device is created in the namespace of the thread that opens
-		// /dev/net/tun, which is why this runs here. It persists after this
-		// call, and only its owner may attach to it: the VM's Firecracker.
-		tap := &netlink.Tuntap{
-			LinkAttrs: netlink.LinkAttrs{Name: TapDevice},
-			Mode:      netlink.TUNTAP_MODE_TAP,
-			Flags:     netlink.TUNTAP_NO_PI | netlink.TUNTAP_VNET_HDR,
-			Owner:     uint32(owner.UID), //nolint:gosec // checked to be positive above
-			Group:     uint32(owner.GID), //nolint:gosec // as above
-		}
-		if err := netlink.LinkAdd(tap); err != nil {
-			return fmt.Errorf("tap %s: %w", TapDevice, err)
-		}
-		if err := setMAC(TapDevice, TapMAC); err != nil {
-			return fmt.Errorf("tap %s: %w", TapDevice, err)
-		}
-		if err := configureLink(TapDevice, netip.PrefixFrom(GatewayIP, 30)); err != nil {
-			return fmt.Errorf("tap %s: %w", TapDevice, err)
+		if err := createTap(owner); err != nil {
+			return err
 		}
 		if err := writeSysctl("net/ipv4/ip_forward", "1"); err != nil {
 			return fmt.Errorf("enable forwarding: %w", err)
@@ -121,6 +109,62 @@ func Create(ctx context.Context, n Network, owner Owner) (err error) {
 	})
 	if err != nil {
 		return fmt.Errorf("create network %s: in namespace %s: %w", n.ID, n.Namespace, err)
+	}
+	return nil
+}
+
+// createOffline fills an offline network's namespace: loopback, and the
+// tap device the guest's network device attaches to, with the gateway's
+// address and MAC as in any other namespace. There's no veth pair and no
+// route beyond tap0's own /30, so the guest's packets have nowhere to go.
+//
+// Forwarding is on, though nothing can be forwarded: then the namespace
+// answers a guest's packet for anywhere else with "network unreachable" at
+// once, rather than dropping it for the guest's connection to time out.
+func createOffline(ctx context.Context, n Network, ns vnetns.NsHandle, owner Owner) error {
+	err := inNamespace(ns, func() error {
+		if err := configureLink("lo", netip.Prefix{}); err != nil {
+			return fmt.Errorf("loopback: %w", err)
+		}
+		if err := createTap(owner); err != nil {
+			return err
+		}
+		if err := writeSysctl("net/ipv4/ip_forward", "1"); err != nil {
+			return fmt.Errorf("enable forwarding: %w", err)
+		}
+		if err := applyNft(ctx, OfflineRuleset()); err != nil {
+			return fmt.Errorf("firewall: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("create offline network %s: in namespace %s: %w", n.ID, n.Namespace, err)
+	}
+	return nil
+}
+
+// createTap makes tap0 in the calling thread's namespace, owned by owner,
+// with the gateway's MAC and address, and brings it up.
+//
+// A tap device is created in the namespace of the thread that opens
+// /dev/net/tun, which is why this runs inside inNamespace. It persists
+// after the call, and only its owner may attach to it: the VM's Firecracker.
+func createTap(owner Owner) error {
+	tap := &netlink.Tuntap{
+		LinkAttrs: netlink.LinkAttrs{Name: TapDevice},
+		Mode:      netlink.TUNTAP_MODE_TAP,
+		Flags:     netlink.TUNTAP_NO_PI | netlink.TUNTAP_VNET_HDR,
+		Owner:     uint32(owner.UID), //nolint:gosec // checked to be positive by Create
+		Group:     uint32(owner.GID), //nolint:gosec // as above
+	}
+	if err := netlink.LinkAdd(tap); err != nil {
+		return fmt.Errorf("tap %s: %w", TapDevice, err)
+	}
+	if err := setMAC(TapDevice, TapMAC); err != nil {
+		return fmt.Errorf("tap %s: %w", TapDevice, err)
+	}
+	if err := configureLink(TapDevice, netip.PrefixFrom(GatewayIP, 30)); err != nil {
+		return fmt.Errorf("tap %s: %w", TapDevice, err)
 	}
 	return nil
 }

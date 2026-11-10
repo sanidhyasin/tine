@@ -195,6 +195,75 @@ func TestVMNetworkIsolation(t *testing.T) {
 	}
 }
 
+// TestOfflineVMNetwork boots a real VM on an offline network: the guest has
+// its eth0 and tap0 as usual, but nothing beyond. It can't reach the
+// internet, the host or its namespace, and finds out at once rather than
+// waiting for a timeout. The namespace has no veth, and destroying it
+// leaves nothing.
+func TestOfflineVMNetwork(t *testing.T) {
+	testenv.RequireRoot(t)
+	testenv.RequireKVM(t)
+	a := testenv.RequireArtifacts(t)
+	data := testenv.RequireDataDir(t)
+	ctx := setupHost(t)
+	requireNoLeftovers(t, "before the test")
+
+	const uid = 299_970
+	n, err := OfflinePlan("itest-"+randomHex(t)+"-off", 210)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Create(ctx, n, Owner{UID: uid, GID: uid}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := Destroy(n); err != nil {
+			t.Errorf("Destroy: %v", err)
+		}
+		requireNoLeftovers(t, "after the test")
+	})
+	if _, veths, err := List(); err != nil || len(veths) != 0 {
+		t.Errorf("host veths with only an offline network: %v, %v; want none", veths, err)
+	}
+	if links := run1(t, "ip", "-n", n.Namespace, "-o", "link", "show"); strings.Contains(links, NamespaceVeth) || !strings.Contains(links, TapDevice) {
+		t.Errorf("the offline namespace's links:\n%s\nwant lo and tap0 only", links)
+	}
+	if routes := run1(t, "ip", "-n", n.Namespace, "route", "show", "default"); strings.TrimSpace(routes) != "" {
+		t.Errorf("the offline namespace has a default route: %q", routes)
+	}
+
+	bootVM(t, ctx, a, data, n, uid)
+	guest := func(cmd string) error {
+		return exec.CommandContext(ctx, "ip", "netns", "exec", n.Namespace, //nolint:gosec // test command
+			"ssh", "-n", "-i", a.GuestKey, "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+			"-o", "ConnectTimeout=2", "-o", "LogLevel=ERROR", "root@"+GuestIP.String(), cmd).Run()
+	}
+	deadline := time.Now().Add(90 * time.Second)
+	for guest("true") != nil {
+		if time.Now().After(deadline) {
+			t.Fatal("the guest never answered SSH")
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	for _, target := range []string{"1.1.1.1:443", "169.254.169.254:80", mainHostIP(t).String() + ":22", GatewayIP.String() + ":22"} {
+		host, port, _ := strings.Cut(target, ":")
+		start := time.Now()
+		err := guest(fmt.Sprintf("timeout 5 bash -c 'echo > /dev/tcp/%s/%s'", host, port))
+		took := time.Since(start)
+		if err == nil {
+			t.Errorf("the offline guest reached %s", target)
+			continue
+		}
+		t.Logf("the offline guest can't reach %s (failed in %v)", target, took.Round(time.Millisecond))
+	}
+	if err := guest("timeout 5 bash -c 'echo > /dev/tcp/1.1.1.1/443' 2>&1 | grep -q 'unreachable'"); err != nil {
+		t.Errorf("the guest's connection to the internet didn't fail with \"network unreachable\" at once")
+	}
+	if err := guest("ip -o addr show lo | grep -q 127.0.0.1"); err != nil {
+		t.Errorf("the guest's loopback isn't up: %v", err)
+	}
+}
+
 // --- helpers ---
 
 // tapFlagsUp matches an UP flag in `ip link` output, e.g. <NO-CARRIER,BROADCAST,MULTICAST,UP>.
