@@ -141,6 +141,40 @@ def _raise_for(resp: httpx.Response) -> None:
     raise error_for(resp.status_code, code, message)
 
 
+def _create_body(
+    image: str | None,
+    vcpus: int | None,
+    memory: int | str | None,
+    ttl: float | timedelta | None,
+    cold: bool,
+    strategy: str | None,
+    network: str | None,
+) -> dict[str, Any]:
+    body = {
+        "image": image,
+        "vcpus": vcpus,
+        "memory_mib": _memory_mib(memory),
+        "ttl_seconds": _seconds(ttl),
+        "cold": cold or None,
+        "strategy": strategy,
+        "network": network,
+    }
+    return {k: v for k, v in body.items() if v is not None}
+
+
+def _fork_body(count: int, ttl: float | timedelta | None, strategy: str | None, network: str | None) -> dict[str, Any]:
+    body = {"count": count, "ttl_seconds": _seconds(ttl), "strategy": strategy, "network": network}
+    return {k: v for k, v in body.items() if v is not None}
+
+
+def _snapshot_params(vm: str | None, kind: str | None, image: str | None) -> dict[str, str]:
+    return {k: v for k, v in (("vm", vm), ("kind", kind), ("image", image)) if v}
+
+
+def _snapshot_id(snapshot: Snapshot | str) -> str:
+    return snapshot.id if isinstance(snapshot, Snapshot) else snapshot
+
+
 def _fork_result(d: dict[str, Any]) -> ForkResult:
     children, errors = [], []
     for c in d.get("children", []):
@@ -232,18 +266,14 @@ class Client:
         ttl: float | timedelta | None = None,
         cold: bool = False,
         strategy: str | None = None,
+        network: str | None = None,
     ) -> VM:
         """Create a VM, restored from its image's template if there is one (in
-        about a twentieth of a second), or booted. ``memory`` is MiB or "1G"."""
-        body = {
-            "image": image,
-            "vcpus": vcpus,
-            "memory_mib": _memory_mib(memory),
-            "ttl_seconds": _seconds(ttl),
-            "cold": cold or None,
-            "strategy": strategy,
-        }
-        return VM.from_json(self._request("POST", "/v1/vms", json={k: v for k, v in body.items() if v is not None}))
+        about a twentieth of a second), or booted. ``memory`` is MiB or "1G".
+        ``network="none"`` gives it loopback only: no internet, nothing
+        beyond itself; commands and files still work."""
+        body = _create_body(image, vcpus, memory, ttl, cold, strategy, network)
+        return VM.from_json(self._request("POST", "/v1/vms", json=body))
 
     def get(self, vm_id: str) -> VM:
         return VM.from_json(self._request("GET", f"/v1/vms/{vm_id}"))
@@ -320,18 +350,63 @@ class Client:
 
     # snapshots and forks
 
-    def snapshot(self, vm_id: str) -> Snapshot:
-        return Snapshot.from_json(self._request("POST", f"/v1/vms/{vm_id}/snapshots", json={}))
+    def snapshot(self, vm_id: str, *, retain: bool = False) -> Snapshot:
+        """Snapshot a running VM. A snapshot goes with its VM; with
+        ``retain=True`` it's kept until ``delete_snapshot``, even once the VM
+        is destroyed, to restore from later with ``fork_snapshot``."""
+        body = {"retain": True} if retain else {}
+        return Snapshot.from_json(self._request("POST", f"/v1/vms/{vm_id}/snapshots", json=body))
+
+    def get_snapshot(self, snapshot: Snapshot | str) -> Snapshot:
+        """A snapshot as it is now, with ``used_by``: the VMs running from it."""
+        return Snapshot.from_json(self._request("GET", f"/v1/snapshots/{_snapshot_id(snapshot)}"))
+
+    def list_snapshots(
+        self, *, vm: str | None = None, kind: str | None = None, image: str | None = None
+    ) -> list[Snapshot]:
+        """Snapshots, oldest first: all of them, or a VM's, or of a kind
+        ("vm", "template" or "fork"), or an image's."""
+        resp = self._request("GET", "/v1/snapshots", params=_snapshot_params(vm, kind, image))
+        return [Snapshot.from_json(s) for s in resp["snapshots"]]
+
+    def delete_snapshot(self, snapshot: Snapshot | str) -> Snapshot:
+        """Delete a snapshot. Raises Conflict while VMs run from it, and Busy
+        while a fork is restoring from it."""
+        return Snapshot.from_json(self._request("DELETE", f"/v1/snapshots/{_snapshot_id(snapshot)}"))
 
     def rollback(self, vm_id: str, snapshot_id: str) -> VM:
         return VM.from_json(self._request("POST", f"/v1/vms/{vm_id}/rollback", json={"snapshot_id": snapshot_id}))
 
     def fork(
-        self, vm_id: str, count: int = 1, *, ttl: float | timedelta | None = None, strategy: str | None = None
+        self,
+        vm_id: str,
+        count: int = 1,
+        *,
+        ttl: float | timedelta | None = None,
+        strategy: str | None = None,
+        network: str | None = None,
     ) -> ForkResult:
-        body = {"count": count, "ttl_seconds": _seconds(ttl), "strategy": strategy}
+        """``count`` running copies of a VM. ``network="none"`` gives them
+        loopback only; they don't inherit the parent's network."""
         return _fork_result(
-            self._request("POST", f"/v1/vms/{vm_id}/fork", json={k: v for k, v in body.items() if v is not None})
+            self._request("POST", f"/v1/vms/{vm_id}/fork", json=_fork_body(count, ttl, strategy, network))
+        )
+
+    def fork_snapshot(
+        self,
+        snapshot: Snapshot | str,
+        count: int = 1,
+        *,
+        ttl: float | timedelta | None = None,
+        strategy: str | None = None,
+        network: str | None = None,
+    ) -> ForkResult:
+        """``count`` VMs restored from a snapshot that's already there, such
+        as a retained one whose VM is gone, each starting exactly where that
+        VM was. Nothing is paused. As for ``fork``, otherwise."""
+        sid = _snapshot_id(snapshot)
+        return _fork_result(
+            self._request("POST", f"/v1/snapshots/{sid}/fork", json=_fork_body(count, ttl, strategy, network))
         )
 
     def health(self) -> dict[str, Any]:
@@ -386,18 +461,10 @@ class AsyncClient:
         ttl: float | timedelta | None = None,
         cold: bool = False,
         strategy: str | None = None,
+        network: str | None = None,
     ) -> VM:
-        body = {
-            "image": image,
-            "vcpus": vcpus,
-            "memory_mib": _memory_mib(memory),
-            "ttl_seconds": _seconds(ttl),
-            "cold": cold or None,
-            "strategy": strategy,
-        }
-        return VM.from_json(
-            await self._request("POST", "/v1/vms", json={k: v for k, v in body.items() if v is not None})
-        )
+        body = _create_body(image, vcpus, memory, ttl, cold, strategy, network)
+        return VM.from_json(await self._request("POST", "/v1/vms", json=body))
 
     async def get(self, vm_id: str) -> VM:
         return VM.from_json(await self._request("GET", f"/v1/vms/{vm_id}"))
@@ -465,18 +532,50 @@ class AsyncClient:
             )
         return await self.write_file(vm_id, path, p.read_bytes(), mode=p.stat().st_mode & 0o7777)
 
-    async def snapshot(self, vm_id: str) -> Snapshot:
-        return Snapshot.from_json(await self._request("POST", f"/v1/vms/{vm_id}/snapshots", json={}))
+    async def snapshot(self, vm_id: str, *, retain: bool = False) -> Snapshot:
+        body = {"retain": True} if retain else {}
+        return Snapshot.from_json(await self._request("POST", f"/v1/vms/{vm_id}/snapshots", json=body))
+
+    async def get_snapshot(self, snapshot: Snapshot | str) -> Snapshot:
+        return Snapshot.from_json(await self._request("GET", f"/v1/snapshots/{_snapshot_id(snapshot)}"))
+
+    async def list_snapshots(
+        self, *, vm: str | None = None, kind: str | None = None, image: str | None = None
+    ) -> list[Snapshot]:
+        resp = await self._request("GET", "/v1/snapshots", params=_snapshot_params(vm, kind, image))
+        return [Snapshot.from_json(s) for s in resp["snapshots"]]
+
+    async def delete_snapshot(self, snapshot: Snapshot | str) -> Snapshot:
+        return Snapshot.from_json(await self._request("DELETE", f"/v1/snapshots/{_snapshot_id(snapshot)}"))
 
     async def rollback(self, vm_id: str, snapshot_id: str) -> VM:
         return VM.from_json(await self._request("POST", f"/v1/vms/{vm_id}/rollback", json={"snapshot_id": snapshot_id}))
 
     async def fork(
-        self, vm_id: str, count: int = 1, *, ttl: float | timedelta | None = None, strategy: str | None = None
+        self,
+        vm_id: str,
+        count: int = 1,
+        *,
+        ttl: float | timedelta | None = None,
+        strategy: str | None = None,
+        network: str | None = None,
     ) -> ForkResult:
-        body = {"count": count, "ttl_seconds": _seconds(ttl), "strategy": strategy}
         return _fork_result(
-            await self._request("POST", f"/v1/vms/{vm_id}/fork", json={k: v for k, v in body.items() if v is not None})
+            await self._request("POST", f"/v1/vms/{vm_id}/fork", json=_fork_body(count, ttl, strategy, network))
+        )
+
+    async def fork_snapshot(
+        self,
+        snapshot: Snapshot | str,
+        count: int = 1,
+        *,
+        ttl: float | timedelta | None = None,
+        strategy: str | None = None,
+        network: str | None = None,
+    ) -> ForkResult:
+        sid = _snapshot_id(snapshot)
+        return _fork_result(
+            await self._request("POST", f"/v1/snapshots/{sid}/fork", json=_fork_body(count, ttl, strategy, network))
         )
 
     async def health(self) -> dict[str, Any]:

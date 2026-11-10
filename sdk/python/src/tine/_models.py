@@ -49,6 +49,8 @@ class VM:
     source: str = ""
     snapshot_id: str = ""
     parent_id: str = ""
+    #: "default" (its own network, with the internet) or "none" (loopback only).
+    network: str = "default"
     error: str = ""
     memory: Memory | None = None
     timings_ms: dict[str, float] = field(default_factory=dict)
@@ -66,6 +68,7 @@ class VM:
             source=d.get("source", ""),
             snapshot_id=d.get("snapshot_id", ""),
             parent_id=d.get("parent_id", ""),
+            network=d.get("network") or "default",
             error=d.get("error", ""),
             memory=Memory.from_json(d["memory"]) if d.get("memory") else None,
             timings_ms=d.get("timings_ms") or {},
@@ -84,6 +87,8 @@ class Snapshot:
     memory_mib: int
     vm_id: str = ""
     size_bytes: int = 0
+    #: Kept until it's deleted, even once its VM is destroyed.
+    retained: bool = False
     created_at: datetime | None = None
     used_by: tuple[str, ...] = ()
     timings_ms: dict[str, float] = field(default_factory=dict)
@@ -99,6 +104,7 @@ class Snapshot:
             memory_mib=d.get("memory_mib", 0),
             vm_id=d.get("vm_id", ""),
             size_bytes=d.get("size_bytes", 0),
+            retained=bool(d.get("retained", False)),
             created_at=_time(d.get("created_at")),
             used_by=tuple(d.get("used_by") or ()),
             timings_ms=d.get("timings_ms") or {},

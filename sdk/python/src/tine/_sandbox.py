@@ -41,20 +41,40 @@ class Sandbox:
         ttl: float | timedelta | None = None,
         cold: bool = False,
         strategy: str | None = None,
+        network: str | None = None,
         client: Client | None = None,
         host: str | None = None,
     ) -> Sandbox:
         """Create a VM. Without ``client``, the sandbox makes its own (for
-        ``host``, or tined on this machine) and closes it when destroyed."""
+        ``host``, or tined on this machine) and closes it when destroyed.
+        ``network="none"`` leaves it with loopback only."""
         owns = client is None
         c = client or Client(host=host)
         try:
-            vm = c.create(image, vcpus=vcpus, memory=memory, ttl=ttl, cold=cold, strategy=strategy)
+            vm = c.create(image, vcpus=vcpus, memory=memory, ttl=ttl, cold=cold, strategy=strategy, network=network)
         except BaseException:
             if owns:
                 c.close()
             raise
         return cls(c, vm, owns_client=owns)
+
+    @classmethod
+    def restore(
+        cls,
+        snapshot: Snapshot | str,
+        n: int = 1,
+        *,
+        client: Client,
+        ttl: float | timedelta | None = None,
+        strategy: str | None = None,
+        network: str | None = None,
+    ) -> list[Sandbox]:
+        """``n`` sandboxes restored from a snapshot, such as one taken with
+        ``snapshot(retain=True)`` whose sandbox is gone, each starting where
+        it was. They share ``client``, which stays the caller's to close.
+        Raises if none could be made."""
+        res = client.fork_snapshot(snapshot, n, ttl=ttl, strategy=strategy, network=network)
+        return [cls(client, vm) for vm in res.children]
 
     @classmethod
     def attach(cls, vm_id: str, *, client: Client | None = None, host: str | None = None) -> Sandbox:
@@ -109,18 +129,29 @@ class Sandbox:
         """Copy a local file to ``path``, or a directory's contents into ``path``."""
         return self.client.upload(self.id, local, path)
 
-    def snapshot(self) -> Snapshot:
-        return self.client.snapshot(self.id)
+    def snapshot(self, *, retain: bool = False) -> Snapshot:
+        """A save point. With ``retain=True`` it's kept, even once this
+        sandbox is destroyed, until ``client.delete_snapshot``: a checkpoint to
+        restore from later with ``Sandbox.restore``."""
+        return self.client.snapshot(self.id, retain=retain)
 
     def rollback(self, snapshot: Snapshot | str) -> None:
         sid = snapshot.id if isinstance(snapshot, Snapshot) else snapshot
         self.vm = self.client.rollback(self.id, sid)
 
-    def fork(self, n: int = 1, *, ttl: float | timedelta | None = None, strategy: str | None = None) -> list[Sandbox]:
+    def fork(
+        self,
+        n: int = 1,
+        *,
+        ttl: float | timedelta | None = None,
+        strategy: str | None = None,
+        network: str | None = None,
+    ) -> list[Sandbox]:
         """``n`` running copies of this VM, each starting exactly where it is
         now. They're destroyed with this sandbox. Raises if none could be
-        made; ``fork_result`` has the details of the last fork."""
-        res = self.client.fork(self.id, n, ttl=ttl, strategy=strategy)
+        made; ``fork_result`` has the details of the last fork. They have the
+        default network unless ``network="none"``, whatever this one has."""
+        res = self.client.fork(self.id, n, ttl=ttl, strategy=strategy, network=network)
         self.fork_result: ForkResult = res
         children = [Sandbox(self.client, vm) for vm in res.children]
         self._forks.extend(children)
@@ -165,18 +196,35 @@ class AsyncSandbox:
         ttl: float | timedelta | None = None,
         cold: bool = False,
         strategy: str | None = None,
+        network: str | None = None,
         client: AsyncClient | None = None,
         host: str | None = None,
     ) -> AsyncSandbox:
         owns = client is None
         c = client or AsyncClient(host=host)
         try:
-            vm = await c.create(image, vcpus=vcpus, memory=memory, ttl=ttl, cold=cold, strategy=strategy)
+            vm = await c.create(
+                image, vcpus=vcpus, memory=memory, ttl=ttl, cold=cold, strategy=strategy, network=network
+            )
         except BaseException:
             if owns:
                 await c.aclose()
             raise
         return cls(c, vm, owns_client=owns)
+
+    @classmethod
+    async def restore(
+        cls,
+        snapshot: Snapshot | str,
+        n: int = 1,
+        *,
+        client: AsyncClient,
+        ttl: float | timedelta | None = None,
+        strategy: str | None = None,
+        network: str | None = None,
+    ) -> list[AsyncSandbox]:
+        res = await client.fork_snapshot(snapshot, n, ttl=ttl, strategy=strategy, network=network)
+        return [cls(client, vm) for vm in res.children]
 
     @property
     def id(self) -> str:
@@ -218,17 +266,22 @@ class AsyncSandbox:
     async def upload(self, local: str | os.PathLike[str], path: str) -> ArchiveResult | FileInfo:
         return await self.client.upload(self.id, local, path)
 
-    async def snapshot(self) -> Snapshot:
-        return await self.client.snapshot(self.id)
+    async def snapshot(self, *, retain: bool = False) -> Snapshot:
+        return await self.client.snapshot(self.id, retain=retain)
 
     async def rollback(self, snapshot: Snapshot | str) -> None:
         sid = snapshot.id if isinstance(snapshot, Snapshot) else snapshot
         self.vm = await self.client.rollback(self.id, sid)
 
     async def fork(
-        self, n: int = 1, *, ttl: float | timedelta | None = None, strategy: str | None = None
+        self,
+        n: int = 1,
+        *,
+        ttl: float | timedelta | None = None,
+        strategy: str | None = None,
+        network: str | None = None,
     ) -> list[AsyncSandbox]:
-        res = await self.client.fork(self.id, n, ttl=ttl, strategy=strategy)
+        res = await self.client.fork(self.id, n, ttl=ttl, strategy=strategy, network=network)
         self.fork_result: ForkResult = res
         children = [AsyncSandbox(self.client, vm) for vm in res.children]
         self._forks.extend(children)

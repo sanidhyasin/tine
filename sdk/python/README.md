@@ -39,15 +39,46 @@ A `Sandbox` made without a client makes its own, and closes it when it's destroy
 
 | | |
 |---|---|
-| `Sandbox.create(image=None, vcpus=None, memory=None, ttl=None, cold=False, strategy=None)` | A new VM, restored from its image's template in about a twentieth of a second, or booted. `memory` is MiB or `"1G"`; `ttl` is seconds or a `timedelta`. |
+| `Sandbox.create(image=None, vcpus=None, memory=None, ttl=None, cold=False, strategy=None, network=None)` | A new VM, restored from its image's template in about a twentieth of a second, or booted. `memory` is MiB or `"1G"`; `ttl` is seconds or a `timedelta`. `network="none"` gives it loopback only: no internet, nothing beyond itself, while commands and files still work. |
 | `Sandbox.attach(vm_id)` | One that exists already. |
 | `sb.exec(cmd, env=, cwd=, stdin=, timeout=, check=, on_output=)` | Runs a command and waits. A string runs through `sh -c`, a list as it is. Returns an `ExecResult` (`exit_code`, `stdout`, `stderr`, `ok`, `duration_ms`); `check=True` raises `CommandFailed` instead of returning a failure, and `on_output(stream, data)` gets output as it arrives. |
 | `sb.read_file(path)`, `sb.read_text(path)` | A file's contents. |
 | `sb.write_file(path, data, mode=0o644)` | Writes a file, creating its directories. |
 | `sb.upload(local, path)` | A local file to `path`, or a directory's contents into the directory `path`. |
-| `sb.fork(n, ttl=None, strategy=None)` | `n` running copies, each starting exactly where this one is. They're destroyed with it. |
-| `sb.snapshot()`, `sb.rollback(snapshot)` | A save point, and going back to it. |
+| `sb.fork(n, ttl=None, strategy=None, network=None)` | `n` running copies, each starting exactly where this one is. They're destroyed with it. They get the default network unless `network="none"`, whatever this one has. |
+| `sb.snapshot(retain=False)`, `sb.rollback(snapshot)` | A save point, and going back to it. A snapshot goes with its sandbox; with `retain=True` it's kept until it's deleted (below). |
+| `Sandbox.restore(snapshot, n=1, client=, ttl=None, strategy=None, network=None)` | `n` new sandboxes restored from a snapshot, each starting where it was taken. They share `client`, which stays yours to close. |
 | `sb.destroy()` | Destroys it, and its forks. A `with` block does it for you. |
+
+## Checkpoints
+
+A retained snapshot outlives its sandbox: take one before each step of an agent, and any step can be restored later, as many times as you like, offline if you want.
+
+```python
+from tine import Client, Sandbox
+
+with Client(host="ssh://ubuntu@tine-dev") as c:
+    with Sandbox.create(client=c) as sb:
+        checkpoints = []
+        for step in plan:
+            checkpoints.append(sb.snapshot(retain=True))   # before each step
+            sb.exec(step)
+    # The sandbox is gone; its checkpoints aren't.
+    retries = Sandbox.restore(checkpoints[3], 5, client=c, network="none")
+    ...
+    for r in retries:
+        r.destroy()
+    for cp in checkpoints:
+        c.delete_snapshot(cp)
+```
+
+| `Client` | |
+|---|---|
+| `fork_snapshot(snapshot, count=1, ttl=None, strategy=None, network=None)` | VMs restored from a snapshot, as a `ForkResult`: the children, and an error for each one that couldn't be made. Nothing is paused. |
+| `get_snapshot(snapshot)`, `list_snapshots(vm=None, kind=None, image=None)` | Snapshots, with `retained` and `used_by`, the VMs running from each. |
+| `delete_snapshot(snapshot)` | Deletes one. `Conflict` while VMs run from it, `Busy` while it's being restored from. |
+
+Each retained snapshot takes up to the VM's memory in disk space on the server, and a VM may have 256 of them, so delete them when a run is done.
 
 ## Async
 

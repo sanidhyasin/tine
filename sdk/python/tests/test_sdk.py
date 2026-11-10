@@ -14,6 +14,7 @@ from tine import (
     CapacityError,
     Client,
     CommandFailed,
+    Conflict,
     InvalidRequest,
     NotFound,
     NotRunning,
@@ -103,6 +104,72 @@ def test_fork_snapshot_rollback(client: Client) -> None:
     assert [client.get(f.id).state for f in forks] == ["destroyed"] * 3
 
 
+def test_network(client: Client, fake: FakeTined) -> None:
+    offline = Sandbox.create(client=client, network="none")
+    assert offline.vm.network == "none" and fake.bodies[-1]["network"] == "none"
+    online = Sandbox.create(client=client)
+    assert online.vm.network == "default" and "network" not in fake.bodies[-1]
+
+    forks = online.fork(2, network="none")
+    assert [f.vm.network for f in forks] == ["none", "none"] and fake.bodies[-1]["network"] == "none"
+    # Children don't inherit their parent's network: the default unless asked.
+    (child,) = offline.fork(1)
+    assert child.vm.network == "default" and "network" not in fake.bodies[-1]
+
+    with pytest.raises(InvalidRequest):
+        client.create(network="bridged")
+    offline.destroy()
+    online.destroy()
+
+
+def test_checkpoints(client: Client, fake: FakeTined) -> None:
+    """A retained snapshot before each step, the sandbox destroyed, then any
+    step restored, offline, as many times as wanted."""
+    sb = Sandbox.create(client=client)
+    checkpoints = []
+    for step in (1, 2, 3):
+        sb.write_file("/root/step", str(step))
+        checkpoints.append(sb.snapshot(retain=True))
+        assert fake.bodies[-1] == {"retain": True}
+    assert all(c.retained for c in checkpoints)
+    plain = sb.snapshot()
+    assert not plain.retained and fake.bodies[-1] == {}
+    sb.destroy()
+
+    # The plain snapshot went with its sandbox; the retained ones stay.
+    with pytest.raises(NotFound):
+        client.get_snapshot(plain.id)
+    assert [s.id for s in client.list_snapshots(vm=sb.id)] == [c.id for c in checkpoints]
+    assert client.get_snapshot(checkpoints[1].id).retained
+
+    restored = Sandbox.restore(checkpoints[1], 2, client=client, network="none", ttl=600)
+    assert fake.bodies[-1] == {"count": 2, "ttl_seconds": 600, "network": "none"}
+    assert [r.read_text("/root/step") for r in restored] == ["2", "2"]
+    for r in restored:
+        assert (r.vm.parent_id, r.vm.snapshot_id, r.vm.source, r.vm.network) == (
+            sb.id,
+            checkpoints[1].id,
+            "snapshot",
+            "none",
+        )
+    assert client.get_snapshot(checkpoints[1].id).used_by == tuple(r.id for r in restored)
+    with pytest.raises(Conflict) as e:
+        client.delete_snapshot(checkpoints[1])
+    assert e.value.code == "in_use"
+
+    res = client.fork_snapshot(checkpoints[0].id)
+    assert len(res.children) == 1 and res.snapshot.id == checkpoints[0].id and res.timings_ms["check"] == 0.3
+    assert client.read_file(res.children[0].id, "/root/step") == b"1"
+
+    for r in restored:
+        r.destroy()
+    assert client.delete_snapshot(checkpoints[1]).id == checkpoints[1].id
+    with pytest.raises(NotFound):
+        client.fork_snapshot(checkpoints[1])
+    with pytest.raises(NotFound):
+        Sandbox.restore("snap-nope", client=client)
+
+
 def test_errors(client: Client) -> None:
     with pytest.raises(NotFound) as e:
         client.get("vm-nope")
@@ -140,6 +207,26 @@ def test_async(fake: FakeTined) -> None:
     asyncio.run(main())
 
 
+def test_async_checkpoints(fake: FakeTined) -> None:
+    async def main() -> None:
+        async with AsyncClient(transport=fake.transport()) as c:
+            async with await AsyncSandbox.create(client=c, network="none") as sb:
+                assert sb.vm.network == "none"
+                await sb.write_file("/root/step", "1")
+                cp = await sb.snapshot(retain=True)
+            assert cp.retained and [s.id for s in await c.list_snapshots(vm=sb.id)] == [cp.id]
+            restored = await AsyncSandbox.restore(cp, 3, client=c, network="none")
+            steps = await asyncio.gather(*(r.read_text("/root/step") for r in restored))
+            assert steps == ["1"] * 3 and all(r.vm.network == "none" for r in restored)
+            res = await c.fork_snapshot(cp.id, 1)
+            await asyncio.gather(*(r.destroy() for r in restored), c.destroy(res.children[0].id))
+            assert (await c.delete_snapshot(cp)).id == cp.id
+            with pytest.raises(NotFound):
+                await c.get_snapshot(cp.id)
+
+    asyncio.run(main())
+
+
 def test_ssh_host_needs_an_ssh_url() -> None:
     with pytest.raises(ValueError):
         Client(host="tine-dev")
@@ -149,8 +236,18 @@ def test_ssh_host_needs_an_ssh_url() -> None:
     not os.environ.get("TINE_TEST_HOST"), reason="set TINE_TEST_HOST=ssh://user@server to test a real tined"
 )
 def test_real_tined() -> None:
-    with Sandbox.create(host=os.environ["TINE_TEST_HOST"], memory="512M", ttl=600) as sb:
-        assert sb.exec("uname -s").stdout == "Linux\n"
-        sb.write_file("/root/hello.txt", "hello from the SDK")
-        forks = sb.fork(2)
-        assert [f.exec("cat /root/hello.txt").stdout for f in forks] == ["hello from the SDK"] * 2
+    with Client(host=os.environ["TINE_TEST_HOST"]) as c:
+        with Sandbox.create(client=c, memory="512M", ttl=600) as sb:
+            assert sb.exec("uname -s").stdout == "Linux\n"
+            sb.write_file("/root/hello.txt", "hello from the SDK")
+            forks = sb.fork(2)
+            assert [f.exec("cat /root/hello.txt").stdout for f in forks] == ["hello from the SDK"] * 2
+            cp = sb.snapshot(retain=True)
+        # The sandbox is gone; its checkpoint isn't.
+        try:
+            (child,) = Sandbox.restore(cp, 1, client=c, network="none", ttl=600)
+            with child:
+                assert child.read_text("/root/hello.txt") == "hello from the SDK" and child.vm.network == "none"
+                assert not child.exec("timeout 5 bash -c 'echo > /dev/tcp/1.1.1.1/443'").ok
+        finally:
+            c.delete_snapshot(cp)
